@@ -89,6 +89,36 @@ test('自动插入：三单先提交，正文尚无映射时保持独立，结�
   assert.ok(f.items.every(item => item.status === 'ready' && item.kind === 'video' && item.textVersion === 'v1'))
 })
 
+test('自动插入：正文在一次对账途中结算时，后两单不能抢先插入', async t => {
+  const f = await setup(t)
+  const id = index => '00000000-0000-4000-8000-' + String(index).padStart(12, '0')
+  for (let index = 0; index < 3; index++) await f.host.store.write({
+    id: id(index), requestId: 'settling-pass-' + index, status: 'ready', model: 'h3参考',
+    createdAt: new Date(Date.UTC(2026, 9, 16, 0, 0, index)).toISOString(),
+    binding: { gameId: 'game-1', generationId, anchor: '场景' + index + '。' },
+  })
+  // Make the mapping appear immediately after the first resolve read returns null.
+  let reads = 0
+  // A fixture hook at the resolver boundary deterministically reproduces the race.
+  const ctx = {
+    credentials: { resolve: async () => null },
+    tavern: {
+      resolveGeneration: async () => ++reads === 1 ? null : binding,
+      list: async () => f.items,
+      attach: async spec => { f.items.push({ ...spec, ...spec.item, id: 'attached-' + f.items.length }) },
+      update: async () => {},
+    },
+  }
+  f.host.dispose()
+  const isolated = await createRunningHubHost(ctx, { dataDirectory: f.directory }, { reconcileMs: 60000 })
+  t.after(() => isolated.dispose())
+  await isolated.reconcile()
+  assert.equal(reads, 1, '同一生成在单次对账中只解析一次，即使返回空')
+  assert.equal(f.items.length, 0)
+  await isolated.reconcile()
+  assert.deepEqual(f.items.map(item => item.anchor), ['场景0。', '场景1。', '场景2。'])
+})
+
 test('自动插入：视频先完成，正文后完成，同ID重试不改绑', async t => {
   const f = await setup(t)
   await f.host.dispatch({ action: 'preferences', autoInsert: true })

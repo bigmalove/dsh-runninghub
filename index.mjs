@@ -84,19 +84,27 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     bindingQueues.set(job.id, next)
     return next.finally(() => { if (bindingQueues.get(job.id) === next) bindingQueues.delete(job.id) })
   }
-  async function resolvedBinding(job) {
+  async function resolvedBinding(job, resolutions) {
     if (!job.binding?.generationId) return job.binding
     const file = path.join(linksDirectory, job.id + '.json')
     try { return JSON.parse(await readFile(file, 'utf8')) }
     catch (error) { if (error.code !== 'ENOENT') throw error }
-    const value = await ctx.tavern.resolveGeneration(job.binding)
+    const generationKey = JSON.stringify([job.binding.gameId, job.binding.generationId])
+    let value
+    if (resolutions?.has(generationKey)) value = resolutions.get(generationKey)
+    else {
+      value = await ctx.tavern.resolveGeneration(job.binding)
+      // Freeze even a null result for this pass. A generation settling halfway
+      // through reconciliation must not let later submissions overtake the first.
+      resolutions?.set(generationKey, value ?? null)
+    }
     if (!value) return null
     const binding = { ...value, anchor: job.binding.anchor || '' }
     await atomicJSON(file, binding)
     return binding
   }
-  async function insert(job, media, outputIndex = 0) {
-    const binding = await resolvedBinding(job)
+  async function insert(job, media, outputIndex = 0, resolutions) {
+    const binding = await resolvedBinding(job, resolutions)
     if (!binding?.gameId) return
     const items = await ctx.tavern.list({ gameId: binding.gameId, turn: binding.turn })
     const existing = items.find(item => item.textVersion === binding.textVersion && item.data?.runninghubJob === job.id && item.data?.outputIndex === outputIndex)
@@ -108,13 +116,13 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
       if (existing.status !== 'ready' || media && existing.attachment?.attachmentId !== media.attachment?.attachmentId) await ctx.tavern.update(existing.id, changes)
     } else await ctx.tavern.attach({ ...binding, item: { ...changes, data: { runninghubJob: job.id, outputIndex } } })
   }
-  async function reconcileJob(job) {
+  async function reconcileJob(job, resolutions) {
     if (!job.binding?.gameId || disposed) return
     return bindingSerial(job, async () => {
       try {
         if (job.attachments?.length) {
-          for (let index = 0; index < job.attachments.length; index++) await insert(job, job.attachments[index], index)
-        } else if (job.binding.generationId) await insert(job)
+          for (let index = 0; index < job.attachments.length; index++) await insert(job, job.attachments[index], index, resolutions)
+        } else if (job.binding.generationId) await insert(job, undefined, 0, resolutions)
         insertionErrors.delete(job.id)
       } catch (error) { insertionErrors.set(job.id, sanitizeMessage(error.message)) }
     })
@@ -124,7 +132,8 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     const next = reconcileQueue.catch(() => {}).then(async () => {
       if (disposed) return
       // Submission order, not download completion order, establishes media order.
-      for (const job of (await store.list()).reverse()) await reconcileJob(job)
+      const resolutions = new Map()
+      for (const job of (await store.list()).reverse()) await reconcileJob(job, resolutions)
     })
     reconcileQueue = next
     return next

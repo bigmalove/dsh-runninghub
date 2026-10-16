@@ -1,12 +1,13 @@
 {
   "name": "dsh-runninghub",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "private": true,
   "type": "module",
   "scripts": {
     "test": "node bin/test.mjs",
     "test:runtime": "node bin/test.mjs --runtime",
-    "test:all": "node bin/test.mjs --all"
+    "test:all": "node bin/test.mjs --all",
+    "test:ui": "node --test tests/dsh-runninghub-ui.test.mjs"
   },
   "files": ["index.mjs", "client.js", "lib/"],
   "description": "RunningHub local gateway studio and asynchronous image/video tasks for DSH Tavern",
