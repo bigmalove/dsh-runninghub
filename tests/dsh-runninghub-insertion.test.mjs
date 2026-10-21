@@ -27,7 +27,8 @@ async function setup(t) {
     attachments: { saveFile: async ({ data, name }) => ({ attachmentId: 'file-' + (++count), name, bytes: data.length }) } }
   const client = {
     describe: async model => ({ alias: model, customFields: [], referenceSlots: [], capabilities: {}, modelFields: [], defaults: {} }),
-    listWorkflows: async () => [],
+    listWorkflows: async () => [{ alias: 'h3参考', revision: 'rev-test', customFields: [], referenceSlots: [], capabilities: {}, defaults: {} }],
+    portDirective: async (alias, mode) => ({ text: `template:${mode}`, mode }),
     submit: async (_input, id) => { calls.push(id); return { taskId: 'task-' + id, accepted: 1 } },
     task: async () => remoteReady ? { status: 'succeeded', outputs: [{ path: '/files/clip.mp4' }] } : { status: 'running' },
     download: async () => ({ data: Buffer.from('test video'), kind: 'video', mediaType: 'video/mp4', name: 'clip.mp4' }),
@@ -63,7 +64,7 @@ test('自动插入：默认关闭、严格布尔校验、持久化且不写Key',
   await assert.rejects(f.host.dispatch({ action: 'preferences', autoInsert: 'true' }), /布尔/)
   await f.host.dispatch({ action: 'preferences', autoInsert: true })
   const settings = JSON.parse(await readFile(path.join(f.directory, 'connection.json'), 'utf8'))
-  assert.deepEqual(Object.keys(settings).sort(), ['autoInsert', 'baseURL'])
+  assert.deepEqual(Object.keys(settings).sort(), ['applyDefaults', 'autoInsert', 'baseURL', 'bindToTurn'])
   f.host.dispose()
   const restored = await f.boot()
   assert.equal((await restored.dispatch({ action: 'list' })).autoInsert, true)

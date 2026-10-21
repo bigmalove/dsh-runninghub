@@ -74,12 +74,18 @@ function makeGatewayFetch({
   referenceBytes,
   referenceType,
   referenceStatus = 200,
+  portDirectiveText,
+  portDirectiveRejectModes,
+  optionGroups,
+  defaultsConflict = false,
 } = {}) {
   const ext = kind === 'video' ? 'mp4' : 'png'
   const fileBytes = kind === 'video' ? MP4_BYTES : PNG_BYTES
   const fileType = kind === 'video' ? 'video/mp4' : 'image/png'
   const outPath = `/files/out/result.${ext}`
   const list = workflows ?? [{ alias: 'demo', customFields: [], referenceSlots: [], capabilities: {} }]
+  const portDirectiveCalls = []
+  const settingsWrites = { defaults: [], duration: [], seeds: [], modelFields: [], slots: [] }
   let generations = 0
   const fetchImpl = async (url, opts = {}) => {
     const u = new URL(url)
@@ -89,8 +95,44 @@ function makeGatewayFetch({
     if (u.pathname === '/api/settings') {
       return new Response(JSON.stringify(settings ?? { defaultModel: 'demo' }), { status: 200, headers: { 'content-type': 'application/json' } })
     }
+    if (u.pathname === '/api/option-groups') {
+      return new Response(JSON.stringify({ groups: optionGroups ?? [] }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }
+    if (/^\/api\/workflows\/[^/]+\/defaults$/.test(u.pathname) && opts.method === 'PUT') {
+      const body = JSON.parse(opts.body || '{}')
+      settingsWrites.defaults.push(body)
+      if (defaultsConflict) return new Response(JSON.stringify({ error: { message: '已被其他页面修改' } }), { status: 409, headers: { 'content-type': 'application/json' } })
+      return new Response(JSON.stringify({ alias: 'demo', defaults: { ...body, updatedAt: 'updated-2' } }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }
+    if (/^\/api\/workflows\/[^/]+\/duration$/.test(u.pathname) && opts.method === 'PUT') {
+      const body = JSON.parse(opts.body || '{}')
+      settingsWrites.duration.push({ body, site: u.searchParams.get('site') })
+      return new Response(JSON.stringify({ alias: 'demo', videoDuration: { seconds: body.seconds, fps: 24 } }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }
+    if (/^\/api\/workflows\/[^/]+\/seed$/.test(u.pathname) && opts.method === 'PUT') {
+      const body = JSON.parse(opts.body || '{}')
+      settingsWrites.seeds.push({ body, site: u.searchParams.get('site') })
+      return new Response(JSON.stringify({ alias: 'demo', seedTargets: [] }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }
+    if (/^\/api\/workflows\/[^/]+\/model-field$/.test(u.pathname) && opts.method === 'PUT') {
+      settingsWrites.modelFields.push({ body: JSON.parse(opts.body || '{}'), site: u.searchParams.get('site') })
+      return new Response(JSON.stringify({ alias: 'demo', modelFields: [] }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }
+    if (/^\/api\/workflows\/[^/]+\/reference-slots\/[^/]+$/.test(u.pathname) && opts.method === 'PUT') {
+      settingsWrites.slots.push({ nodeId: decodeURIComponent(u.pathname.split('/').at(-1)), body: JSON.parse(opts.body || '{}') })
+      return new Response(JSON.stringify({ alias: 'demo', referenceSlots: [] }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }
     if (/^\/api\/workflows\/[^/]+\/nodes$/.test(u.pathname)) {
       return new Response(JSON.stringify(nodes ?? []), { status: 200, headers: { 'content-type': 'application/json' } })
+    }
+    if (/^\/api\/workflows\/[^/]+\/port-directive$/.test(u.pathname) && opts.method === 'POST') {
+      const body = JSON.parse(opts.body || '{}')
+      portDirectiveCalls.push({ alias: decodeURIComponent(u.pathname.split('/')[3]), body })
+      if (portDirectiveRejectModes?.includes(body.mode)) {
+        return new Response(JSON.stringify({ error: { message: '模板缺少参考图' } }), { status: 400, headers: { 'content-type': 'application/json' } })
+      }
+      if (typeof portDirectiveText !== 'string') return new Response(JSON.stringify({ error: 'not found' }), { status: 404 })
+      return new Response(JSON.stringify({ text: portDirectiveText, mode: body.mode }), { status: 200, headers: { 'content-type': 'application/json' } })
     }
     if (u.pathname === '/api/lora-library') {
       return new Response(JSON.stringify(loraLibrary ?? { loras: [], maxConcurrent: 1, enabled: true }), { status: 200, headers: { 'content-type': 'application/json' } })
@@ -112,7 +154,7 @@ function makeGatewayFetch({
     }
     return new Response(JSON.stringify({ error: 'not found' }), { status: 404 })
   }
-  return { fetchImpl, generations: () => generations, outPath }
+  return { fetchImpl, generations: () => generations, outPath, portDirectiveCalls, settingsWrites }
 }
 
 // ---- fake attachments that actually persist bytes so media can be served back ----
@@ -365,14 +407,14 @@ describe('submit: parameter validation before acceptance', () => {
     assert.equal(jobs.length, 0, 'no job may be persisted for an invalid requestId')
   })
 
-  test('unknown model rejected (describe fails) before job acceptance', async () => {
+  test('workflow override rejected: the panel selection wins', async () => {
     const { host } = await makeHost({ configured: true, gateway: makeGatewayFetch() })
     await assert.rejects(
       host.dispatch({ action: 'submit', requestId: 'req-unknown-model', input: { model: 'nope', prompt: 'x' }, bindToTurn: false }),
-      (e) => /未找到工作流别名/.test(e.message),
+      (e) => /工作流由面板选择/.test(e.message),
     )
     const jobs = await host.store.list()
-    assert.equal(jobs.length, 0, 'no job may be persisted when describe fails')
+    assert.equal(jobs.length, 0, 'no job may be persisted when the model tries to pick a workflow')
   })
 
   test('bindToTurn without gameId is rejected before acceptance', async () => {
@@ -639,6 +681,392 @@ describe('summary: model follows server defaultModel then first usable, settings
 })
 
 // =====================================================================
+describe('workflow selection: panel state drives tools and prompt template', () => {
+  const workflows = [
+    { alias: 'demo', revision: 'r-demo', customFields: [], referenceSlots: [], capabilities: {}, defaults: {} },
+    { alias: 'video', revision: 'r-video', defaultEnhanceMode: 't2i-h3', videoDuration: { seconds: 5 },
+      pipeline: { kind: 'first-frame', imageWorkflowAlias: 'Krea2' },
+      customFields: [{ key: 'image_prompt', label: '生图提示词', type: 'text' }], referenceSlots: [], capabilities: {}, defaults: {} },
+  ]
+  const template = '【模板】image### … ### / video### … ###\n\n（用法说明，这一段不用发给 LLM：不要发送）'
+
+  test('select-model persists the choice and returns its template mode', async () => {
+    const { host, dataDirectory } = await makeHost({ configured: true,
+      gateway: makeGatewayFetch({ workflows, settings: { defaultModel: 'demo' }, portDirectiveText: template }) })
+    const selected = await host.dispatch({ action: 'select-model', model: 'video' })
+    assert.equal(selected.model, 'video')
+    assert.equal(selected.templateMode, 't2i-h3')
+    assert.equal(selected.templateError, undefined)
+    const saved = JSON.parse(await readFile(join(dataDirectory, 'selection.json'), 'utf8'))
+    assert.equal(saved.model, 'video')
+    const listed = await host.dispatch({ action: 'list' })
+    assert.equal(listed.model, 'video', 'summary.model 应优先使用面板选择')
+    assert.equal(listed.templateMode, 't2i-h3')
+    assert.equal(listed.templateError, undefined)
+  })
+
+  test('first-frame Qwen pipeline sends image-side defaults so qwen-multi-h3 can build', async () => {
+    const qwenPipe = {
+      alias: 'qwen-pipe', revision: 'r-qwen-pipe', defaultEnhanceMode: 'qwen-multi-h3',
+      videoDuration: { seconds: 5 },
+      pipeline: { kind: 'first-frame', imageWorkflowAlias: 'QwenImage21-多图生图', videoWorkflowAlias: 'H3-图生视频' },
+      customFields: [], referenceSlots: [], capabilities: {}, defaults: {},
+    }
+    const qwenImage = {
+      alias: 'QwenImage21-多图生图', revision: 'r-qwen-img',
+      customFields: [], capabilities: {},
+      referenceSlots: [{ nodeId: '601', kind: 'image', label: '参考图 1', tag: '<Picture 1>', role: 'images.image_1' }],
+      defaults: { references: [{ nodeId: '601', kind: 'image', name: 'a.png', mimeType: 'image/png', note: '女主外貌' }] },
+    }
+    const h3Video = {
+      alias: 'H3-图生视频', revision: 'r-h3-video',
+      customFields: [], capabilities: {},
+      referenceSlots: [{ nodeId: '114', kind: 'image', label: '首帧', tag: '<Picture 1>', role: 'first_frame' }],
+      defaults: {},
+    }
+    const gateway = makeGatewayFetch({ workflows: [qwenPipe, qwenImage, h3Video], settings: { defaultModel: 'qwen-pipe' }, portDirectiveText: template })
+    const { host } = await makeHost({ configured: true, gateway })
+    const selected = await host.dispatch({ action: 'select-model', model: 'qwen-pipe' })
+    assert.equal(selected.templateMode, 'qwen-multi-h3')
+    assert.equal(gateway.portDirectiveCalls.length, 1)
+    const body = gateway.portDirectiveCalls[0].body
+    assert.deepEqual(body.references, [{ kind: 'image', label: '生图·参考图 1', tag: '<image1>', note: '女主外貌' }])
+    assert.deepEqual(body.mediaLimits, { picture: 1, video: 0, audio: 0 })
+    assert.equal(body.durationSeconds, 5)
+  })
+
+  test('a 400 template falls back to the next compatible mode', async () => {
+    const qwenPipe = {
+      alias: 'qwen-pipe-empty', revision: 'r-qwen-empty', defaultEnhanceMode: 'qwen-multi-h3',
+      videoDuration: { seconds: 5 },
+      pipeline: { kind: 'first-frame', imageWorkflowAlias: 'missing-image', videoWorkflowAlias: 'H3-图生视频' },
+      customFields: [], referenceSlots: [], capabilities: {}, defaults: {},
+    }
+    const h3Video = { alias: 'H3-图生视频', customFields: [], capabilities: {}, referenceSlots: [], defaults: {} }
+    const gateway = makeGatewayFetch({ workflows: [qwenPipe, h3Video], settings: { defaultModel: 'qwen-pipe-empty' },
+      portDirectiveText: template, portDirectiveRejectModes: ['qwen-multi-h3'] })
+    const { host } = await makeHost({ configured: true, gateway })
+    const selected = await host.dispatch({ action: 'select-model', model: 'qwen-pipe-empty' })
+    assert.equal(selected.templateMode, 'qwen-h3')
+    assert.equal(selected.templateError, undefined)
+    assert.deepEqual(gateway.portDirectiveCalls.map((call) => call.body.mode), ['qwen-multi-h3', 'qwen-h3'])
+  })
+
+  test('promptText points at the current skill; the skill carries the template and strips the human-only note', async () => {
+    const { host, dataDirectory } = await makeHost({ configured: true,
+      gateway: makeGatewayFetch({ workflows, settings: { defaultModel: 'demo' }, portDirectiveText: template }) })
+    await host.dispatch({ action: 'preferences', autoInsert: true })
+    await host.dispatch({ action: 'select-model', model: 'video' })
+    const text = host.promptText()
+    assert.match(text, /当前工作流固定为「video」/)
+    assert.match(text, /runninghub-current/)
+    assert.match(text, /不要传 model/)
+    const skill = await readFile(join(dataDirectory, 'skills', 'runninghub-current', 'SKILL.md'), 'utf8')
+    assert.match(skill, /【模板】/)
+    assert.match(skill, /purpose: writing/)
+    assert.equal(skill.includes('用法说明'), false, '给人看的用法说明不应进入 Skill')
+  })
+
+  test('auto-insert off still tells the model to read the skill before any generation', async () => {
+    const { host } = await makeHost({ configured: true,
+      gateway: makeGatewayFetch({ workflows, settings: { defaultModel: 'demo' }, portDirectiveText: template }) })
+    await host.dispatch({ action: 'select-model', model: 'video' })
+    assert.equal(host.autoInsert, false)
+    const text = host.promptText()
+    assert.match(text, /当前工作流固定为「video」/)
+    assert.match(text, /要生成图片或视频时/)
+    assert.match(text, /runninghub-current/)
+    assert.match(text, /不要拿工作流模式名/)
+    assert.match(text, /只有玩家明确要求生成图片或视频时才调用 runninghub_generate/)
+    assert.equal(text.includes('拆成三个分镜'), false, '自动插入关闭时不应注入自动插入流程')
+  })
+
+  test('describe returns promptSkill and a mode alias skill exists', async () => {
+    const { host, dataDirectory } = await makeHost({ configured: true,
+      gateway: makeGatewayFetch({ workflows, settings: { defaultModel: 'demo' }, portDirectiveText: template }) })
+    await host.dispatch({ action: 'select-model', model: 'video' })
+    const described = await host.dispatch({ action: 'describe' })
+    assert.equal(described.promptSkill, 'runninghub-current')
+    assert.equal(described.promptTemplateReady, true)
+    assert.equal(described.promptMode, 't2i-h3')
+    // 模型把 defaultEnhanceMode（t2i-h3）当 skill 名时也能读到同一份模板。
+    const alias = await readFile(join(dataDirectory, 'skills', 'runninghub-alias-mode', 'SKILL.md'), 'utf8')
+    assert.match(alias, /^name: t2i-h3$/m)
+    assert.match(alias, /【模板】/)
+  })
+
+  test('submit uses the selected workflow and splits image### / video### into custom.image_prompt + prompt', async () => {
+    let body
+    const { host } = await makeHost({ configured: true,
+      gateway: makeGatewayFetch({ workflows, settings: { defaultModel: 'demo' }, portDirectiveText: template,
+        onGenerations: (_url, opts) => { body = JSON.parse(opts.body) } }) })
+    await host.dispatch({ action: 'select-model', model: 'video' })
+    const job = await host.dispatch({ action: 'submit', requestId: 'req-video', bindToTurn: false,
+      input: { prompt: 'image###\nA《Picture 1》\n###\n\nvideo###\nB shot\n###' } })
+    await waitForJob(host, job.id, value => Boolean(value.remoteTaskId))
+    assert.equal(body.model, 'video')
+    assert.equal(body.prompt, 'B shot')
+    assert.equal(body.custom.image_prompt, 'A<Picture 1>')
+  })
+
+  test('submit accepts structured image_prompt + prompt without any fences', async () => {
+    let body
+    const { host } = await makeHost({ configured: true,
+      gateway: makeGatewayFetch({ workflows, settings: { defaultModel: 'demo' }, portDirectiveText: template,
+        onGenerations: (_url, opts) => { body = JSON.parse(opts.body) } }) })
+    await host.dispatch({ action: 'select-model', model: 'video' })
+    const job = await host.dispatch({ action: 'submit', requestId: 'req-structured', bindToTurn: false,
+      input: { prompt: 'B shot', image_prompt: 'A《Picture 1》' } })
+    await waitForJob(host, job.id, value => Boolean(value.remoteTaskId))
+    assert.equal(body.model, 'video')
+    assert.equal(body.prompt, 'B shot')
+    assert.equal(body.custom.image_prompt, 'A<Picture 1>', '结构化字段也要把书名号还原成尖括号')
+  })
+
+  test('image_prompt is rejected for a non-pipeline workflow', async () => {
+    const { host } = await makeHost({ configured: true,
+      gateway: makeGatewayFetch({ workflows, settings: { defaultModel: 'demo' }, portDirectiveText: template }) })
+    await assert.rejects(
+      host.dispatch({ action: 'submit', requestId: 'req-no-pipe', bindToTurn: false,
+        input: { prompt: 'x', image_prompt: 'y' } }),
+      /不是管线/,
+    )
+    assert.equal((await host.store.list()).length, 0)
+  })
+
+  test('skill is rewritten for native tool calls, without image### / video### fences', async () => {
+    const gatewayTemplate = [
+      '【提示词写法 · 测试】',
+      '两段都要写。',
+      '',
+      '【输出格式】',
+      '两段各自用末尾那节【输出包裹格式】给的标记包起来：image### 包住生图段，video### 包住视频段。',
+      '',
+      '【输出包裹格式 · 端口调用（本节优先级最高）】',
+      'image###',
+      '……',
+      '###',
+      'video###',
+      '……',
+      '###',
+      '- 标记逐字写成 `image###`、`video###` 与 `###`。',
+    ].join('\n')
+    const { host, dataDirectory } = await makeHost({ configured: true,
+      gateway: makeGatewayFetch({ workflows, settings: { defaultModel: 'demo' }, portDirectiveText: gatewayTemplate }) })
+    await host.dispatch({ action: 'select-model', model: 'video' })
+    const skill = await readFile(join(dataDirectory, 'skills', 'runninghub-current', 'SKILL.md'), 'utf8')
+    assert.match(skill, /原生工具调用/)
+    assert.match(skill, /input\.image_prompt/)
+    assert.match(skill, /input\.prompt/)
+    assert.equal(skill.includes('输出包裹格式'), false, '原生工具不应再让模型看包裹格式')
+    assert.equal(/image###|video###/.test(skill), false, '原生工具 Skill 不应再出现文本标记')
+  })
+
+  test('the model cannot override the panel selection', async () => {
+    const { host } = await makeHost({ configured: true,
+      gateway: makeGatewayFetch({ workflows, settings: { defaultModel: 'demo' }, portDirectiveText: template }) })
+    await host.dispatch({ action: 'select-model', model: 'video' })
+    await assert.rejects(
+      host.dispatch({ action: 'submit', requestId: 'req-override', bindToTurn: false, input: { model: 'demo', prompt: 'x' } }),
+      (error) => /工作流由面板选择/.test(error.message),
+    )
+    assert.equal((await host.store.list()).length, 0)
+  })
+
+  test('Ref2VA rejects prose prompts before spending credits', async () => {
+    const refWorkflow = {
+      alias: 'h3参考', revision: 'r-ref', defaultEnhanceMode: 'h3-ref2va',
+      videoDuration: { seconds: 5, fps: 24 }, customFields: [], capabilities: {},
+      referenceSlots: [{ nodeId: '37', kind: 'image', label: '参考图 1', tag: '<Picture 1>', role: 'ref_images.ref_image_0' }],
+      defaults: { references: [{ nodeId: '37', kind: 'image', name: 'a.png', mimeType: 'image/png' }] },
+    }
+    const { host } = await makeHost({ configured: true,
+      gateway: makeGatewayFetch({ kind: 'video', workflows: [refWorkflow], settings: { defaultModel: 'h3参考' }, portDirectiveText: template }) })
+    await host.dispatch({ action: 'select-model', model: 'h3参考' })
+    const guidance = host.promptText()
+    assert.match(guidance, /六段/)
+    assert.match(guidance, /subject_definitions/)
+    assert.match(guidance, /<Subject 1>/)
+    const toolExec = { agent: { session: { id: 'game-1' } } }
+    await assert.rejects(
+      host.dispatch({ action: 'submit', requestId: 'req-ref-prose', bindToTurn: false,
+        input: { prompt: 'The woman from <Picture 1> lies on a futon.' } }, toolExec),
+      (error) => /全参考工作流要求六段/.test(error.message) && /subject_definitions/.test(error.message),
+    )
+    assert.equal((await host.store.list()).length, 0, '被拦下的提交不应留下任务或计费')
+  })
+
+  test('Ref2VA accepts a six-section prompt with <Subject N> and rejects a Picture-only body', async () => {
+    const refWorkflow = {
+      alias: 'h3参考', revision: 'r-ref', defaultEnhanceMode: 'h3-ref2va',
+      videoDuration: { seconds: 5, fps: 24 }, customFields: [], capabilities: {},
+      referenceSlots: [{ nodeId: '37', kind: 'image', label: '参考图 1', tag: '<Picture 1>', role: 'ref_images.ref_image_0' }],
+      defaults: { references: [{ nodeId: '37', kind: 'image', name: 'a.png', mimeType: 'image/png' }] },
+    }
+    const structured = [
+      'subject_definitions:',
+      '<Subject 1> is the woman in <Picture 1>, with long dark hair.',
+      '',
+      'summary: [reference generation]',
+      '',
+      'retention_analysis:',
+      '<Subject 1> (appears in [Shot 1]): fully_preserved - face and hair.',
+      '',
+      'detailed_description:',
+      'A woman in a warm room.',
+      '',
+      'overall_soundscape:',
+      'Room tone.',
+      '',
+      'non_diegetic_music:',
+      'N/A',
+    ].join('\n')
+    let body
+    const { host } = await makeHost({ configured: true,
+      gateway: makeGatewayFetch({ kind: 'video', workflows: [refWorkflow], settings: { defaultModel: 'h3参考' }, portDirectiveText: template,
+        onGenerations: (_url, opts) => { body = JSON.parse(opts.body) } }) })
+    await host.dispatch({ action: 'select-model', model: 'h3参考' })
+    const guidance = host.promptText()
+    assert.match(guidance, /六段/)
+    assert.match(guidance, /subject_definitions/)
+    assert.match(guidance, /<Subject 1>/)
+    const toolExec = { agent: { session: { id: 'game-1' } } }
+    await assert.rejects(
+      host.dispatch({ action: 'submit', requestId: 'req-ref-no-subject', bindToTurn: false,
+        input: { prompt: structured.replaceAll('<Subject 1>', '<Picture 1>') } }, toolExec),
+      (error) => /<Subject N>/.test(error.message),
+    )
+    const job = await host.dispatch({ action: 'submit', requestId: 'req-ref-structured', bindToTurn: false,
+      input: { prompt: structured } }, toolExec)
+    await waitForJob(host, job.id, value => Boolean(value.remoteTaskId))
+    assert.equal(body.model, 'h3参考')
+    assert.match(body.prompt, /^subject_definitions:/m)
+    assert.match(body.prompt, /<Subject 1>/)
+  })
+
+  test('template fetch failure is surfaced but does not break selection', async () => {
+    const { host, dataDirectory } = await makeHost({ configured: true,
+      gateway: makeGatewayFetch({ workflows, settings: { defaultModel: 'demo' } }) })
+    await host.dispatch({ action: 'preferences', autoInsert: true })
+    const selected = await host.dispatch({ action: 'select-model', model: 'video' })
+    assert.equal(selected.model, 'video')
+    assert.ok(selected.templateError, '模板不可用时应给出错误')
+    assert.match(host.promptText(), /runninghub-current/)
+    const skill = await readFile(join(dataDirectory, 'skills', 'runninghub-current', 'SKILL.md'), 'utf8')
+    assert.match(skill, /提示词模板暂不可用/)
+    assert.match(skill, /不要调用 runninghub_generate/)
+  })
+})
+
+// =====================================================================
+describe('workflow settings: save-settings writes the same gateway defaults as the admin console', () => {
+  function settingsWorkflow() {
+    return {
+      alias: 'demo',
+      primarySite: 'international',
+      customFields: [{ key: 'quality', label: '质量', type: 'number', min: 1, max: 10 }],
+      referenceSlots: [
+        { nodeId: '9', kind: 'image', label: '参考图' },
+        { nodeId: '10', kind: 'image', label: '旁路图', bypassed: true },
+      ],
+      seedTargets: [{ target: '5.seed', nodeId: '5', field: 'seed', classType: 'KSampler', templateValue: 1 }],
+      modelFields: [{ target: '6.unet_name', nodeId: '6', field: 'unet_name', classType: 'UNETLoader', value: 'a', canvasValue: 'b' }],
+      capabilities: { resolutionFields: ['aspect_ratio'] },
+      defaults: {
+        updatedAt: 'updated-1',
+        resolution: { aspect_ratio: '16:9' },
+        custom: { quality: 3 },
+        references: [{ nodeId: '9', kind: 'image', name: 'a.png' }],
+        referencePools: [],
+        presetIds: [],
+        promptSuffix: '',
+      },
+      videoDuration: { seconds: 5, fps: 24 },
+    }
+  }
+
+  test('writes defaults, duration, seed, model field and reference slot, then re-describes', async () => {
+    const gateway = makeGatewayFetch({ workflows: [settingsWorkflow()], settings: { defaultModel: 'demo' } })
+    const { host } = await makeHost({ configured: true, gateway })
+    const result = await host.dispatch({
+      action: 'save-settings',
+      model: 'demo',
+      defaults: {
+        presetIds: [],
+        promptSuffix: '',
+        resolution: { aspect_ratio: '9:16' },
+        custom: { quality: 7 },
+        references: [{ nodeId: '9', kind: 'image', note: '新备注' }],
+        referencePools: [],
+        baseUpdatedAt: 'updated-1',
+      },
+      duration: { seconds: 8 },
+      seeds: [{ target: '5.seed', value: 42 }],
+      modelFields: [{ target: '6.unet_name', value: 'c' }],
+      referenceSlots: [{ nodeId: '10', enabled: true }],
+    })
+    assert.equal(result.model, 'demo')
+    assert.equal(result.workflow.alias, 'demo')
+    assert.deepEqual(gateway.settingsWrites.slots, [{ nodeId: '10', body: { enabled: true } }])
+    assert.equal(gateway.settingsWrites.defaults.length, 1)
+    assert.deepEqual(gateway.settingsWrites.defaults[0], {
+      presetIds: [], promptSuffix: '', resolution: { aspect_ratio: '9:16' }, custom: { quality: 7 },
+      references: [{ nodeId: '9', kind: 'image', note: '新备注' }], referencePools: [], baseUpdatedAt: 'updated-1',
+    })
+    assert.deepEqual(gateway.settingsWrites.duration, [{ body: { seconds: 8 }, site: 'international' }])
+    assert.deepEqual(gateway.settingsWrites.seeds, [{ body: { target: '5.seed', value: 42 }, site: 'international' }])
+    assert.deepEqual(gateway.settingsWrites.modelFields, [{ body: { target: '6.unet_name', value: 'c' }, site: 'international' }])
+  })
+
+  test('rejects a model that disagrees with the panel selection', async () => {
+    const gateway = makeGatewayFetch({ workflows: [settingsWorkflow()], settings: { defaultModel: 'demo' } })
+    const { host } = await makeHost({ configured: true, gateway })
+    await assert.rejects(
+      host.dispatch({ action: 'save-settings', model: 'other', defaults: {} }),
+      /工作流由面板选择/,
+    )
+    assert.equal(gateway.settingsWrites.defaults.length, 0)
+  })
+
+  test('maps a gateway 409 to a conflict error instead of silently overwriting', async () => {
+    const gateway = makeGatewayFetch({ workflows: [settingsWorkflow()], settings: { defaultModel: 'demo' }, defaultsConflict: true })
+    const { host } = await makeHost({ configured: true, gateway })
+    await assert.rejects(
+      host.dispatch({ action: 'save-settings', defaults: { resolution: { aspect_ratio: '9:16' } } }),
+      error => error.code === 'CONFLICT' && /别处更新/.test(error.message),
+    )
+  })
+
+  test('option-groups action returns sanitized candidate groups', async () => {
+    const gateway = makeGatewayFetch({ workflows: [settingsWorkflow()], settings: { defaultModel: 'demo' },
+      optionGroups: [{ id: 'g1', label: '组一', values: ['a', 'b'] }] })
+    const { host } = await makeHost({ configured: true, gateway })
+    assert.deepEqual(await host.dispatch({ action: 'option-groups' }), { groups: [{ id: 'g1', label: '组一', values: ['a', 'b'] }] })
+  })
+})
+
+describe('preferences: applyDefaults and bindToTurn persist with connection.json', () => {
+  test('saves both booleans, rejects non-booleans, and restores them after reboot', async () => {
+    const gateway = makeGatewayFetch({ workflows: [{ alias: 'demo', customFields: [], referenceSlots: [], capabilities: {} }] })
+    const { host, dataDirectory, ctx } = await makeHost({ configured: true, gateway })
+    assert.deepEqual(await host.dispatch({ action: 'preferences', applyDefaults: false, bindToTurn: false }),
+      { autoInsert: false, applyDefaults: false, bindToTurn: false })
+    await assert.rejects(host.dispatch({ action: 'preferences', applyDefaults: 'false' }), /布尔/)
+    const listed = await host.dispatch({ action: 'list' })
+    assert.equal(listed.applyDefaults, false)
+    assert.equal(listed.bindToTurn, false)
+    host.dispose()
+    const restored = await createRunningHubHost(ctx,
+      { dataDirectory, baseURL: BASE }, { fetchImpl: gateway.fetchImpl, pollMs: 5 })
+    try {
+      const state = await restored.dispatch({ action: 'list' })
+      assert.equal(state.applyDefaults, false)
+      assert.equal(state.bindToTurn, false)
+    } finally { restored.dispose() }
+  })
+})
+
+// =====================================================================
 describe('reference route: same-origin binary, no key/address leak', () => {
   function refWorkflows() {
     return [{
@@ -722,21 +1150,30 @@ describe('reference route: same-origin binary, no key/address leak', () => {
 
 // =====================================================================
 describe('apply: registration and cleanup (apply 不再返回 host)', () => {
-  test('apply 注册 2 HTTP 路由、3 callHost handler、3 工具，且不返回 host', async () => {
+  test('apply 注册 2 HTTP 路由、3 callHost handler、4 工具，且不返回 host', async () => {
     const dataDirectory = await mkdtemp(join(tmpRoot, 'rh-test-'))
     liveHosts.push({ host: { dispose() {} }, dataDirectory })
     const effects = []
     const registered = []
     const handles = {}
     const tools = []
+    let promptSection, settledHandler, removedHandler
     const attachments = makeAttachments({ saveImage: [], saveFile: [], getTurnState: [], getTurn: [], credentialsSet: [] })
     const ctx = {
       attachments,
       credentials: { resolve: async () => undefined, set: async () => {}, describe: async () => undefined },
-      tavern: { handle: (name, fn) => { handles[name] = fn } },
+      tavern: {
+        handle: (name, fn) => { handles[name] = fn },
+        promptSection: spec => { promptSection = spec },
+        onTurnSettled: handler => { settledHandler = handler },
+        onGameRemoved: handler => { removedHandler = handler },
+      },
       webServer: { register: (spec) => { registered.push(spec); return () => {} } },
       effect: (fn) => { const d = fn(); effects.push(d); return d },
-      inject: (names, fn) => { if (names[0] === 'tools') fn({ tools: { register: (spec) => tools.push(spec) } }) },
+      inject: (names, fn) => {
+        if (names[0] === 'tools') fn({ tools: { register: (spec) => tools.push(spec) } })
+        if (names[0] === 'llm') fn({ llm: { stream: async function* () {} } })
+      },
     }
     // index.mjs 删除 apply 末尾 `return host` 后，apply 不再返回 host。
     const result = await apply(ctx, { dataDirectory, baseURL: BASE })
@@ -750,8 +1187,13 @@ describe('apply: registration and cleanup (apply 不再返回 host)', () => {
     }
     // apply exposes list/describe as callHost handlers; status is a tool, not a handle.
     assert.deepEqual(Object.keys(handles).sort(), ['dsh-runninghub/describe', 'dsh-runninghub/list'].sort())
-    assert.equal(tools.length, 3)
-    assert.deepEqual(tools.map(t => t.name).sort(), ['runninghub_describe', 'runninghub_generate', 'runninghub_status'].sort())
+    assert.equal(tools.length, 4)
+    assert.deepEqual(tools.map(t => t.name).sort(), ['runninghub_describe', 'runninghub_generate', 'runninghub_send_pregenerated', 'runninghub_status'].sort())
+    assert.equal(promptSection?.name, 'auto-insert')
+    assert.equal(typeof promptSection?.text, 'function')
+    assert.equal(promptSection.text({ gameId: 'fixture-game' }), '', '没有自动插入与预生成时不注入段落')
+    assert.equal(typeof settledHandler, 'function')
+    assert.equal(typeof removedHandler, 'function')
     assert.equal(effects.length, 4, 'dispose + 3 route effects expected')
   })
 
@@ -816,5 +1258,132 @@ describe('apply: registration and cleanup (apply 不再返回 host)', () => {
     host.dispose()
     // list→summary 不走 connect，不校验 disposed；用 describe（经 connect）验证拆除。
     await assert.rejects(host.dispatch({ action: 'describe', model: 'demo' }), (e) => e.code === 'DISPOSED')
+  })
+})
+
+// =====================================================================
+describe('regenerate: task history replays the saved prompt, params and references', () => {
+  const workflows = [{
+    alias: 'demo', revision: 'rev-demo',
+    customFields: [{ key: 'quality', label: '质量', type: 'number', min: 1, max: 10 }],
+    referenceSlots: [{ nodeId: 'image-ref', kind: 'image', label: '参考图' }],
+    videoDuration: { seconds: 5, fps: 24 },
+    capabilities: {}, defaults: {},
+  }]
+
+  test('重新生成按原输入新建任务；参考素材往返一致且不写进任务记录', async () => {
+    const bodies = []
+    const gateway = makeGatewayFetch({ workflows, onGenerations: (_url, opts) => bodies.push(JSON.parse(opts.body)) })
+    const { host, calls, dataDirectory } = await makeHost({ configured: true, gateway })
+
+    const original = await host.dispatch({ action: 'submit', requestId: 'req-replay-1', bindToTurn: false, input: {
+      model: 'demo', prompt: '  原样提示词\n第二行  ', apply_defaults: true, duration_seconds: 5,
+      resolution: { aspect_ratio: '9:16' }, custom: { quality: 2 },
+      references: [{ nodeId: 'image-ref', name: '主角.png', mimeType: 'image/png', data: PNG_BYTES.toString('base64'), note: '主角参考' }],
+    } })
+    assert.equal(original.replayable, true, '提交响应应直接标记可重放')
+    await waitForJob(host, original.id, job => job.status === 'ready')
+
+    const listed = await host.dispatch({ action: 'list' })
+    const stored = listed.jobs.find(job => job.id === original.id)
+    assert.equal(stored.replayable, true)
+    assert.equal('prompt' in stored, false, '提示词不能出现在任务列表/任务记录里')
+    const taskFile = await readFile(join(dataDirectory, 'tasks', original.id + '.json'), 'utf8')
+    assert.equal(taskFile.includes('原样提示词'), false, '任务记录不得包含提示词')
+    assert.equal(taskFile.includes(PNG_BYTES.toString('base64')), false, '任务记录不得包含参考素材')
+
+    const regenerated = await host.dispatch({ action: 'regenerate', id: original.id, requestId: 'req-replay-2', bindToTurn: false })
+    assert.notEqual(regenerated.id, original.id, '重新生成必须新建任务')
+    assert.equal(regenerated.replayable, true)
+    await waitForJob(host, regenerated.id, job => job.status === 'ready')
+    await waitForJob(host, original.id, job => job.status === 'ready')
+
+    assert.equal(gateway.generations(), 2, '一键重新生成应恰好再提交一次')
+    const { client_request_id: _first, ...firstBody } = bodies[0]
+    const { client_request_id: _second, ...secondBody } = bodies[1]
+    assert.deepEqual(secondBody, firstBody, '重新提交的提示词、参数与参考素材必须与首次一致')
+    assert.equal(secondBody.references[0].data, PNG_BYTES.toString('base64'))
+
+    const replayFile = await readFile(join(dataDirectory, 'replays', original.id, 'input.json'), 'utf8')
+    assert.match(replayFile, /原样提示词/)
+    assert.equal(replayFile.includes(PNG_BYTES.toString('base64')), false, '参考素材按二进制去重保存')
+    assert.equal((await host.replays.load(regenerated.id)).prompt, '原样提示词\n第二行', 'validateInput 会去掉提示词首尾空白')
+  })
+
+  test('同一 requestId 重试重新生成只提交一次，并返回首次创建的新任务', async () => {
+    const gateway = makeGatewayFetch({ workflows })
+    const { host } = await makeHost({ configured: true, gateway })
+    const original = await host.dispatch({ action: 'submit', requestId: 'req-replay-dedupe-1', bindToTurn: false,
+      input: { model: 'demo', prompt: 'dedupe' } })
+    await waitForJob(host, original.id, job => job.status === 'ready')
+
+    const first = await host.dispatch({ action: 'regenerate', id: original.id, requestId: 'req-replay-dedupe-2', bindToTurn: false })
+    const second = await host.dispatch({ action: 'regenerate', id: original.id, requestId: 'req-replay-dedupe-2', bindToTurn: false })
+    assert.equal(second.id, first.id)
+    await waitForJob(host, first.id, job => job.status === 'ready')
+    assert.equal(gateway.generations(), 2, '原任务 1 次 + 重新生成 1 次，重试不得再提交')
+  })
+
+  test('运行中、结果未知或没有快照的任务拒绝重新生成', async () => {
+    const gateway = makeGatewayFetch({ workflows, taskStatus: 'running' })
+    const { host } = await makeHost({ configured: true, gateway })
+    const active = await host.dispatch({ action: 'submit', requestId: 'req-replay-active', bindToTurn: false,
+      input: { model: 'demo', prompt: 'still running' } })
+    await waitForJob(host, active.id, job => Boolean(job.remoteTaskId))
+    await assert.rejects(host.dispatch({ action: 'regenerate', id: active.id, requestId: 'req-replay-active-2', bindToTurn: false }),
+      /只有已结束的任务/)
+
+    const { randomUUID } = await import('node:crypto')
+    const legacy = await host.store.write({
+      id: randomUUID(), requestId: 'req-replay-legacy', status: 'ready', model: 'demo',
+      createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+      outputs: [], attachments: [], completedOutputs: [],
+    })
+    await assert.rejects(host.dispatch({ action: 'regenerate', id: legacy.id, requestId: 'req-replay-legacy-2', bindToTurn: false }),
+      (error) => error.code === 'NOT_FOUND' && /没有保存可重放的输入/.test(error.message))
+
+    const unknown = await host.store.write({
+      id: randomUUID(), requestId: 'req-replay-unknown', status: 'submit_unknown', model: 'demo',
+      createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+      outputs: [], attachments: [], completedOutputs: [],
+    })
+    await assert.rejects(host.dispatch({ action: 'regenerate', id: unknown.id, requestId: 'req-replay-unknown-2', bindToTurn: false }),
+      /只有已结束的任务/)
+  })
+
+  test('重启后快照仍在：历史任务继续可重放', async () => {
+    const gateway = makeGatewayFetch({ workflows })
+    const first = await makeHost({ configured: true, gateway })
+    const original = await first.host.dispatch({ action: 'submit', requestId: 'req-replay-restart-1', bindToTurn: false,
+      input: { model: 'demo', prompt: 'restart prompt' } })
+    await waitForJob(first.host, original.id, job => job.status === 'ready')
+    first.host.dispose()
+
+    const restored = await createRunningHubHost(first.ctx, { dataDirectory: first.dataDirectory, baseURL: BASE }, { pollMs: 5, fetchImpl: gateway.fetchImpl })
+    liveHosts.push({ host: restored, dataDirectory: first.dataDirectory })
+    const listed = await restored.dispatch({ action: 'list' })
+    assert.equal(listed.jobs.find(job => job.id === original.id).replayable, true, '重启扫描 replays/ 后仍标记可重放')
+
+    const regenerated = await restored.dispatch({ action: 'regenerate', id: original.id, requestId: 'req-replay-restart-2', bindToTurn: false })
+    await waitForJob(restored, regenerated.id, job => job.status === 'ready')
+    assert.equal(gateway.generations(), 2, '重启后重新生成仍只提交一次')
+    assert.equal((await restored.replays.load(regenerated.id)).prompt, 'restart prompt')
+  })
+
+  test('重新生成沿用原工作流，不要求它仍是面板当前选择，并可绑定当前对话轮次', async () => {
+    const other = { alias: 'other', revision: 'rev-other', customFields: [], referenceSlots: [], capabilities: {}, defaults: {} }
+    const gateway = makeGatewayFetch({ workflows: [...workflows, other], settings: { defaultModel: 'demo' } })
+    const { host, calls } = await makeHost({ configured: true, gateway })
+    const original = await host.dispatch({ action: 'submit', requestId: 'req-replay-model-1', bindToTurn: false,
+      input: { model: 'demo', prompt: 'demo prompt' } })
+    await waitForJob(host, original.id, job => job.status === 'ready')
+    await host.dispatch({ action: 'select-model', model: 'other' })
+
+    const regenerated = await host.dispatch({ action: 'regenerate', id: original.id, requestId: 'req-replay-model-2',
+      bindToTurn: true, gameId: 'game-replay' })
+    assert.equal(regenerated.model, 'demo', '重新生成必须使用原任务的工作流，而不是面板当前选择')
+    assert.equal(calls.getTurnState.at(-1), 'game-replay', '绑定开关开启时重新绑定当前轮次')
+    assert.equal(regenerated.binding.gameId, 'game-replay')
+    await waitForJob(host, regenerated.id, job => Boolean(job.remoteTaskId))
   })
 })

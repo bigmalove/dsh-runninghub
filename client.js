@@ -9,6 +9,8 @@ window.__ModuleLoader__.load({
     const MB = 1024 * 1024
     // 仅在内存中保留未确认请求；面板重新挂载时也不生成新的请求 ID。
     const pendingRequests = new Map()
+    // 重新生成的未确认请求按「对话 + 任务」保留，网络不明时重试仍沿用同一 requestId。
+    const pendingRegenerations = new Map()
     const own = (object, key) => Object.prototype.hasOwnProperty.call(object || {}, key)
     const message = error => typeof error === 'string' ? error : error?.message || '未知错误'
     const statuses = {
@@ -16,9 +18,13 @@ window.__ModuleLoader__.load({
       queued: '排队中', running: '生成中', downloading: '下载中', ready: '已就绪',
       failed: '失败', download_failed: '下载失败',
     }
+    const pregenStatuses = {
+      generating: '生成中', ready: '就绪', failed: '失败',
+      used: '已用', discarded: '已删', stale: '已退',
+    }
     // Visual system follows the local RunningHub client, scoped to this panel.
     const css = `
-.rh-studio{--rh-bg:#f4f6f8;--rh-surface:#fff;--rh-soft:#f8fafb;--rh-ink:#18212f;--rh-muted:#667085;--rh-line:#dde3ea;--rh-brand:#175cd3;--rh-brand-soft:#eff5ff;--rh-success:#087a55;--rh-success-soft:#ecfdf3;--rh-danger:#b42318;--rh-warning:#a15c07;--rh-shadow:0 1px 2px #10182806,0 8px 24px #10182806;container-type:inline-size;position:relative;isolation:isolate;min-width:0;min-height:700px;background:var(--rh-bg);color:var(--rh-ink);font:13px/1.6 Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;overflow-wrap:anywhere;color-scheme:light}
+.rh-studio{--rh-bg:#f4f6f8;--rh-surface:#fff;--rh-soft:#f8fafb;--rh-ink:#18212f;--rh-muted:#667085;--rh-line:#dde3ea;--rh-brand:#175cd3;--rh-brand-soft:#eff5ff;--rh-success:#087a55;--rh-success-soft:#ecfdf3;--rh-danger:#b42318;--rh-warning:#a15c07;--rh-shadow:0 1px 2px #10182806,0 8px 24px #10182806;container-type:inline-size;position:relative;isolation:isolate;min-width:0;min-height:0;max-height:100%;height:100%;flex:1 1 auto;overflow-y:auto;overscroll-behavior:contain;background:var(--rh-bg);color:var(--rh-ink);font:13px/1.6 Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;overflow-wrap:anywhere;color-scheme:light}
 .rh-studio[data-theme="dark"]{--rh-bg:#141a23;--rh-surface:#1b2430;--rh-soft:#202c3a;--rh-ink:#e9eef5;--rh-muted:#a4b2c4;--rh-line:#344153;--rh-brand:#8db6ff;--rh-brand-soft:#233b60;--rh-success:#74ddb5;--rh-success-soft:#1d3b35;--rh-danger:#ffaaa2;--rh-warning:#f6d08b;color-scheme:dark}
 .rh-studio *{box-sizing:border-box}.rh-studio button,.rh-studio input,.rh-studio textarea,.rh-studio select{font:inherit}.rh-studio button{cursor:pointer}.rh-studio button:disabled{cursor:not-allowed;opacity:.48}.rh-studio button:focus-visible,.rh-studio input:focus-visible,.rh-studio select:focus-visible,.rh-studio textarea:focus-visible,.rh-studio summary:focus-visible{outline:3px solid color-mix(in srgb,var(--rh-brand) 35%,transparent);outline-offset:3px}.rh-studio h2,.rh-studio h3,.rh-studio p{margin:0}.rh-studio h2{font-size:22px;line-height:1.35;letter-spacing:-.04em}.rh-studio h3{font-size:14px;font-weight:700}.rh-studio svg{flex-shrink:0;display:block}
 .rh-topbar{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:18px 24px;background:var(--rh-surface);border-bottom:1px solid var(--rh-line)}.rh-brand{display:flex;align-items:center;gap:10px;min-width:0}.rh-mark{display:grid;place-items:center;width:36px;height:36px;border-radius:11px;background:#172b4d;color:#fff;font-size:15px;font-weight:800;letter-spacing:-1px}.rh-brand-name{font-size:15px;font-weight:750;letter-spacing:-.3px}.rh-kicker{font-size:10px;letter-spacing:1.6px;color:var(--rh-muted);font-weight:600}.rh-top-actions,.rh-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.rh-pill{display:inline-flex;align-items:center;gap:7px;border:1px solid var(--rh-line);border-radius:30px;padding:5px 10px;font-size:11px;white-space:nowrap;color:var(--rh-muted)}.rh-dot{width:6px;height:6px;border-radius:50%;background:currentColor}.rh-pill[data-state="online"]{color:var(--rh-success);background:var(--rh-success-soft);border-color:transparent}
@@ -28,10 +34,77 @@ window.__ModuleLoader__.load({
 .rh-references{border-top:1px solid var(--rh-line);padding:19px 24px 22px}.rh-slots{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin-top:14px}.rh-slot{display:flex;flex-direction:column;gap:10px;min-width:0;padding:13px;border:1px solid var(--rh-line);border-radius:11px;background:var(--rh-soft)}.rh-slot-head{display:flex;align-items:center;justify-content:space-between;gap:8px}.rh-slot-title{font-size:12px;font-weight:650}.rh-slot-tag{font-size:9px;color:var(--rh-muted);border:1px solid var(--rh-line);border-radius:4px;padding:1px 5px}.rh-upload{position:relative;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:7px;height:112px;border:1px dashed var(--rh-line);border-radius:8px;background:var(--rh-surface);color:var(--rh-muted);text-align:center;padding:10px;cursor:pointer;overflow:hidden}.rh-upload:hover{border-color:var(--rh-brand);color:var(--rh-brand);background:var(--rh-brand-soft)}.rh-upload:focus-within{outline:3px solid var(--rh-brand-soft);border-color:var(--rh-brand)}.rh-upload input[type="file"]{position:absolute;inset:0;width:100%;height:100%;opacity:0;cursor:pointer}.rh-upload strong{font-size:11px;color:var(--rh-ink);max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.rh-upload small{font-size:10px}.rh-reference-image{width:100%;height:100%;object-fit:contain;position:absolute;inset:0}.rh-upload[data-selected="true"]{border-style:solid;border-color:var(--rh-brand)}.rh-remove{border:0;background:none;color:var(--rh-muted);font-size:10px;padding:0;cursor:pointer}.rh-filename{display:flex;justify-content:space-between;gap:8px;font-size:10px;color:var(--rh-muted)}
 .rh-btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;padding:8px 12px;border:1px solid var(--rh-line);border-radius:8px;background:var(--rh-surface);color:var(--rh-ink);font-size:11px;line-height:1.5;font-weight:550;white-space:nowrap}.rh-btn:hover:not(:disabled){background:var(--rh-soft);border-color:var(--rh-muted)}.rh-btn-primary{background:var(--rh-brand);color:#fff;border-color:var(--rh-brand);padding:12px 26px;font-size:12px;box-shadow:0 3px 7px #175cd322}.rh-studio[data-theme="dark"] .rh-btn-primary{color:#14243e}.rh-btn-primary:hover:not(:disabled){filter:brightness(.95);background:var(--rh-brand);border-color:var(--rh-brand)}.rh-btn-quiet{border-color:transparent;background:transparent;padding:5px 8px;color:var(--rh-muted)}.rh-btn-link{border:0;background:transparent;color:var(--rh-brand);padding:0;font-size:11px;cursor:pointer}.rh-submitbar{position:sticky;bottom:0;z-index:4;display:flex;align-items:center;justify-content:space-between;gap:14px;padding:15px 24px;background:var(--rh-surface);border:1px solid var(--rh-line);border-radius:12px;box-shadow:0 -3px 18px #10182807;margin-top:16px}.rh-submit-summary{font-size:11px;font-weight:600}.rh-submit-sub{color:var(--rh-muted);font-size:10px;margin-top:2px}.rh-notice{margin-top:12px;padding:12px 14px;border-radius:9px;background:var(--rh-brand-soft);font-size:11px;color:var(--rh-brand)}.rh-error{white-space:pre-wrap;color:var(--rh-danger);background:color-mix(in srgb,var(--rh-danger) 7%,var(--rh-surface));border:1px solid color-mix(in srgb,var(--rh-danger) 22%,var(--rh-line));border-radius:8px;padding:10px 12px;font-size:11px;margin:10px 0}.rh-warning{padding:16px;border:1px solid color-mix(in srgb,var(--rh-warning) 35%,var(--rh-line));background:var(--rh-soft);border-radius:10px;margin-top:14px;display:flex;flex-direction:column;gap:10px}
 .rh-results{margin-top:24px}.rh-results-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:13px}.rh-results-title{display:flex;align-items:center;gap:8px}.rh-filters{display:flex;gap:5px;flex-wrap:wrap;margin-bottom:15px}.rh-filter{border:1px solid transparent;background:transparent;color:var(--rh-muted);padding:5px 10px;border-radius:6px;font-size:11px}.rh-filter[aria-pressed="true"]{background:var(--rh-surface);border-color:var(--rh-line);color:var(--rh-ink);box-shadow:0 1px 2px #10182806}.rh-jobs{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:15px}.rh-job{overflow:hidden}.rh-job-preview{position:relative;background:var(--rh-soft);border-bottom:1px solid var(--rh-line);min-height:150px;display:flex;align-items:center;justify-content:center;padding:0}.rh-job-media{display:block;width:100%;max-height:280px;object-fit:contain;background:var(--rh-soft)}.rh-job-audio{padding:24px;width:100%}.rh-job-wait{padding:28px;text-align:center;display:flex;flex-direction:column;align-items:center;gap:9px;color:var(--rh-muted);font-size:11px}.rh-job-wait svg{color:var(--rh-brand)}.rh-job-info{padding:14px 15px}.rh-job-title{font-size:12px;font-weight:650;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.rh-job-meta{display:flex;justify-content:space-between;gap:10px;color:var(--rh-muted);font-size:10px;margin-top:8px}.rh-status{display:inline-flex;align-items:center;gap:5px;color:var(--rh-muted);font-size:10px}.rh-status[data-state="ready"]{color:var(--rh-success)}.rh-status[data-state="running"],.rh-status[data-state="queued"],.rh-status[data-state="downloading"]{color:var(--rh-brand)}.rh-status[data-state="failed"],.rh-status[data-state="download_failed"],.rh-status[data-state="submit_unknown"]{color:var(--rh-danger)}.rh-job-details{margin-top:10px;border-top:1px solid var(--rh-line);padding-top:9px}.rh-job-details summary{font-size:10px;color:var(--rh-muted);cursor:pointer}.rh-job-details code{font-size:9px;display:block;overflow-wrap:anywhere;margin:7px 0;color:var(--rh-muted)}.rh-progress{height:3px;background:var(--rh-line);width:100%;border-radius:4px;overflow:hidden;margin-top:3px}.rh-progress span{display:block;height:100%;background:var(--rh-brand);min-width:6px}.rh-empty{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;padding:45px 20px;border:1px dashed var(--rh-line);border-radius:12px;color:var(--rh-muted);text-align:center;background:var(--rh-surface)}.rh-empty strong{color:var(--rh-ink);font-size:12px}.rh-empty svg{opacity:.6}.rh-empty small{font-size:11px;max-width:280px}
-.rh-drawer-layer{position:absolute;inset:0;z-index:20;display:flex;justify-content:flex-end;min-height:700px}.rh-backdrop{position:absolute;inset:0;border:0;background:#10182844;cursor:default!important}.rh-drawer{position:sticky;top:0;z-index:1;width:min(410px,100%);background:var(--rh-surface);border-left:1px solid var(--rh-line);box-shadow:-12px 0 40px #10182814;align-self:flex-start;min-width:0;height:100svh;max-height:100svh;overflow-y:auto}.rh-drawer-head{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:20px;border-bottom:1px solid var(--rh-line)}.rh-drawer-content{padding:22px;display:flex;flex-direction:column;gap:24px}.rh-setting-group{display:flex;flex-direction:column;gap:14px}.rh-setting-heading{font-size:12px;font-weight:700;display:flex;align-items:center;gap:8px}.rh-toggle-row{display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:12px;cursor:pointer}.rh-switch{position:relative;display:inline-flex;flex-shrink:0;width:34px;height:20px}.rh-switch input{position:absolute;inset:0;opacity:0;margin:0;width:100%;height:100%;z-index:1;cursor:pointer}.rh-switch-track{width:100%;height:100%;border-radius:20px;background:var(--rh-line);transition:background .15s}.rh-switch-track:after{content:'';position:absolute;width:14px;height:14px;border-radius:50%;top:3px;left:3px;background:#fff;box-shadow:0 1px 3px #0002;transition:transform .15s}.rh-switch input:checked+.rh-switch-track{background:var(--rh-brand)}.rh-switch input:checked+.rh-switch-track:after{transform:translateX(14px)}.rh-switch input:focus-visible+.rh-switch-track{outline:3px solid var(--rh-brand-soft);outline-offset:3px}.rh-switch input:disabled+.rh-switch-track{opacity:.5}.rh-skeleton{height:13px;border-radius:5px;background:var(--rh-line);opacity:.5;margin:12px 0}
+
+.rh-video-summary{display:flex;align-items:center;flex-wrap:wrap;gap:12px;padding:12px 12px 9px}
+.rh-video-summary-copy{flex:1 1 150px;min-width:0;display:flex;flex-direction:column;gap:2px}
+.rh-video-summary-status{display:flex;align-items:center;justify-content:space-between;gap:6px}
+.rh-video-summary .rh-status{font-size:9px}
+.rh-video-summary-time{font-size:9px;color:var(--rh-muted);font-variant-numeric:tabular-nums}
+.rh-video-summary .rh-job-title{font-size:12px;margin-top:1px}
+.rh-video-meta{font-size:9.5px;color:var(--rh-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.rh-video-binding{display:flex;align-items:center;gap:4px;margin-top:auto;color:var(--rh-success);font-size:9px;line-height:1.5}
+.rh-video-binding[data-state="error"]{color:var(--rh-danger)}
+.rh-video-binding .icon{width:10px;height:10px}
+.rh-video-thumb{position:relative;display:block;flex:none;padding:0;border:0;border-radius:8px;overflow:hidden;background:#0e1721;box-shadow:0 1px 3px #10182824;cursor:pointer}
+.rh-video-thumb-hit{position:absolute;inset:0;z-index:2;width:100%;height:100%;padding:0;border:0;border-radius:inherit;background:transparent;cursor:pointer}
+.rh-video-thumb-hit:focus-visible{outline:none;box-shadow:inset 0 0 0 3px var(--rh-brand)}
+.rh-video-thumb video{display:block;width:100%;height:100%;object-fit:cover;background:#0e1721;pointer-events:none}
+.rh-video-thumb-card{width:122px;height:69px}
+.rh-video-thumb-toast{width:112px;height:63px}
+.rh-video-play{position:absolute;left:50%;top:50%;pointer-events:none;transform:translate(-50%,-50%);display:grid;place-items:center;width:29px;height:29px;border-radius:50%;background:#070d1699;border:1px solid #ffffff8c;color:#fff;backdrop-filter:blur(3px);box-shadow:0 4px 14px #00000047;transition:background .18s,transform .18s,border-color .18s}
+.rh-video-thumb-toast .rh-video-play{width:27px;height:27px}
+.rh-video-thumb:hover .rh-video-play,.rh-video-thumb:focus-visible .rh-video-play{background:var(--rh-brand);border-color:transparent;transform:translate(-50%,-50%) scale(1.06)}
+.rh-video-play .icon{width:12px;height:12px;margin-left:1px}
+.rh-video-duration{position:absolute;right:5px;bottom:4px;pointer-events:none;padding:1px 4px;border-radius:4px;background:#060b12b8;color:#fff;font-size:8px;line-height:1.5;letter-spacing:.2px;font-variant-numeric:tabular-nums}
+.rh-job-info-compact{padding:0 12px 12px}
+.rh-job-info-compact>.rh-row{padding-top:10px;border-top:1px solid var(--rh-line)}
+.rh-job-info-compact .rh-job-details{margin-top:9px}
+.rh-video-toasts{position:fixed;z-index:15;left:12px;right:12px;bottom:12px;display:flex;flex-direction:column-reverse;align-items:flex-end;gap:8px;pointer-events:none}
+.rh-video-toasts-raised{bottom:90px}
+.rh-video-toast{position:relative;display:flex;align-items:center;gap:11px;width:100%;max-width:396px;padding:9px;border:1px solid var(--rh-line);border-radius:13px;background:var(--rh-surface);box-shadow:0 16px 40px #1018282e,0 2px 8px #10182814;pointer-events:auto;cursor:pointer;overflow:hidden;animation:rh-toast-in .3s cubic-bezier(.22,1,.36,1)}
+.rh-video-toast::before{content:"";position:absolute;left:0;top:9px;bottom:9px;width:3px;border-radius:0 3px 3px 0;background:var(--rh-success)}
+.rh-video-toast:hover{border-color:color-mix(in srgb,var(--rh-brand) 38%,var(--rh-line));box-shadow:0 20px 48px #1018283d,0 2px 8px #1018281a}
+.rh-video-toast-copy{flex:1;min-width:0;padding-right:24px}
+.rh-video-toast-kicker{display:flex;align-items:center;gap:5px;color:var(--rh-success);font-size:9px;font-weight:650;line-height:1.5}
+.rh-video-check{display:grid;place-items:center;width:13px;height:13px;flex:none;border-radius:50%;background:var(--rh-success);color:var(--rh-surface)}
+.rh-video-check .icon{width:8px;height:8px;stroke-width:2.6}
+.rh-video-toast-title{margin-top:1px;font-size:11.5px;font-weight:650;line-height:1.45;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.rh-video-toast-meta{margin-top:1px;color:var(--rh-muted);font-size:9px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.rh-video-toast-close{position:absolute;top:5px;right:5px;display:grid;place-items:center;width:21px;height:21px;padding:0;border:0;border-radius:6px;background:transparent;color:var(--rh-muted);opacity:.72}
+.rh-video-toast-close:hover{background:var(--rh-soft);color:var(--rh-ink);opacity:1}
+.rh-video-toast-close .icon{width:12px;height:12px}
+@keyframes rh-toast-in{from{opacity:0;transform:translateY(12px) scale(.985)}to{opacity:1;transform:none}}
+.rh-player-dialog{position:fixed;inset:0;display:grid;place-items:center;width:100%;max-width:none;height:100%;max-height:none;margin:0;padding:28px;border:0;background:transparent;color:#e9f0f9;overflow:auto;box-sizing:border-box}
+.rh-player-dialog:not([open]){display:none}
+.rh-player-dialog::backdrop{background:#03070ccc;backdrop-filter:blur(9px)}
+.rh-player{display:flex;flex-direction:column;width:min(880px,100%);max-height:calc(100vh - 56px);overflow:hidden;border:1px solid #ffffff21;border-radius:16px;background:#0e1520;color:#e9f0f9;box-shadow:0 40px 120px #000000a6,0 1px 0 #ffffff0f inset;animation:rh-player-in .28s cubic-bezier(.22,1,.36,1)}
+@keyframes rh-player-in{from{opacity:0;transform:translateY(10px) scale(.98)}to{opacity:1;transform:none}}
+.rh-player-head{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;padding:15px 18px 13px;border-bottom:1px solid #ffffff14;background:#111a26}
+.rh-player-kicker{color:#7fa7dd;font-size:8px;font-weight:700;letter-spacing:1.6px}
+.rh-player-dialog .rh-player-title{margin:3px 0 0;font-size:15px;line-height:1.4;letter-spacing:-.2px;font-weight:650;color:#e9f0f9}
+.rh-player-sub{margin-top:3px;color:#8b9bb0;font-size:9.5px}
+.rh-player-close{flex:none;display:grid;place-items:center;width:31px;height:31px;padding:0;border:1px solid #ffffff1f;border-radius:8px;background:#ffffff0a;color:#d9e5f4}
+.rh-player-close:hover{background:#ffffff1a;border-color:#ffffff33}
+.rh-player-close .icon{width:14px;height:14px}
+.rh-player-stage{position:relative;background:#000;aspect-ratio:16/9;max-height:calc(100vh - 270px)}
+.rh-player-stage video{display:block;width:100%;height:100%;object-fit:contain;background:#000}
+.rh-player-foot{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:11px 18px;border-top:1px solid #ffffff14;background:#111a26}
+.rh-player-chips{display:flex;align-items:center;gap:5px;flex-wrap:wrap}
+.rh-player-chip{padding:2px 7px;border:1px solid #ffffff17;border-radius:999px;background:#ffffff0b;color:#9fadc0;font-size:9px;line-height:1.6;white-space:nowrap}
+.rh-player-actions{display:flex;align-items:center;gap:6px;flex:none}
+.rh-player-btn{display:inline-flex;align-items:center;justify-content:center;gap:5px;padding:6px 10px;border:1px solid #ffffff21;border-radius:7px;background:#ffffff0b;color:#d8e4f4;font-size:10px;line-height:1.45;font-weight:550;white-space:nowrap}
+.rh-player-btn:hover{background:#ffffff1a}
+.rh-player-btn.primary{background:#2f6fdd;border-color:#2f6fdd;color:#fff}
+.rh-player-btn.primary:hover{background:#3b7ceb}
+.rh-player-btn .icon{width:12px;height:12px}
+@media (max-width:560px){.rh-studio .rh-player-dialog{padding:12px}.rh-studio .rh-player{width:100%;border-radius:12px}.rh-studio .rh-player-foot{align-items:flex-start;flex-direction:column}.rh-studio .rh-player-stage{max-height:none}.rh-studio .rh-video-toasts{left:8px;right:8px;bottom:8px}.rh-studio .rh-video-toasts-raised{bottom:84px}.rh-studio .rh-video-thumb-toast{width:96px;height:54px}}
+.rh-pregen{margin-top:24px}.rh-pregen-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:12px}.rh-pregen-entry{overflow:hidden;border:1px solid var(--rh-line);border-radius:11px;background:var(--rh-surface);display:flex;flex-direction:column;min-width:0}.rh-pregen-preview{background:var(--rh-soft);border-bottom:1px solid var(--rh-line);min-height:130px;display:flex;align-items:center;justify-content:center;position:relative}.rh-pregen-video{display:block;width:100%;max-height:240px;object-fit:contain;background:#000}.rh-pregen-info{padding:12px;display:flex;flex-direction:column;gap:8px;min-width:0}.rh-pregen-meta{display:flex;justify-content:space-between;gap:8px;color:var(--rh-muted);font-size:10px}.rh-pregen-desc{margin:0;font-size:12px;line-height:1.55;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}.rh-pregen-actions{display:flex;gap:6px;flex-wrap:wrap;margin-top:auto}.rh-pregen-settings{display:grid;grid-template-columns:repeat(3,minmax(120px,1fr)) auto auto;gap:10px;align-items:end;padding-bottom:14px;border-bottom:1px solid var(--rh-line)}.rh-pregen-empty{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;padding:26px 18px;margin-top:12px;border:1px dashed var(--rh-line);border-radius:10px;color:var(--rh-muted);text-align:center}.rh-pregen-empty strong{color:var(--rh-ink);font-size:12px}.rh-pregen-empty small{font-size:11px;max-width:340px}
+.rh-drawer-layer{position:absolute;inset:0;z-index:20;display:flex;justify-content:flex-end;min-height:0}.rh-backdrop{position:absolute;inset:0;border:0;background:#10182844;cursor:default!important}.rh-drawer{position:sticky;top:0;z-index:1;width:min(410px,100%);background:var(--rh-surface);border-left:1px solid var(--rh-line);box-shadow:-12px 0 40px #10182814;align-self:flex-start;min-width:0;height:100svh;max-height:100svh;overflow-y:auto}.rh-drawer-head{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:20px;border-bottom:1px solid var(--rh-line)}.rh-drawer-content{padding:22px;display:flex;flex-direction:column;gap:24px}.rh-setting-group{display:flex;flex-direction:column;gap:14px}.rh-setting-heading{font-size:12px;font-weight:700;display:flex;align-items:center;gap:8px}.rh-toggle-row{display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:12px;cursor:pointer}.rh-switch{position:relative;display:inline-flex;flex-shrink:0;width:34px;height:20px}.rh-switch input{position:absolute;inset:0;opacity:0;margin:0;width:100%;height:100%;z-index:1;cursor:pointer}.rh-switch-track{width:100%;height:100%;border-radius:20px;background:var(--rh-line);transition:background .15s}.rh-switch-track:after{content:'';position:absolute;width:14px;height:14px;border-radius:50%;top:3px;left:3px;background:#fff;box-shadow:0 1px 3px #0002;transition:transform .15s}.rh-switch input:checked+.rh-switch-track{background:var(--rh-brand)}.rh-switch input:checked+.rh-switch-track:after{transform:translateX(14px)}.rh-switch input:focus-visible+.rh-switch-track{outline:3px solid var(--rh-brand-soft);outline-offset:3px}.rh-switch input:disabled+.rh-switch-track{opacity:.5}.rh-settings-status{padding:10px 12px;border:1px solid var(--rh-line);border-radius:9px;background:var(--rh-soft);font-size:11px;line-height:1.65;color:var(--rh-muted)}.rh-settings-status[data-state="saved"]{color:var(--rh-success);border-color:color-mix(in srgb,var(--rh-success) 28%,var(--rh-line))}.rh-settings-status[data-state="dirty"]{color:var(--rh-warning);border-color:color-mix(in srgb,var(--rh-warning) 30%,var(--rh-line))}.rh-settings-status[data-state="saving"]{color:var(--rh-brand)}.rh-settings-status[data-state="error"],.rh-settings-status[data-state="conflict"]{color:var(--rh-danger);border-color:color-mix(in srgb,var(--rh-danger) 28%,var(--rh-line))}.rh-settings-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.rh-model-field{display:flex;flex-direction:column;gap:8px;padding:10px;border:1px solid var(--rh-line);border-radius:9px;background:var(--rh-soft);min-width:0}.rh-model-field-head{display:flex;align-items:center;justify-content:space-between;gap:8px;min-width:0}.rh-model-field-title{font-size:11px;font-weight:650;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.rh-skeleton{height:13px;border-radius:5px;background:var(--rh-line);opacity:.5;margin:12px 0}
 @container (max-width:780px){.rh-composer{grid-template-columns:1fr}.rh-side{border-left:0;border-top:1px solid var(--rh-line)}.rh-side>.rh-stack{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}.rh-side .rh-fold,.rh-side .rh-rule,.rh-side .rh-section-label{grid-column:1/-1}.rh-prompt{min-height:220px}.rh-workflow-hint{display:none}.rh-jobs{grid-template-columns:repeat(auto-fill,minmax(220px,1fr))}}
 @container (max-width:480px){.rh-topbar{padding:14px}.rh-body{padding:16px 12px}.rh-hero,.rh-prompt-pane{padding:18px 16px}.rh-references{padding:16px}.rh-side{padding:18px 16px}.rh-brand-name{font-size:13px}.rh-brand-sub,.rh-context,.rh-top-actions .rh-pill,.rh-prompt-meta .rh-note:last-child{display:none}.rh-nav{margin-bottom:15px}.rh-workflow{gap:8px;padding:10px;margin-top:16px}.rh-workflow select{padding:8px}.rh-studio h2{font-size:20px}.rh-side>.rh-stack{display:flex}.rh-slots{grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.rh-slot{padding:9px}.rh-upload{height:105px}.rh-slot .rh-note{font-size:10px}.rh-submitbar{padding:12px;gap:10px}.rh-submit-sub{display:none}.rh-btn-primary{padding:11px 17px}.rh-submit-summary{font-size:10px}.rh-jobs{grid-template-columns:1fr}.rh-results-head{gap:6px}.rh-drawer-content{padding:18px}.rh-top-actions{gap:4px}.rh-topbar .rh-btn{padding:7px 9px}}
 @media(prefers-reduced-motion:reduce){.rh-studio *{transition:none!important;animation:none!important}}
+@container (max-width:780px){.rh-pregen-settings{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@container (max-width:480px){.rh-pregen-grid{grid-template-columns:1fr}.rh-pregen-settings{grid-template-columns:1fr}}
 `
     const paths = {
       settings: ['M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8', 'm19.4 15 .1.1 1.4 1.1-1.4 2.4-1.7-.7a8 8 0 0 1-2.2 1.3l-.3 1.8h-2.8l-.3-1.8a8 8 0 0 1-2.2-1.3l-1.7.7L6.9 16l1.4-1.1a8 8 0 0 1 0-2.6L6.9 11l1.4-2.4 1.7.7a8 8 0 0 1 2.2-1.3l.3-1.8h2.8l.3 1.8a8 8 0 0 1 2.2 1.3l1.7-.7 1.4 2.4-1.4 1.1a8 8 0 0 1 0 2.9'],
@@ -40,6 +113,7 @@ window.__ModuleLoader__.load({
       refresh: ['M20 7v5h-5M4 17v-5h5', 'M6.1 7a7 7 0 0 1 11.5-2L20 8M4 16l2.4 3A7 7 0 0 0 18 17'],
       upload: ['M12 16V3m-5 5 5-5 5 5M4 15v5h16v-5'],
       image: ['M3 3h18v18H3zM3 16l5-5 6 6 3-3 4 4', 'M16 7h.01'],
+      play: ['M8 5.4v13.2L19 12 8 5.4Z'],
       video: ['M3 5h13v14H3zM16 10l5-3v10l-5-3'],
       audio: ['M9 18V5l11-2v13M9 5l11-2', 'M9 17c0 3-6 4-6 1s6-4 6-1M20 15c0 3-6 4-6 1s6-4 6-1'],
       arrow: ['M5 12h14m-5-5 5 5-5 5'],
@@ -49,15 +123,87 @@ window.__ModuleLoader__.load({
       link: ['m9 15 6-6M8 17l-1 1a3.5 3.5 0 0 1-5-5l4-4a3.5 3.5 0 0 1 5 0M16 7l1-1a3.5 3.5 0 0 1 5 5l-4 4a3.5 3.5 0 0 1-5 0'],
     }
     function icon(name, size = 16) {
-      return h('svg', { width: size, height: size, viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor',
+      const fill = name === 'play'
+      return h('svg', { width: size, height: size, viewBox: '0 0 24 24', fill: fill ? 'currentColor' : 'none', stroke: fill ? 'none' : 'currentColor',
         strokeWidth: 1.6, strokeLinecap: 'round', strokeLinejoin: 'round', 'aria-hidden': true },
         (paths[name] || paths.image).map((d, index) => h('path', { key: index, d })))
     }
 
-    async function request(body, signal) {
+    const MEDIA_URL = /^\/api\/dsh-runninghub\/media\?/
+    const isMediaUrl = url => typeof url === 'string' && MEDIA_URL.test(url)
+    const jobLabel = job => job?.model || '生成任务'
+    const canRegenerateJob = job => job?.replayable === true && ['ready', 'failed', 'download_failed'].includes(job.status)
+    const hasJobBinding = job => Boolean(job?.binding && (job.binding.generationId || job.binding.gameId || Number.isInteger(job.binding.turn)))
+    function videoAttachmentOf(job) {
+      const items = Array.isArray(job?.attachments) ? job.attachments : []
+      return items.find(item => item?.kind === 'video' && isMediaUrl(item.url)) || null
+    }
+    function compactVideoOf(job) {
+      const items = Array.isArray(job?.attachments) ? job.attachments : []
+      return items.length === 1 && items[0]?.kind === 'video' && isMediaUrl(items[0].url) ? items[0] : null
+    }
+    function formatDuration(value) {
+      if (!Number.isFinite(value) || value < 0) return ''
+      const total = Math.round(value)
+      return Math.floor(total / 60) + ':' + String(total % 60).padStart(2, '0')
+    }
+    function formatJobTime(job) {
+      const time = new Date(job?.createdAt)
+      return Number.isNaN(time.getTime()) ? '' : time.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+    }
+    function formatJobClock(job) {
+      const time = new Date(job?.createdAt)
+      return Number.isNaN(time.getTime()) ? '' : time.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
+    }
+    function toastMeta(job) {
+      const parts = []
+      const clock = formatJobClock(job)
+      if (clock) parts.push(clock)
+      if (job?.costCoins != null) parts.push(job.costCoins + ' 币')
+      if (hasJobBinding(job)) parts.push(job.insertionError ? '插入失败' : '已绑定正文')
+      else parts.push('独立创作')
+      return parts.join(' · ')
+    }
+    function playerSubtitle(job) {
+      const parts = []
+      if (Number.isInteger(job?.binding?.turn)) parts.push('第 ' + job.binding.turn + ' 轮')
+      if (hasJobBinding(job)) parts.push(job.insertionError ? '正文插入失败' : '已绑定正文版本')
+      return parts.join(' · ') || '视频预览'
+    }
+    // 媒体路由偶尔会在面板刚挂载时返回一次失败（鉴权/范围请求的瞬时问题），
+    // 原生 <video> 不会自己重试。这里只给 RunningHub 媒体 URL 加一次 retry 参数；
+    // React 的 src prop 没变，重渲染不会把改过的 src 覆盖回去。
+    function retryMediaOnce(event) {
+      const video = event.currentTarget
+      if (!video || typeof video.src !== 'string') return
+      let url
+      try { url = new URL(video.src, window.location.href) } catch { return }
+      if (!url.pathname.startsWith('/api/dsh-runninghub/media') || url.searchParams.has('retry')) return
+      url.searchParams.set('retry', '1')
+      video.src = url.href
+    }
+
+    function VideoThumb({ item, className, label, onClick }) {
+      const [duration, setDuration] = useState(null)
+      return h('div', { className: 'rh-video-thumb' + (className ? ' ' + className : '') },
+        h('video', {
+          src: item.url, preload: 'metadata', muted: true, playsInline: true, controls: false,
+          'aria-hidden': true, tabIndex: -1, onError: retryMediaOnce,
+          onLoadedMetadata: event => {
+            const value = event.currentTarget.duration
+            if (Number.isFinite(value) && value > 0) setDuration(value)
+          },
+        }),
+        h('span', { className: 'rh-video-play', 'aria-hidden': true }, icon('play', 12)),
+        duration != null ? h('span', { className: 'rh-video-duration' }, formatDuration(duration)) : null,
+        h('button', { type: 'button', className: 'rh-video-thumb-hit', onClick, 'aria-label': label, title: label }))
+    }
+
+    async function request(body, signal, gameId) {
       let response
       try {
-        response = await fetch(API, {
+        const url = body ? API : API + (gameId ? '?gameId=' + encodeURIComponent(String(gameId)) : '')
+        response = await fetch(url, {
           method: body ? 'POST' : 'GET', credentials: 'same-origin', cache: 'no-store', signal,
           ...(body ? { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : {}),
         })
@@ -172,13 +318,12 @@ window.__ModuleLoader__.load({
       const [refreshBusy, setRefreshBusy] = useState(false)
       const [refreshError, setRefreshError] = useState('')
       const [model, setModel] = useState('')
-      const manualModel = useRef(false)
+      const selectionBusy = useRef(false)
       const [draftContext, setDraftContext] = useState('')
       const [workflow, setWorkflow] = useState(null)
       const [workflowBusy, setWorkflowBusy] = useState(false)
       const [workflowError, setWorkflowError] = useState('')
       const [prompt, setPrompt] = useState('')
-      const [applyDefaults, setApplyDefaults] = useState(true)
       const [duration, setDuration] = useState('')
       const [ratio, setRatio] = useState('')
       const [megapixels, setMegapixels] = useState('')
@@ -188,17 +333,63 @@ window.__ModuleLoader__.load({
       const [references, setReferences] = useState({})
       const [referenceErrors, setReferenceErrors] = useState({})
       const [bindToTurn, setBindToTurn] = useState(true)
+      const [settingsBusy, setSettingsBusy] = useState(false)
+      const [settingsStatus, setSettingsStatus] = useState('idle')
+      const [settingsDirty, setSettingsDirty] = useState(false)
+      const [settingsError, setSettingsError] = useState('')
+      const [settingsNotice, setSettingsNotice] = useState('')
+      const [preferenceBusy, setPreferenceBusy] = useState(false)
+      const [preferenceError, setPreferenceError] = useState('')
+      const [pregenDraft, setPregenDraft] = useState({ count: 0, perTurn: 0, maxAge: 6, review: true })
+      const [pregenBusy, setPregenBusy] = useState({})
+      const [pregenRefillBusy, setPregenRefillBusy] = useState(false)
+      const [pregenError, setPregenError] = useState('')
+      const [pregenNotice, setPregenNotice] = useState('')
+      const pregenDraftDirty = useRef(false)
+      const [seedDraft, setSeedDraft] = useState({})
+      const [modelDraft, setModelDraft] = useState({})
+      const [optionGroups, setOptionGroups] = useState([])
+      const [optionGroupsError, setOptionGroupsError] = useState('')
+      const [slotModes, setSlotModes] = useState({})
+      const [clearedDefaults, setClearedDefaults] = useState({})
+      const settingsParts = useRef(new Set())
+      const settingsDirtyRef = useRef(false)
+      const settingsLock = useRef(false)
+      const settingsVersion = useRef(0)
+      const modelRef = useRef(model)
+      modelRef.current = model
+      const autoSaveTimer = useRef(null)
+      const autoSavePaused = useRef(false)
+      const autoSaveConflict = useRef(false)
+      const saveSettingsRef = useRef(null)
+      // 主面板里的提示词类自定义参数只对本次生成生效，不能被“自动保存成功”清掉。
+      const perShotCustomKeys = useRef(new Set())
+      // 主面板上传的参考素材同样只覆盖本次生成，不能混进设置同步的 defaults.references。
+      const perShotReferenceSlots = useRef(new Set())
+      const prefsLoaded = useRef(false)
+      const optionGroupsContext = useRef('')
       const [submitBusy, setSubmitBusy] = useState(false)
       const [submitError, setSubmitError] = useState('')
       const [submitNotice, setSubmitNotice] = useState('')
       const [pending, setPending] = useState(() => pendingRequests.get(contextKey) || null)
       const [retrying, setRetrying] = useState({})
       const [downloadErrors, setDownloadErrors] = useState({})
+      const [regenerating, setRegenerating] = useState({})
+      const [regenerateErrors, setRegenerateErrors] = useState({})
+      const [regenerateNotice, setRegenerateNotice] = useState('')
+      const [videoNotices, setVideoNotices] = useState([])
+      const [player, setPlayer] = useState(null)
+      const [playerMedia, setPlayerMedia] = useState({})
+      const playerDialogRef = useRef(null)
+      const playerCloseRef = useRef(null)
+      const seenJobs = useRef(null)
+      const toastedJobs = useRef(new Set())
       const alive = useRef(false)
       const controllers = useRef(new Set())
       const configLock = useRef(false)
       const submitLock = useRef(false)
       const downloadLocks = useRef(new Set())
+      const regenerateLocks = useRef(new Set())
       const baseInitialized = useRef(false)
       const baseDirty = useRef(false)
       const pendingRef = useRef(pending)
@@ -207,6 +398,7 @@ window.__ModuleLoader__.load({
         alive.current = true
         return () => {
           alive.current = false
+          if (autoSaveTimer.current) { clearTimeout(autoSaveTimer.current); autoSaveTimer.current = null }
           controllers.current.forEach(controller => controller.abort())
           controllers.current.clear()
         }
@@ -250,6 +442,8 @@ window.__ModuleLoader__.load({
         if (value) pendingRequests.set(contextKey, value)
         else pendingRequests.delete(contextKey)
         if (alive.current) setPending(value)
+        // 提交结果确认完，继续把之前没写完的设置同步掉。
+        if (!value && settingsDirtyRef.current) scheduleAutoSave(0)
       }
       function mergeJob(job) {
         if (!job || typeof job.id !== 'string') throw new Error('宿主未返回有效的任务 ID')
@@ -269,14 +463,23 @@ window.__ModuleLoader__.load({
           current = controller()
           setRefreshBusy(true)
           try {
-            const data = await request(null, current.signal)
+            const data = await request(null, current.signal, gameId)
             if (!active || !alive.current) return
             if (!data || !Array.isArray(data.jobs) || !Array.isArray(data.workflows)) {
               throw new Error('宿主状态格式无效：缺少 jobs 或 workflows')
             }
             setSummary({ configured: data.configured, baseURL: data.baseURL,
-              autoInsert: data.autoInsert === true, adapter: data.adapter, model: data.model, jobs: data.jobs, workflows: data.workflows,
+              autoInsert: data.autoInsert === true, applyDefaults: data.applyDefaults !== false,
+              bindToTurn: data.bindToTurn !== false, workflowSettings: data.workflowSettings === true,
+              adapter: data.adapter, model: data.model, defaultModel: data.defaultModel || '',
+              templateMode: data.templateMode || '', templateError: data.templateError || '',
+              jobs: data.jobs, workflows: data.workflows,
+              pregen: data.pregen || null,
               gatewayError: data.gatewayError || '', settingsError: data.settingsError || '' })
+            if (!prefsLoaded.current) {
+              prefsLoaded.current = true
+              setBindToTurn(data.bindToTurn !== false)
+            }
             if (!baseInitialized.current) {
               if (!baseDirty.current) setBaseURL(data.baseURL || DEFAULT_BASE)
               baseInitialized.current = true
@@ -299,27 +502,427 @@ window.__ModuleLoader__.load({
         }
       }, [visible, refreshVersion])
 
+      const jobsKey = (summary?.jobs || []).map(job => (job?.id || '') + ':' + (job?.status || '')).join('|')
+      useEffect(() => {
+        const jobs = summary?.jobs
+        if (!Array.isArray(jobs) || visible === false) return
+        if (seenJobs.current === null) {
+          seenJobs.current = new Map(jobs.map(job => [job.id, job.status]))
+          return
+        }
+        const previous = seenJobs.current
+        const completed = []
+        for (const job of jobs) {
+          if (!job || typeof job.id !== 'string') continue
+          const before = previous.get(job.id)
+          previous.set(job.id, job.status)
+          if (job.status !== 'ready' || before === 'ready') continue
+          if (toastedJobs.current.has(job.id)) continue
+          const item = videoAttachmentOf(job)
+          if (!item) continue
+          toastedJobs.current.add(job.id)
+          completed.push({ id: job.id, job, item })
+        }
+        if (completed.length) setVideoNotices(current => [...completed, ...current].slice(0, 3))
+      }, [jobsKey, visible])
+
+      useEffect(() => {
+        if (!player) return
+        const dialog = playerDialogRef.current
+        const previous = document.activeElement
+        if (dialog) {
+          if (typeof dialog.showModal === 'function') {
+            try { if (!dialog.open) dialog.showModal() } catch { dialog.setAttribute('open', '') }
+          } else dialog.setAttribute('open', '')
+          if (!dialog.open) dialog.setAttribute('open', '')
+        }
+        playerCloseRef.current?.focus?.()
+        return () => {
+          if (dialog) {
+            try {
+              if (typeof dialog.close === 'function' && dialog.open) dialog.close()
+              else dialog.removeAttribute('open')
+            } catch { dialog.removeAttribute('open') }
+            if (dialog.open) dialog.removeAttribute('open')
+          }
+          if (previous && previous !== document.body && previous.isConnected !== false) previous.focus?.()
+        }
+      }, [player])
+
       const workflowListVersion = JSON.stringify((summary?.workflows || []).map(item => [item.alias, item.revision || item]))
+      const pregenSettingsKey = summary?.pregen ? JSON.stringify(summary.pregen.settings) : ''
+      useEffect(() => {
+        if (!summary?.pregen || pregenDraftDirty.current) return
+        setPregenDraft({ ...summary.pregen.settings })
+      }, [pregenSettingsKey])
       const syncContext = model + ':' + configVersion
       useEffect(() => {
         if (!summary?.configured || lockedForSync()) return
         const available = (summary.workflows || []).filter(item => !item.broken)
         const preferred = available.some(item => item.alias === summary.model) ? summary.model : available[0]?.alias || ''
-        if (!available.some(item => item.alias === model) || !manualModel.current && model !== preferred) {
-          manualModel.current = false
-          setModel(preferred)
-        }
+        // 面板选择会写回宿主；selectionBusy 期间不要被轮询回来的旧值盖掉。
+        if (!selectionBusy.current && preferred && model !== preferred) setModel(preferred)
       }, [workflowListVersion, summary?.model, summary?.configured, configBusy, submitBusy, pending])
       function lockedForSync() { return configBusy || submitBusy || Boolean(pendingRef.current) }
+
+      function markSettings(part) {
+        settingsParts.current.add(part)
+        settingsVersion.current += 1
+        settingsDirtyRef.current = true
+        setSettingsDirty(true)
+        setSettingsStatus('dirty')
+        setSettingsError('')
+        setSettingsNotice('')
+        autoSavePaused.current = false
+        scheduleAutoSave()
+      }
+
+      // 改动后短暂合并再写网关：输入框连续敲字只落一次，离散控件也感觉是“立刻保存”。
+      function scheduleAutoSave(delay = 500) {
+        if (autoSavePaused.current || autoSaveConflict.current) return
+        if (autoSaveTimer.current) clearTimeout(autoSaveTimer.current)
+        autoSaveTimer.current = setTimeout(() => {
+          autoSaveTimer.current = null
+          if (!alive.current) return
+          if (settingsLock.current || submitLock.current) { scheduleAutoSave(250); return }
+          // 待核对的提交期间不写设置；等用户处理完 pending 再续。
+          if (pendingRef.current) { setSettingsStatus('dirty'); return }
+          void saveSettingsRef.current?.({ auto: true })
+        }, delay)
+      }
+
+      function reloadSettings() {
+        const discard = settingsDirtyRef.current || autoSaveConflict.current
+        if (autoSaveTimer.current) { clearTimeout(autoSaveTimer.current); autoSaveTimer.current = null }
+        settingsParts.current.clear()
+        settingsVersion.current += 1
+        settingsDirtyRef.current = false
+        autoSavePaused.current = false
+        autoSaveConflict.current = false
+        setSettingsDirty(false)
+        setSettingsStatus('idle')
+        setSettingsError('')
+        setSettingsNotice('')
+        if (discard) {
+          perShotCustomKeys.current.clear()
+          perShotReferenceSlots.current.clear()
+          setCustom({})
+          setReferences({})
+          setReferenceErrors({})
+          setDuration('')
+          setRatio('')
+          setMegapixels('')
+          setWidth(''); setHeight('')
+          setSeedDraft({})
+          setModelDraft({})
+          setSlotModes({})
+          setClearedDefaults({})
+        }
+        setRefreshVersion(value => value + 1)
+      }
+
+      function adoptWorkflowSettings(data) {
+        if (!data) return
+        const seeds = {}
+        for (const seed of data.seedTargets || []) seeds[seed.target] = seed.pinnedValue !== undefined ? String(seed.pinnedValue) : ''
+        setSeedDraft(seeds)
+        const models = {}
+        for (const field of data.modelFields || []) models[field.target] = { value: field.value ?? '', groupId: field.groupId ?? '' }
+        setModelDraft(models)
+        const modes = {}
+        for (const slot of data.referenceSlots || []) modes[slot.nodeId] = !slot.bypassed
+        setSlotModes(modes)
+        setClearedDefaults({})
+        settingsParts.current.clear()
+        settingsDirtyRef.current = false
+        setSettingsDirty(false)
+        setSettingsError('')
+      }
+
+      async function loadOptionGroups() {
+        if (!summary?.configured || summary?.workflowSettings !== true) return
+        const current = controller()
+        try {
+          const data = await request({ action: 'option-groups' }, current.signal)
+          if (!alive.current) return
+          setOptionGroups(Array.isArray(data?.groups) ? data.groups : [])
+          setOptionGroupsError('')
+        } catch (error) {
+          if (alive.current && error.name !== 'AbortError') setOptionGroupsError(message(error))
+        } finally {
+          controllers.current.delete(current)
+        }
+      }
+
+      async function savePreference(patch) {
+        setPreferenceBusy(true)
+        setPreferenceError('')
+        const current = controller()
+        try {
+          const data = await request({ action: 'preferences', ...patch }, current.signal)
+          if (!alive.current) return data
+          setSummary(previous => ({ ...(previous || {}),
+            ...(typeof data?.autoInsert === 'boolean' ? { autoInsert: data.autoInsert } : {}),
+            ...(typeof data?.bindToTurn === 'boolean' ? { bindToTurn: data.bindToTurn } : {}) }))
+          return data
+        } catch (error) {
+          if (alive.current && error.name !== 'AbortError') setPreferenceError(message(error))
+          throw error
+        } finally {
+          controllers.current.delete(current)
+          if (alive.current) setPreferenceBusy(false)
+        }
+      }
+
+      async function changePreference(key, value) {
+        const previous = bindToTurn
+        setBindToTurn(value)
+        try { await savePreference({ [key]: value }) }
+        catch {
+          if (alive.current) setBindToTurn(previous)
+        }
+      }
+
+      function settingsResolution() {
+        const resolution = {}
+        if (resolutionFields.has('aspect_ratio') && ratio.trim()) resolution.aspect_ratio = ratio.trim()
+        if (resolutionFields.has('megapixels') && megapixels.trim()) resolution.megapixels = Number(megapixels)
+        if (dimensionsSupported && !resolutionFields.has('aspect_ratio') && (width.trim() || height.trim())) {
+          if (!width.trim() || !height.trim()) throw new Error('宽度和高度必须成对填写。')
+          resolution.width = Number(width)
+          resolution.height = Number(height)
+        }
+        return Object.keys(resolution).length ? resolution : null
+      }
+
+      function settingsCustom(defaults) {
+        const values = { ...(defaults || {}) }
+        for (const field of workflow?.customFields || []) {
+          // 主面板里的提示词类参数只属于本次生成，不写进客户端默认值。
+          if (perShotCustomKeys.current.has(field.key)) continue
+          if (!own(custom, field.key)) continue
+          const value = custom[field.key]
+          if (value === '' || value === null || value === undefined) delete values[field.key]
+          else values[field.key] = value
+        }
+        return Object.keys(values).length ? values : null
+      }
+
+      function settingsSeeds() {
+        const changes = []
+        for (const target of workflow?.seedTargets || []) {
+          if (target.managedByCustomField) continue
+          const raw = seedDraft[target.target] === undefined ? '' : String(seedDraft[target.target]).trim()
+          const previous = target.pinnedValue !== undefined ? String(target.pinnedValue) : ''
+          if (raw === previous) continue
+          if (!raw) { changes.push({ target: target.target, value: null }); continue }
+          const value = Number(raw)
+          if (!Number.isSafeInteger(value) || value < 0) throw new Error('种子必须是非负整数。')
+          changes.push({ target: target.target, value })
+        }
+        return changes
+      }
+
+      function settingsModelFields() {
+        const changes = []
+        for (const field of workflow?.modelFields || []) {
+          const draft = modelDraft[field.target] || { value: field.value ?? '', groupId: field.groupId ?? '' }
+          const patch = {}
+          if ((draft.groupId || '') !== (field.groupId || '')) patch.groupId = draft.groupId || null
+          if ((draft.value ?? '') !== (field.value ?? '')) patch.value = draft.value ?? ''
+          if (Object.keys(patch).length) changes.push({ target: field.target, ...patch })
+        }
+        return changes
+      }
+
+      function settingsSlots() {
+        const changes = []
+        for (const slot of workflow?.referenceSlots || []) {
+          const enabled = slotModes[slot.nodeId] !== false
+          if (enabled !== !slot.bypassed) changes.push({ nodeId: slot.nodeId, enabled })
+        }
+        return changes
+      }
+
+      async function settingsReferences(signal) {
+        const defaults = workflow?.defaults || {}
+        const current = new Map((defaults.references || []).map(asset => [asset.nodeId, asset]))
+        const items = []
+        // 管线工作流的素材属于子工作流，插件只沿用客户端的整组值，不在设置里改。
+        if (workflow?.pipeline) {
+          for (const asset of defaults.references || []) {
+            items.push({ nodeId: asset.nodeId, kind: asset.kind, ...(asset.note ? { note: asset.note } : {}) })
+          }
+          return items
+        }
+        for (const slot of workflow?.referenceSlots || []) {
+          if (slotModes[slot.nodeId] === false || clearedDefaults[slot.nodeId]) continue
+          const asset = current.get(slot.nodeId)
+          // 主面板的素材/备注是本次生成用的，设置同步只用客户端已保存的那份。
+          const perShot = perShotReferenceSlots.current.has(String(slot.nodeId))
+          const entry = perShot ? {} : references[slot.nodeId] || {}
+          const note = String(own(entry, 'note') ? entry.note : asset?.note || '').trim()
+          if (entry.file) {
+            items.push({ nodeId: slot.nodeId, kind: slot.kind, name: entry.file.name, mimeType: entry.file.type,
+              data: await readBase64(entry.file, signal), ...(note ? { note } : {}) })
+          } else if (asset) {
+            items.push({ nodeId: slot.nodeId, kind: slot.kind, ...(note ? { note } : {}) })
+          }
+        }
+        return items
+      }
+
+      async function settingsDefaults(parts, signal) {
+        const defaults = workflow?.defaults || {}
+        const payload = {
+          presetIds: defaults.presetIds || [],
+          promptSuffix: defaults.promptSuffix || '',
+          resolution: parts.has('resolution') ? settingsResolution() : defaults.resolution ?? null,
+          custom: parts.has('custom') ? settingsCustom(defaults.custom) : defaults.custom ?? null,
+          ...(defaults.updatedAt ? { baseUpdatedAt: defaults.updatedAt } : {}),
+        }
+        // 管线工作流的参考素材属于子工作流：整段省略 references/referencePools，
+        // 服务端会保留原来的那组，而不是被插件清空。
+        if (!workflow?.pipeline) {
+          payload.references = await settingsReferences(signal)
+          payload.referencePools = defaults.referencePools || []
+        }
+        return payload
+      }
+
+      async function saveSettings(options = {}) {
+        if (settingsLock.current || !workflow || !settingsDirtyRef.current) return
+        if (submitLock.current || pendingRef.current) {
+          if (options.auto) scheduleAutoSave(300)
+          return
+        }
+        if (summary?.workflowSettings !== true) {
+          autoSavePaused.current = true
+          setSettingsStatus('error')
+          setSettingsError('宿主侧还是旧版本：请重启 DSH 后再保存设置。')
+          return
+        }
+        settingsLock.current = true
+        setSettingsBusy(true)
+        setSettingsStatus('saving')
+        setSettingsError('')
+        setSettingsNotice('')
+        const targetModel = model
+        const current = controller()
+        const version = settingsVersion.current
+        try {
+          const parts = new Set(settingsParts.current)
+          const body = { action: 'save-settings', model }
+          if (['resolution', 'custom', 'references', 'slots'].some(part => parts.has(part))) body.defaults = await settingsDefaults(parts, current.signal)
+          if (parts.has('duration')) body.duration = { seconds: duration.trim() === '' ? null : Number(duration) }
+          if (parts.has('seeds')) {
+            const seeds = settingsSeeds()
+            if (seeds.length) body.seeds = seeds
+          }
+          if (parts.has('modelFields')) {
+            const fields = settingsModelFields()
+            if (fields.length) body.modelFields = fields
+          }
+          if (parts.has('slots')) {
+            const slots = settingsSlots()
+            if (slots.length) body.referenceSlots = slots
+          }
+          if (!['defaults', 'duration', 'seeds', 'modelFields', 'referenceSlots'].some(key => body[key] !== undefined)) {
+            if (settingsVersion.current === version) {
+              settingsParts.current.clear()
+              settingsDirtyRef.current = false
+              setSettingsDirty(false)
+              setSettingsStatus('saved')
+              setSettingsNotice('已与客户端同步')
+            } else scheduleAutoSave(150)
+            return
+          }
+          const data = await request(body, current.signal)
+          if (!alive.current || modelRef.current !== targetModel) return
+          autoSavePaused.current = false
+          autoSaveConflict.current = false
+          const changedDuringSave = settingsVersion.current !== version
+          if (!changedDuringSave) {
+            settingsParts.current.clear()
+            settingsDirtyRef.current = false
+            setSettingsDirty(false)
+            setSettingsStatus('saved')
+            setSettingsNotice('已自动写入客户端；6888 管理页与端口调用使用同一份。')
+            // 已保存成默认素材的本地文件清掉预览；主面板本次生成用的素材保留。
+            setReferences(previous => {
+              const next = {}
+              for (const [nodeId, entry] of Object.entries(previous)) {
+                next[nodeId] = perShotReferenceSlots.current.has(nodeId) ? { ...entry } : { ...entry, file: null }
+              }
+              return next
+            })
+            setReferenceErrors({})
+          } else {
+            setSettingsStatus('dirty')
+            setSettingsNotice('')
+          }
+          if (data?.workflow && data.workflow.alias === model) {
+            setWorkflow({ ...data.workflow, syncContext })
+            setSummary(previous => previous ? { ...previous,
+              workflows: (previous.workflows || []).map(item => item.alias === data.workflow.alias ? data.workflow : item) } : previous)
+            if (!changedDuringSave) adoptWorkflowSettings(data.workflow)
+          } else if (!changedDuringSave) setRefreshVersion(value => value + 1)
+          if (!changedDuringSave) {
+            // 已写进客户端，本地不再保留设置类覆盖；输入框回到“占位符＝客户端当前值”。
+            setCustom(previous => {
+              const next = {}
+              for (const [key, value] of Object.entries(previous)) if (perShotCustomKeys.current.has(key)) next[key] = value
+              return next
+            })
+            setDuration(''); setRatio(''); setMegapixels(''); setWidth(''); setHeight('')
+          }
+          if (changedDuringSave) scheduleAutoSave(150)
+        } catch (error) {
+          if (error.name === 'AbortError') return
+          if (alive.current && modelRef.current === targetModel) {
+            const conflict = /别处更新|409/.test(message(error))
+            if (conflict) autoSaveConflict.current = true
+            else autoSavePaused.current = true
+            setSettingsStatus(conflict ? 'conflict' : 'error')
+            setSettingsError(message(error))
+          }
+        } finally {
+          controllers.current.delete(current)
+          settingsLock.current = false
+          if (alive.current) setSettingsBusy(false)
+        }
+      }
+      saveSettingsRef.current = saveSettings
+
+      function retrySave() {
+        autoSavePaused.current = false
+        autoSaveConflict.current = false
+        setSettingsError('')
+        setSettingsStatus('dirty')
+        void saveSettingsRef.current?.({ auto: false })
+      }
+
       useEffect(() => {
         if (draftContext === syncContext) return
         setDraftContext(syncContext)
         setCustom({}); setReferences({}); setReferenceErrors({})
         setDuration(''); setRatio(''); setMegapixels(''); setWidth(''); setHeight('')
         setSubmitError(''); setSubmitNotice('')
+        if (autoSaveTimer.current) { clearTimeout(autoSaveTimer.current); autoSaveTimer.current = null }
+        settingsParts.current.clear()
+        settingsVersion.current += 1
+        perShotCustomKeys.current.clear()
+        perShotReferenceSlots.current.clear()
+        autoSavePaused.current = false
+        autoSaveConflict.current = false
+        settingsDirtyRef.current = false
+        setSettingsDirty(false)
+        setSettingsStatus('idle')
+        setSettingsError('')
+        setSettingsNotice('')
       }, [syncContext])
       useEffect(() => {
-        if (!summary?.configured || !model || visible === false) return
+        if (!summary?.configured || !model || visible === false || selectionBusy.current) return
         let active = true
         const current = controller()
         // Background synchronization must not interrupt typing or disable uploads.
@@ -332,6 +935,8 @@ window.__ModuleLoader__.load({
           }
           if (data.broken) throw new Error(data.brokenReason || '客户端工作流已损坏')
           setWorkflow({ ...data, syncContext })
+          // 有未保存改动时轮询只刷新展示数据，不把用户正在改的值冲掉。
+          if (!settingsDirtyRef.current || data.alias !== workflow?.alias) adoptWorkflowSettings(data)
         }).catch(error => {
           if (active && alive.current && error.name !== 'AbortError') setWorkflowError(message(error))
         }).finally(() => {
@@ -340,6 +945,15 @@ window.__ModuleLoader__.load({
         })
         return () => { active = false; current.abort(); controllers.current.delete(current) }
       }, [model, summary?.workflows, summary?.configured, configVersion, visible, refreshVersion])
+
+      useEffect(() => {
+        if (!settingsOpen || !workflow || !(workflow.modelFields || []).length) return
+        if (summary?.workflowSettings !== true) return
+        const context = workflow.alias + ':' + (workflow.revision || '')
+        if (optionGroupsContext.current === context) return
+        optionGroupsContext.current = context
+        void loadOptionGroups()
+      }, [settingsOpen, workflow?.alias, workflow?.revision])
 
       async function saveConfig() {
         if (configLock.current || submitLock.current || pendingRef.current) return
@@ -390,10 +1004,60 @@ window.__ModuleLoader__.load({
         }
       }
 
-      function selectModel(value) {
-        manualModel.current = true
+      async function savePregenSettings(patch) {
+        if (!gameId) { setPregenError('打开一局游戏后再配置预生成'); return }
+        const current = controller()
+        setPregenError('')
+        setPregenNotice('')
+        try {
+          const data = await request({ action: 'pregen-settings', gameId, ...patch }, current.signal)
+          if (!alive.current) return
+          if (data?.pregen) setSummary(previous => ({ ...(previous || {}), pregen: data.pregen }))
+          pregenDraftDirty.current = false
+          if (data?.pregen?.settings) setPregenDraft({ ...data.pregen.settings })
+          setPregenNotice('预生成设置已保存')
+          setRefreshVersion(value => value + 1)
+        } catch (error) {
+          if (alive.current && error.name !== 'AbortError') setPregenError(message(error))
+        } finally {
+          controllers.current.delete(current)
+        }
+      }
+
+      async function pregenAction(action, id) {
+        if (!gameId) { setPregenError('打开一局游戏后再使用预生成'); return }
+        const current = controller()
+        if (id) setPregenBusy(previous => ({ ...previous, [id]: action }))
+        else setPregenRefillBusy(true)
+        setPregenError('')
+        setPregenNotice('')
+        try {
+          const body = { action: action === 'refill' ? 'pregen-refill' : action === 'send' ? 'pregen-send' : 'pregen-delete', gameId }
+          if (id) body.id = id
+          const data = await request(body, current.signal)
+          if (!alive.current) return
+          if (data?.pregen) setSummary(previous => ({ ...(previous || {}), pregen: data.pregen }))
+          if (action === 'refill') setPregenNotice(data?.cooldown ? '上次失败后冷却中，稍后再试。' : '已开始后台补池。')
+          else if (action === 'delete') setPregenNotice('已从池子里移除。')
+          else if (action === 'send') setPregenNotice(data?.queued ? '已排入本轮：正文写完、版本确定后补入。' : '视频已补到当前正文。')
+          setRefreshVersion(value => value + 1)
+        } catch (error) {
+          if (alive.current && error.name !== 'AbortError') setPregenError(message(error))
+        } finally {
+          controllers.current.delete(current)
+          if (id) setPregenBusy(previous => { const next = { ...previous }; delete next[id]; return next })
+          else setPregenRefillBusy(false)
+        }
+      }
+
+      async function selectModel(value) {
+        if (!value || value === model || selectionBusy.current || settingsLock.current) return
+        selectionBusy.current = true
+        const previous = model
+        const current = controller()
         setModel(value)
         setWorkflow(null)
+        setWorkflowBusy(true)
         setCustom({})
         setReferences({})
         setReferenceErrors({})
@@ -403,11 +1067,41 @@ window.__ModuleLoader__.load({
         setWidth(''); setHeight('')
         setSubmitError('')
         setSubmitNotice('')
+        if (autoSaveTimer.current) { clearTimeout(autoSaveTimer.current); autoSaveTimer.current = null }
+        settingsParts.current.clear()
+        settingsVersion.current += 1
+        perShotCustomKeys.current.clear()
+        perShotReferenceSlots.current.clear()
+        autoSavePaused.current = false
+        autoSaveConflict.current = false
+        settingsDirtyRef.current = false
+        setSettingsDirty(false)
+        setSettingsStatus('idle')
+        setSettingsError('')
+        setSettingsNotice('')
+        setClearedDefaults({})
+        try {
+          const data = await request({ action: 'select-model', model: value }, current.signal)
+          if (!alive.current) return
+          setSummary(previousSummary => ({ ...(previousSummary || {}), model: data?.model || value,
+            templateMode: data?.templateMode || '', templateError: data?.templateError || '' }))
+          setWorkflowError('')
+          setRefreshVersion(version => version + 1)
+        } catch (error) {
+          if (alive.current && error.name !== 'AbortError') {
+            setModel(previous)
+            setWorkflowError(message(error))
+          }
+        } finally {
+          controllers.current.delete(current)
+          selectionBusy.current = false
+          if (alive.current) setWorkflowBusy(false)
+        }
       }
       function updateReference(nodeId, patch) {
         setReferences(previous => ({ ...previous, [nodeId]: { ...previous[nodeId], ...patch } }))
       }
-      function chooseFile(slot, event) {
+      function chooseFile(slot, event, inSettings = false) {
         const file = event.target.files?.[0]
         let error = ''
         if (file) {
@@ -420,13 +1114,19 @@ window.__ModuleLoader__.load({
         if (error) event.target.value = ''
         updateReference(slot.nodeId, { file: error ? null : file || null })
         setReferenceErrors(previous => ({ ...previous, [slot.nodeId]: error }))
+        if (file && !error) setClearedDefaults(previous => ({ ...previous, [slot.nodeId]: false }))
+        // 设置抽屉里的素材是客户端默认素材；主面板上传只覆盖本次生成，不写回客户端。
+        if (inSettings) {
+          perShotReferenceSlots.current.delete(String(slot.nodeId))
+          markSettings('references')
+        } else perShotReferenceSlots.current.add(String(slot.nodeId))
       }
 
       async function makeInput(signal) {
         if (!workflow || workflow.syncContext !== syncContext || draftContext !== syncContext || workflowError || workflowBusy) throw new Error('请先同步当前工作流描述。')
         if (workflow.pipeline && Object.values(references).some(entry => entry.file || entry.note)) throw new Error('管线素材请在本地客户端修改，插件同步沿用。')
         if (!prompt.trim()) throw new Error('请先写下提示词。')
-        const input = { model, prompt, apply_defaults: applyDefaults }
+        const input = { model, prompt, apply_defaults: true }
         function positive(value, label) {
           const number = Number(value)
           if (!Number.isFinite(number) || number <= 0) throw new Error(label + '必须是大于 0 的数字。')
@@ -483,7 +1183,7 @@ window.__ModuleLoader__.load({
             ...(slot.bypassed ? { enable: true } : {}) })
         }
         for (const slot of notes) {
-          if (!applyDefaults || slot.bypassed) continue
+          if (slot.bypassed) continue
           files.push({ nodeId: slot.nodeId, note: references[slot.nodeId].note.trim() })
         }
         if (files.length) input.references = files
@@ -561,6 +1261,44 @@ window.__ModuleLoader__.load({
         }
       }
 
+      async function regenerate(job) {
+        if (regenerateLocks.current.has(job.id)) return
+        regenerateLocks.current.add(job.id)
+        setRegenerating(previous => ({ ...previous, [job.id]: true }))
+        setRegenerateErrors(previous => ({ ...previous, [job.id]: '' }))
+        setRegenerateNotice('')
+        const current = controller()
+        const key = contextKey + '|' + job.id
+        let body = pendingRegenerations.get(key)
+        if (!body) {
+          body = { action: 'regenerate', id: job.id, requestId: crypto.randomUUID(),
+            ...(gameId ? { gameId } : {}), bindToTurn: Boolean(bindToTurn && gameId) }
+          pendingRegenerations.set(key, body)
+        }
+        try {
+          const next = await request(body, current.signal)
+          if (!alive.current) return
+          if (!next || typeof next.id !== 'string') {
+            const error = new Error('宿主未返回有效任务，重新生成结果未知。')
+            error.uncertain = true
+            throw error
+          }
+          mergeJob(next)
+          pendingRegenerations.delete(key)
+          setRegenerateNotice('已按原任务重新提交，新任务会出现在列表顶部。')
+          setRefreshVersion(value => value + 1)
+        } catch (error) {
+          if (error.name === 'AbortError') return
+          if (alive.current) setRegenerateErrors(previous => ({
+            ...previous, [job.id]: message(error) + ' 再次点击会沿用同一请求 ID，不会重复提交。',
+          }))
+        } finally {
+          controllers.current.delete(current)
+          regenerateLocks.current.delete(job.id)
+          if (alive.current) setRegenerating(previous => ({ ...previous, [job.id]: false }))
+        }
+      }
+
       const locked = configBusy || submitBusy || Boolean(pending)
       const formDisabled = locked || workflowBusy || !workflow || workflow.syncContext !== syncContext || draftContext !== syncContext || Boolean(workflowError)
       const aliases = Array.from(new Set((summary?.workflows || []).filter(item => !item.broken).map(item => item.alias))).filter(Boolean)
@@ -569,24 +1307,33 @@ window.__ModuleLoader__.load({
       const durationSupported = Boolean(workflow?.videoDuration || workflow?.capabilities?.durationSchema)
       const effectiveResolution = {
         ...(workflow?.pipeline?.kind === 'first-frame' ? workflow.pipeline.imageResolution : workflow?.pipeline?.gridResolution),
-        ...(applyDefaults ? workflow?.defaults?.resolution : {}),
+        ...workflow?.defaults?.resolution,
       }
       const referenceGroups = workflow?.pipeline ? workflow.referenceGroups || [] : []
-      function renderCustom(definition) {
+      function renderCustom(definition, options = {}) {
+        const inSettings = options.settings === true
         const changed = own(custom, definition.key)
-        const defaultValue = applyDefaults && own(workflow.defaults?.custom, definition.key)
+        const defaultValue = own(workflow.defaults?.custom, definition.key)
           ? workflow.defaults.custom[definition.key] : definition.randomize ? '' : definition.defaultValue
         const value = changed ? custom[definition.key] : defaultValue ?? ''
-        const change = next => setCustom(previous => {
-          const values = { ...previous }
-          if (next === '') {
-            delete values[definition.key]
-            if (definition.aiLora && definition.strengthKey) delete values[definition.strengthKey]
-          } else values[definition.key] = next
-          const option = definition.aiLoraOptions?.find(item => String(item.value) === String(next))
-          if (option?.strength != null && definition.strengthKey) values[definition.strengthKey] = option.strength
-          return values
-        })
+        const change = next => {
+          // 主面板里的提示词类参数只对本次生成生效；开关、数值、LoRA 和设置抽屉里的改动都自动写回客户端。
+          if (!inSettings && definition.type === 'text') {
+            if (next === '') perShotCustomKeys.current.delete(definition.key)
+            else perShotCustomKeys.current.add(definition.key)
+          } else perShotCustomKeys.current.delete(definition.key)
+          if (inSettings || definition.type !== 'text') markSettings('custom')
+          setCustom(previous => {
+            const values = { ...previous }
+            if (next === '') {
+              delete values[definition.key]
+              if (definition.aiLora && definition.strengthKey) delete values[definition.strengthKey]
+            } else values[definition.key] = next
+            const option = definition.aiLoraOptions?.find(item => String(item.value) === String(next))
+            if (option?.strength != null && definition.strengthKey) values[definition.strengthKey] = option.strength
+            return values
+          })
+        }
         const props = { className: 'rh-input', disabled: formDisabled }
         let control
         if (definition.type === 'boolean') {
@@ -617,47 +1364,231 @@ window.__ModuleLoader__.load({
           definition.randomize ? note('留空使用随机种子') : null,
           changed ? button('恢复默认', () => change(''), formDisabled, null, 'link') : null)
       }
-      function renderReference(slot, group) {
+      function renderReference(slot, group, options = {}) {
+        const inSettings = options.settings === true
         const readonly = Boolean(group)
         const source = group || workflow
         const entry = readonly ? {} : references[slot.nodeId] || {}
-        const supported = !readonly && (slot.kind === 'image' || slot.kind === 'audio')
+        const gatewayEnabled = !inSettings || slotModes[slot.nodeId] !== false
+        const cleared = inSettings && clearedDefaults[slot.nodeId] === true
+        const supported = !readonly && gatewayEnabled && (slot.kind === 'image' || slot.kind === 'audio')
         const label = slot.label || slot.nodeId
         const defaults = (source?.defaults?.references || []).find(item => String(item.nodeId) === String(slot.nodeId))
         const pool = (source?.defaults?.referencePools || []).find(item => String(item.nodeId) === String(slot.nodeId))
-        const usesDefaults = applyDefaults || readonly
+        const usesDefaults = true
         const automatic = readonly && workflow.pipeline?.kind === 'first-frame' && group.title === '视频' && /first_frame/i.test(slot.role || '')
         return h('div', { key: slot.nodeId, className: 'rh-slot' },
           h('div', { className: 'rh-slot-head' }, h('span', { className: 'rh-slot-title' }, label),
             h('span', { className: 'rh-slot-tag' }, slot.tag || (slot.kind === 'audio' ? 'AUDIO' : 'IMAGE'))),
-          !entry.file && defaults && usesDefaults && !automatic ? h(SavedReference, { model: source.alias, asset: defaults, revision: source.revision || defaults.updatedAt }) : null,
+          !entry.file && defaults && !automatic && !cleared ? h(SavedReference, { model: source.alias, asset: defaults, revision: source.revision || defaults.updatedAt }) : null,
           automatic ? note('由生图阶段自动填充') : null,
+          cleared ? note('自动同步后将清除客户端上的默认素材。') : null,
           !entry.file && pool && usesDefaults && !automatic ? note('客户端随机图库池 · ' + pool.galleryIds.length + ' 张，生成时随机抽取') : null,
           supported ? h('label', { className: 'rh-upload', 'data-selected': Boolean(entry.file) },
             entry.file?.type.startsWith('image/') ? h(ReferencePreview, { file: entry.file }) : icon(entry.file ? 'audio' : 'upload', 22),
             !entry.file?.type.startsWith('image/') ? h('strong', null, entry.file ? entry.file.name : '点击上传' + (slot.kind === 'audio' ? '音频' : '图片')) : null,
             !entry.file ? h('small', null, '单个文件不超过 10MB') : null,
             h('input', { key: model + ':' + slot.nodeId + ':' + (entry.file?.name || ''), type: 'file', accept: slot.kind + '/*',
-              'aria-label': '上传' + label, disabled: formDisabled, onChange: event => chooseFile(slot, event) })) : readonly ? note('与客户端共用素材 · 在客户端修改') : note('暂不支持此素材类型'),
+              'aria-label': (inSettings ? '设置里上传' : '上传') + label, disabled: formDisabled,
+              onChange: event => chooseFile(slot, event, inSettings) })) : readonly ? note('与客户端共用素材 · 在客户端修改') :
+            !gatewayEnabled ? note('先在网关启用这个槽位，才能保存默认素材。') : note('暂不支持此素材类型'),
           entry.file ? h('div', { className: 'rh-filename' }, h('span', null, (entry.file.size / MB).toFixed(2) + ' MB'),
             h('button', { type: 'button', className: 'rh-remove', disabled: formDisabled,
-              onClick: () => { updateReference(slot.nodeId, { file: null }); setReferenceErrors(previous => ({ ...previous, [slot.nodeId]: '' })) } }, '移除素材')) :
-            note(defaults && usesDefaults ? '默认 · ' + (defaults.name || '工作流素材') : !usesDefaults ? '已停用客户端保存的默认素材' : '未上传时保留工作流素材'),
+              onClick: () => {
+                updateReference(slot.nodeId, { file: null })
+                setReferenceErrors(previous => ({ ...previous, [slot.nodeId]: '' }))
+                if (inSettings) { perShotReferenceSlots.current.delete(String(slot.nodeId)); markSettings('references') }
+                else perShotReferenceSlots.current.add(String(slot.nodeId))
+              } }, '移除素材')) :
+            h('div', { className: 'rh-row', style: { gap: 8 } },
+              note(cleared ? '待清除' : defaults ? '默认 · ' + (defaults.name || '工作流素材') : '未上传时保留工作流素材'),
+              inSettings && defaults && !cleared ? button('清除默认', () => {
+                setClearedDefaults(previous => ({ ...previous, [slot.nodeId]: true }))
+                updateReference(slot.nodeId, { file: null, note: '' })
+                perShotReferenceSlots.current.delete(String(slot.nodeId))
+                markSettings('references')
+              }, formDisabled, null, 'link') : null,
+              inSettings && cleared ? button('撤销', () => {
+                setClearedDefaults(previous => ({ ...previous, [slot.nodeId]: false }))
+                markSettings('references')
+              }, formDisabled, null, 'link') : null),
           field('素材备注', h('input', { type: 'text', className: 'rh-input', maxLength: 200,
-            value: own(entry, 'note') ? entry.note : usesDefaults ? pool?.note || defaults?.note || '' : '', placeholder: '可选：人物身份、声音或用途',
-            disabled: formDisabled || readonly, onChange: event => updateReference(slot.nodeId, { note: event.target.value }) })),
-          !readonly && slot.bypassed ? checkbox('启用此旁路节点', Boolean(entry.enable), enable => updateReference(slot.nodeId, { enable }), formDisabled) : null,
+            value: own(entry, 'note') ? entry.note : pool?.note || defaults?.note || '', placeholder: '可选：人物身份、声音或用途',
+            disabled: formDisabled || readonly || !gatewayEnabled,
+            onChange: event => {
+              updateReference(slot.nodeId, { note: event.target.value })
+              if (inSettings) { perShotReferenceSlots.current.delete(String(slot.nodeId)); markSettings('references') }
+              else perShotReferenceSlots.current.add(String(slot.nodeId))
+            } })),
+          inSettings ? checkbox('在网关启用此槽位', slotModes[slot.nodeId] !== false, enable => {
+            setSlotModes(previous => ({ ...previous, [slot.nodeId]: enable }))
+            markSettings('slots')
+          }, formDisabled) :
+            !readonly && slot.bypassed ? checkbox('启用此旁路节点', Boolean(entry.enable), enable => updateReference(slot.nodeId, { enable }), formDisabled) : null,
           alert(referenceErrors[slot.nodeId]))
       }
+      function settingsStatusText() {
+        if (settingsStatus === 'saving') return '正在自动同步到客户端…'
+        if (settingsStatus === 'conflict') return settingsError || '客户端设置已在别处更新；点“重新载入”取回客户端那份。'
+        if (settingsStatus === 'error') return settingsError || '自动同步失败，修改任意设置或点“重试同步”再试。'
+        if (settingsDirty) return '已改动，正在自动同步到客户端…'
+        if (settingsNotice) return settingsNotice
+        return '已与客户端同步；这里的值与 6888 管理页是同一份。'
+      }
+
+      function renderSettingsStatus() {
+        const adminURL = (() => {
+          try { return new URL('/admin/', summary?.baseURL || baseURL || DEFAULT_BASE).href } catch { return '' }
+        })()
+        const hostReady = summary?.workflowSettings === true
+        const failed = settingsStatus === 'error'
+        return h('div', { className: 'rh-stack', style: { gap: 9 } },
+          h('div', { className: 'rh-settings-status', 'data-state': settingsStatus, role: 'status' }, settingsStatusText()),
+          !hostReady ? h('div', { className: 'rh-error', role: 'alert' },
+            '宿主侧还是旧版本：请重启 DSH 后再保存设置。只刷新页面只会更新界面，保存、候选组和切换工作流仍会失败。') : null,
+          h('div', { className: 'rh-settings-actions' },
+            failed ? button(settingsBusy ? '同步中…' : '重试同步', retrySave, !hostReady || settingsBusy || !settingsDirty, null, 'primary') : null,
+            button(settingsDirty ? '放弃并重新载入' : '重新载入', reloadSettings, settingsBusy),
+            adminURL ? h('a', { className: 'rh-btn rh-btn-link', href: adminURL, target: '_blank', rel: 'noopener' }, '打开 6888 管理页') : null))
+      }
+
+      function renderSeedSettings() {
+        if (!workflow?.seedTargets?.length) return null
+        return h('details', { className: 'rh-fold' },
+          h('summary', null, '随机种子', h('span', { className: 'rh-count' }, workflow.seedTargets.length)),
+          h('div', { className: 'rh-fold-content' },
+            ...workflow.seedTargets.map(target => {
+              if (target.managedByCustomField) return note(target.classType + ' · ' + target.target + '：由自定义参数接管，请在自定义参数里设置。', target.target)
+              const pinned = target.pinnedValue !== undefined
+              return h('div', { className: 'rh-field', key: target.target },
+                h('span', { className: 'rh-field-label' }, target.classType + ' · ' + target.target,
+                  h('span', { className: 'rh-note' }, pinned ? '已固定' : '每次随机')),
+                h('div', { className: 'rh-row' },
+                  h('input', { className: 'rh-input', type: 'text', inputMode: 'numeric', value: seedDraft[target.target] ?? '',
+                    placeholder: '每次随机', disabled: formDisabled,
+                    onChange: event => {
+                      const digits = event.target.value.replace(/[^\d]/g, '')
+                      setSeedDraft(previous => ({ ...previous, [target.target]: digits }))
+                      markSettings('seeds')
+                    } }),
+                  button('解除', () => {
+                    setSeedDraft(previous => ({ ...previous, [target.target]: '' }))
+                    markSettings('seeds')
+                  }, formDisabled, null, 'quiet')))
+            }),
+            note('留空＝每次生成换一个随机种子；填数字＝固定。改动会立即写回客户端，与 6888 管理页同一份。')))
+      }
+
+      function renderModelSettings() {
+        if (!workflow?.modelFields?.length) return null
+        return h('details', { className: 'rh-fold' },
+          h('summary', null, '模型字段', h('span', { className: 'rh-count' }, workflow.modelFields.length)),
+          h('div', { className: 'rh-fold-content' },
+            optionGroupsError ? alert('候选组读取失败：' + optionGroupsError) : null,
+            h('div', { className: 'rh-row' }, button('刷新候选组', loadOptionGroups, formDisabled, null, 'link')),
+            ...workflow.modelFields.map(modelField => {
+              const draft = modelDraft[modelField.target] || { value: modelField.value ?? '', groupId: modelField.groupId ?? '' }
+              const group = optionGroups.find(item => item.id === draft.groupId)
+              const values = group?.values || []
+              const known = Array.from(new Set([draft.value, modelField.canvasValue, ...values].filter(value => typeof value === 'string' && value)))
+              const overridden = (draft.value ?? '') !== (modelField.canvasValue ?? '')
+              return h('div', { className: 'rh-model-field', key: modelField.target },
+                h('div', { className: 'rh-model-field-head' },
+                  h('span', { className: 'rh-model-field-title', title: modelField.target },
+                    (modelField.groupTitle || '未分组') + ' · ' + (modelField.classType || '模型') + ' ' + modelField.nodeId),
+                  overridden ? h('span', { className: 'rh-slot-tag' }, '已覆盖') : null),
+                h('div', { className: 'rh-grid2' },
+                  field('候选组', h('select', { className: 'rh-input', value: draft.groupId || '', disabled: formDisabled,
+                    onChange: event => {
+                      setModelDraft(previous => ({ ...previous, [modelField.target]: { ...draft, groupId: event.target.value } }))
+                      markSettings('modelFields')
+                    } },
+                  h('option', { value: '' }, '未选择候选组'),
+                  group ? h('option', { value: group.id }, group.label + '（' + group.values.length + '）') : draft.groupId ? h('option', { value: draft.groupId }, '当前候选组（未载入）') : null,
+                  optionGroups.filter(item => item.id !== draft.groupId).map(item => h('option', { key: item.id, value: item.id }, item.label + '（' + item.values.length + '）')))),
+                  field('模型', h('select', { className: 'rh-input', value: draft.value ?? '', disabled: formDisabled || !known.length,
+                    onChange: event => {
+                      setModelDraft(previous => ({ ...previous, [modelField.target]: { ...draft, value: event.target.value } }))
+                      markSettings('modelFields')
+                    } },
+                  known.map(value => h('option', { key: value, value }, value === modelField.canvasValue ? value + '（画布原值）' : value))))),
+                note('画布原值：' + (modelField.canvasValue || '—') + (group ? '' : ' · 先在 6888 管理页给这个字段选一个候选组，或直接保留下拉里的当前值。')))
+            }),
+            note('切换后写入网关工作流覆盖层；与「单镜生成」页的模型设置是同一份。')))
+      }
+
+      function renderGenerationSettings() {
+        return h('section', { className: 'rh-setting-group' },
+          h('div', { className: 'rh-setting-heading' }, icon('create'), '生成设置'),
+          note('网关当前：画幅 ' + (workflow?.defaults?.resolution ? JSON.stringify(workflow.defaults.resolution) : '画布原值')
+            + ' · 片长 ' + (durationDefault ?? '画布原值') + ' 秒 · 自定义 '
+            + Object.keys(workflow?.defaults?.custom || {}).length + ' 项'),
+          h('details', { className: 'rh-fold', open: true },
+            h('summary', null, '分辨率与片长'),
+            h('div', { className: 'rh-fold-content' },
+              resolutionFields.has('aspect_ratio') ? field('默认画面比例', h('input', { className: 'rh-input', value: ratio,
+                placeholder: String(effectiveResolution.aspect_ratio || workflow?.videoAspect?.ratio || '工作流默认'), disabled: formDisabled,
+                onChange: event => { setRatio(event.target.value); markSettings('resolution') } })) : null,
+              resolutionFields.has('megapixels') ? field('默认像素量 / MP', h('input', { className: 'rh-input', type: 'number', min: 0.1, max: 16, step: 'any', value: megapixels,
+                placeholder: String(effectiveResolution.megapixels ?? '工作流默认'), disabled: formDisabled,
+                onChange: event => { setMegapixels(event.target.value); markSettings('resolution') } })) : null,
+              dimensionsSupported && !resolutionFields.has('aspect_ratio') ? h('div', { className: 'rh-grid2' },
+                field('默认宽度 / px', h('input', { className: 'rh-input', type: 'number', min: 64, max: 8192, step: 1, value: width,
+                  placeholder: String(effectiveResolution.width ?? '工作流默认'), disabled: formDisabled,
+                  onChange: event => { setWidth(event.target.value); markSettings('resolution') } })),
+                field('默认高度 / px', h('input', { className: 'rh-input', type: 'number', min: 64, max: 8192, step: 1, value: height,
+                  placeholder: String(effectiveResolution.height ?? '工作流默认'), disabled: formDisabled,
+                  onChange: event => { setHeight(event.target.value); markSettings('resolution') } }))) : null,
+              durationSupported ? field('默认片长 / 秒', h('input', { className: 'rh-input', type: 'number', min: 0.5, max: 120, step: 'any', value: duration,
+                placeholder: durationDefault != null ? String(durationDefault) : '工作流默认', disabled: formDisabled,
+                onChange: event => { setDuration(event.target.value); markSettings('duration') } })) : null,
+              !resolutionFields.size ? note('此工作流没有声明可覆盖的分辨率字段。') : null,
+              h('div', { className: 'rh-row' },
+                button('清除分辨率默认', () => { setRatio(''); setMegapixels(''); setWidth(''); setHeight(''); markSettings('resolution') }, formDisabled, null, 'link'),
+                durationSupported ? button('清除片长默认', () => { setDuration(''); markSettings('duration') }, formDisabled, null, 'link') : null),
+              note('留空＝用工作流画布原值；填写＝保存为网关默认。与 6888 管理页「单镜生成」的分辨率/片长是同一份。'))),
+          renderCustomSettings(),
+          renderModelSettings(),
+          renderSeedSettings())
+      }
+
+      function renderCustomSettings() {
+        if (!workflow?.customFields?.length) return null
+        return h('details', { className: 'rh-fold' },
+          h('summary', null, '自定义参数默认值', h('span', { className: 'rh-count' }, workflow.customFields.length)),
+          h('div', { className: 'rh-fold-content' }, workflow.customFields.map(field => renderCustom(field, { settings: true })),
+            note('改动会立即自动写回客户端，与 6888 管理页「单镜生成」的自定义参数是同一份。')))
+      }
+
+      function renderGenerationBehavior() {
+        return h('section', { className: 'rh-setting-group' },
+          h('div', { className: 'rh-setting-heading' }, icon('settings'), '生成行为'),
+          checkbox('绑定当前对话轮次', bindToTurn, value => changePreference('bindToTurn', value), locked),
+          note('提交时绑定当前正文版本，成片完成后插回对应位置；关闭只影响新任务。'),
+          note('生成永远套用客户端保存的分辨率、参考素材、模型字段、自定义参数和随机种子，不再有单独的插件开关。'),
+          preferenceError ? alert(preferenceError) : null)
+      }
+
+      function renderReferenceSettings() {
+        return h('section', { className: 'rh-setting-group' },
+          h('div', { className: 'rh-setting-heading' }, icon('image'), '参考素材默认值'),
+          workflow?.pipeline
+            ? note('管线工作流的素材在子工作流上，请在 6888 管理页或「单镜生成」页修改；这里沿用客户端保存的整组素材。')
+            : workflow?.referenceSlots?.length
+              ? h('div', { className: 'rh-slots' }, workflow.referenceSlots.map(slot => renderReference(slot, null, { settings: true })))
+              : note('此工作流没有参考素材槽。'),
+          note('这里是保存到网关的默认素材，与「单镜生成」页的参考素材、6888 管理页同一份；单个文件 ≤ 10MB，保存请求 ≤ 25MB。'))
+      }
+
+
       function renderAttachment(item, index) {
-        const valid = typeof item.url === 'string' && /^\/api\/dsh-runninghub\/media\?/.test(item.url)
         let media = null
-        if (valid && item.kind === 'video') {
+        if (isMediaUrl(item.url) && item.kind === 'video') {
           media = h('video', { src: item.url, controls: true, preload: 'metadata', playsInline: true,
-            className: 'rh-job-media' })
-        } else if (valid && item.kind === 'image') {
+            className: 'rh-job-media', onError: retryMediaOnce })
+        } else if (isMediaUrl(item.url) && item.kind === 'image') {
           media = h('img', { src: item.url, alt: item.name || '生成图片', loading: 'lazy', className: 'rh-job-media' })
-        } else if (valid && item.kind === 'audio') {
+        } else if (isMediaUrl(item.url) && item.kind === 'audio') {
           media = h('audio', { src: item.url, controls: true, preload: 'metadata', className: 'rh-job-audio' })
         }
         return h('div', { key: index, style: { width: '100%' } }, media || note('此附件暂无可预览媒体。'))
@@ -669,10 +1600,67 @@ window.__ModuleLoader__.load({
         : jobFilter === 'ready' ? job.status === 'ready' : ['failed', 'download_failed', 'submit_unknown'].includes(job.status)))
       const durationDefault = workflow?.videoDuration?.seconds
       const selectedReferences = Object.values(references).filter(entry => entry.file).length
+
+      function openPlayer(job, item) {
+        if (!job || !item || !isMediaUrl(item.url)) return
+        setPlayerMedia({})
+        setPlayer({ job, item })
+      }
+      function closePlayer() { setPlayer(null) }
+      function dismissVideoNotice(id) {
+        setVideoNotices(current => current.filter(notice => notice.id !== id))
+      }
+      function renderJobErrors(job) {
+        return [
+          alert(job.queryError ? '查询暂时失败，将自动重试。' : '', 'query-' + job.id),
+          alert(job.error, 'error-' + job.id),
+          alert(job.insertionError ? '正文插入失败，媒体已保留：' + message(job.insertionError) : '', 'insertion-' + job.id),
+          job.status === 'submit_unknown' ? note('先核对任务，请勿重复生成。', 'unknown-' + job.id) : null,
+        ]
+      }
+      function renderJobControls(job, canRegenerate, video) {
+        const play = video ? button('播放', () => openPlayer(job, video), false, 'play-' + job.id, 'primary', 'play') : null
+        const regenerateButton = canRegenerate ? button(regenerating[job.id] ? '重新提交中…' : '重新生成', () => regenerate(job),
+          Boolean(regenerating[job.id]), 'regen-' + job.id, '', 'refresh') : null
+        const retryButton = job.status === 'download_failed' ? button(retrying[job.id] ? '下载重试中…' : '仅重试下载', () => retryDownload(job.id),
+          Boolean(retrying[job.id]), 'retry-' + job.id, 'quiet', 'refresh') : null
+        if (!play && !regenerateButton && !retryButton) return null
+        return h('div', { className: 'rh-row', style: { marginTop: 9 } }, play, regenerateButton, retryButton)
+      }
+      function renderJobDetails(job) {
+        return h('details', { className: 'rh-job-details' }, h('summary', null, '任务详情'),
+          h('code', null, '本地 · ' + job.id), job.remoteTaskId ? h('code', null, '远端 · ' + job.remoteTaskId) : null,
+          note(job.replayable ? '刷新只查询状态；「重新生成」会按原提示词、参数与参考素材新建任务并重新计费。'
+            : ['ready', 'failed', 'download_failed'].includes(job.status)
+              ? '刷新只查询状态；此任务没有保存可重放的输入，无法重新生成。'
+              : '刷新只查询状态，不会重新提交。'))
+      }
       function renderJob(job) {
+        const canRegenerate = canRegenerateJob(job)
+        const video = compactVideoOf(job)
+        if (video) {
+          return h('article', { key: job.id, className: 'rh-card rh-job' },
+            h('div', { className: 'rh-video-summary' },
+              h(VideoThumb, { item: video, className: 'rh-video-thumb-card', label: '播放视频：' + jobLabel(job),
+                onClick: () => openPlayer(job, video) }),
+              h('div', { className: 'rh-video-summary-copy' },
+                h('div', { className: 'rh-video-summary-status' },
+                  h('span', { className: 'rh-status', 'data-state': job.status },
+                    h('span', { className: 'rh-dot' }), statuses[job.status] || job.status),
+                  h('span', { className: 'rh-video-summary-time' }, formatJobTime(job))),
+                h('div', { className: 'rh-job-title', title: job.model }, jobLabel(job)),
+                h('div', { className: 'rh-video-meta' }, ['视频', job.costCoins != null ? job.costCoins + ' 币' : ''].filter(Boolean).join(' · ')),
+                hasJobBinding(job) ? h('div', { className: 'rh-video-binding', 'data-state': job.insertionError ? 'error' : 'ok' },
+                  icon('link', 10), job.insertionError ? '正文插入失败' : Number.isInteger(job.binding?.turn) ? '已绑定第 ' + job.binding.turn + ' 轮正文' : '已绑定正文版本') : null)),
+            h('div', { className: 'rh-job-info rh-job-info-compact' },
+              renderJobErrors(job),
+              renderJobControls(job, canRegenerate, video),
+              alert(regenerateErrors[job.id]),
+              alert(downloadErrors[job.id]),
+              renderJobDetails(job)))
+        }
         const inProgress = activeStatuses.includes(job.status)
         const progress = Number(job.progress)
-        const time = new Date(job.createdAt)
         return h('article', { key: job.id, className: 'rh-card rh-job' },
           h('div', { className: 'rh-job-preview' }, (job.attachments || []).length ?
             h('div', { style: { width: '100%' } }, job.attachments.map(renderAttachment)) :
@@ -680,21 +1668,146 @@ window.__ModuleLoader__.load({
               h('span', null, job.status === 'running' ? '镜头正在生成中' : statuses[job.status] || job.status),
               inProgress ? h('div', { className: 'rh-progress' }, h('span', { style: { width: (Number.isFinite(progress) && progress > 0 ? Math.min(100, progress <= 1 ? progress * 100 : progress) : 24) + '%' } })) : null)),
           h('div', { className: 'rh-job-info' },
-            h('div', { className: 'rh-job-title', title: job.model }, job.model || '生成任务'),
+            h('div', { className: 'rh-job-title', title: job.model }, jobLabel(job)),
             h('div', { className: 'rh-job-meta' }, h('span', { className: 'rh-status', 'data-state': job.status },
               h('span', { className: 'rh-dot' }), statuses[job.status] || job.status),
-              h('span', null, Number.isNaN(time.getTime()) ? '' : time.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }))),
-            job.binding?.generationId ? h('div', { className: 'rh-job-meta' }, h('span', null, '已绑定正文版本'), icon('link', 12)) : null,
+              h('span', null, formatJobTime(job))),
+            hasJobBinding(job) ? h('div', { className: 'rh-job-meta' }, h('span', null, '已绑定正文版本'), icon('link', 12)) : null,
             job.costCoins != null ? h('div', { className: 'rh-job-meta' }, h('span', null, '生成费用'), h('span', null, job.costCoins + ' 币')) : null,
-            alert(job.queryError ? '查询暂时失败，将自动重试。' : ''), alert(job.error),
-            alert(job.insertionError ? '正文插入失败，媒体已保留：' + message(job.insertionError) : ''),
-            job.status === 'submit_unknown' ? note('先核对任务，请勿重复生成。') : null,
-            job.status === 'download_failed' ? button(retrying[job.id] ? '下载重试中…' : '仅重试下载', () => retryDownload(job.id), Boolean(retrying[job.id]), null, '', 'refresh') : null,
+            renderJobErrors(job),
+            renderJobControls(job, canRegenerate, null),
+            alert(regenerateErrors[job.id]),
             alert(downloadErrors[job.id]),
-            h('details', { className: 'rh-job-details' }, h('summary', null, '任务详情'),
-              h('code', null, '本地 · ' + job.id), job.remoteTaskId ? h('code', null, '远端 · ' + job.remoteTaskId) : null,
-              note('刷新与下载重试不会重新生成。'))))
+            renderJobDetails(job)))
       }
+      function renderVideoNotice(notice) {
+        const job = notice.job
+        return h('div', {
+          key: notice.id, className: 'rh-video-toast', role: 'group', 'aria-label': '视频生成完成',
+          onClick: () => openPlayer(job, notice.item),
+        },
+        h(VideoThumb, { item: notice.item, className: 'rh-video-thumb-toast', label: '播放视频：' + jobLabel(job),
+          onClick: event => { event.stopPropagation(); openPlayer(job, notice.item) } }),
+        h('div', { className: 'rh-video-toast-copy' },
+          h('div', { className: 'rh-video-toast-kicker' },
+            h('span', { className: 'rh-video-check', 'aria-hidden': true }, icon('check', 8)), '生成完成'),
+          h('div', { className: 'rh-video-toast-title', title: jobLabel(job) }, jobLabel(job)),
+          h('div', { className: 'rh-video-toast-meta' }, toastMeta(job))),
+        h('button', { type: 'button', className: 'rh-video-toast-close', 'aria-label': '收起通知',
+          onClick: event => { event.stopPropagation(); dismissVideoNotice(notice.id) } }, icon('close', 12)))
+      }
+      function renderPlayer() {
+        if (!player) return null
+        const job = player.job
+        const chips = []
+        if (playerMedia.duration != null) chips.push(formatDuration(playerMedia.duration))
+        if (playerMedia.width && playerMedia.height) chips.push(playerMedia.width + ' × ' + playerMedia.height)
+        if (job.costCoins != null) chips.push(job.costCoins + ' 币')
+        if (!chips.length) chips.push('视频')
+        const busy = Boolean(regenerating[job.id])
+        return h('dialog', {
+          ref: playerDialogRef, className: 'rh-player-dialog', 'aria-modal': 'true', 'aria-labelledby': 'rh-player-title',
+          onCancel: event => { event.preventDefault(); closePlayer() },
+          onClick: event => { if (event.target === event.currentTarget) closePlayer() },
+        },
+        h('section', { className: 'rh-player' },
+          h('header', { className: 'rh-player-head' },
+            h('div', null,
+              h('div', { className: 'rh-player-kicker' }, 'VIDEO PREVIEW'),
+              h('h3', { id: 'rh-player-title', className: 'rh-player-title' }, jobLabel(job)),
+              h('div', { className: 'rh-player-sub' }, playerSubtitle(job))),
+            h('button', { type: 'button', className: 'rh-player-close', ref: playerCloseRef, 'aria-label': '关闭播放器',
+              onClick: closePlayer }, icon('close'))),
+          h('div', { className: 'rh-player-stage' },
+            h('video', { key: player.item.url, className: 'rh-player-video', src: player.item.url, controls: true,
+              autoPlay: true, playsInline: true, preload: 'metadata', onError: retryMediaOnce,
+              onLoadedMetadata: event => {
+                const video = event.currentTarget
+                setPlayerMedia({ duration: Number.isFinite(video.duration) ? video.duration : null,
+                  width: video.videoWidth || null, height: video.videoHeight || null })
+              } })),
+          h('footer', { className: 'rh-player-foot' },
+            h('div', { className: 'rh-player-chips' }, chips.map((chip, index) => h('span', { key: index, className: 'rh-player-chip' }, chip))),
+            h('div', { className: 'rh-player-actions' },
+              canRegenerateJob(job) ? h('button', { type: 'button', className: 'rh-player-btn', disabled: busy,
+                onClick: () => { const target = job; closePlayer(); regenerate(target) } },
+                icon('refresh'), busy ? '重新提交中…' : '重新生成') : null,
+              h('button', { type: 'button', className: 'rh-player-btn primary', onClick: closePlayer }, '关闭')))))
+      }
+
+      const pregen = summary?.pregen || null
+      const pregenLive = (pregen?.entries || []).filter(entry => entry.status === 'ready' || entry.status === 'generating')
+      const pregenInactive = (pregen?.entries || []).filter(entry => entry.status !== 'ready' && entry.status !== 'generating').reverse()
+      function updatePregenDraft(key, value) {
+        pregenDraftDirty.current = true
+        setPregenDraft(previous => ({ ...previous, [key]: value }))
+      }
+      function renderPregenEntry(entry) {
+        const busy = pregenBusy[entry.id]
+        const video = (entry.attachments || []).find(item => item.kind === 'video' && item.url)
+        const canSend = entry.status === 'ready' || entry.status === 'stale'
+        const canDelete = ['generating', 'ready', 'failed', 'stale'].includes(entry.status)
+        const progress = Number(entry.progress)
+        return h('article', { key: entry.id, className: 'rh-pregen-entry' },
+          h('div', { className: 'rh-pregen-preview' }, video ?
+            h('video', { className: 'rh-pregen-video', src: video.url, controls: true, preload: 'metadata', playsInline: true,
+              onError: retryMediaOnce }) :
+            h('div', { className: 'rh-job-wait' }, icon(entry.status === 'generating' ? 'clock' : 'video', 24),
+              h('span', null, pregenStatuses[entry.status] || entry.status),
+              entry.status === 'generating' ? h('div', { className: 'rh-progress' }, h('span', {
+                style: { width: (Number.isFinite(progress) && progress > 0 ? Math.min(100, progress <= 1 ? progress * 100 : progress) : 28) + '%' },
+              })) : null)),
+          h('div', { className: 'rh-pregen-info' },
+            h('div', { className: 'rh-pregen-meta' },
+              h('span', { className: 'rh-status', 'data-state': entry.status }, h('span', { className: 'rh-dot' }), pregenStatuses[entry.status] || entry.status),
+              entry.createdTurn ? h('span', null, '第 ' + entry.createdTurn + ' 轮规划') : null),
+            h('p', { className: 'rh-pregen-desc', title: entry.description }, entry.description),
+            entry.summary && entry.status !== 'ready' ? note(entry.summary) : null,
+            alert(entry.error),
+            h('div', { className: 'rh-pregen-actions' },
+              canSend ? button(busy === 'send' ? '发送中…' : '发送到本轮', () => pregenAction('send', entry.id), Boolean(busy), null, '', 'arrow') : null,
+              canDelete ? button(busy === 'delete' ? '删除中…' : '删除', () => pregenAction('delete', entry.id), Boolean(busy), null, 'quiet') : null)))
+      }
+      const pregenCard = gameId && pregen ? h('section', { className: 'rh-card rh-pregen', 'aria-label': '预生成视频池' },
+        h('div', { className: 'rh-card-head' },
+          h('div', null,
+            h('div', { className: 'rh-eyebrow' }, 'PRE-GENERATED POOL'),
+            h('h3', null, '预生成视频池'),
+            note(`就绪 ${pregen.ready || 0} · 生成中 ${pregen.generating || 0}${pregen.settings?.count ? ` · 目标 ${pregen.settings.count}` : ''}`)),
+          h('div', { className: 'rh-row' },
+            pregen.planning ? h('span', { className: 'rh-pill' }, '规划中…') : null,
+            button(pregenRefillBusy ? '补池中…' : '补池', () => pregenAction('refill'), pregenRefillBusy || !pregen.settings?.count, null, 'quiet', 'refresh'))),
+        h('div', { className: 'rh-card-body' },
+          h('div', { className: 'rh-pregen-settings' },
+            field('预生成目标数量', h('input', { className: 'rh-input', type: 'number', min: 0, max: 20, step: 1,
+              value: String(pregenDraft.count ?? 0), disabled: !gameId || pregenRefillBusy,
+              onChange: event => updatePregenDraft('count', Math.max(0, Math.min(20, Number(event.target.value) || 0))) })),
+            field('预生成每轮上限', h('input', { className: 'rh-input', type: 'number', min: 0, max: 20, step: 1,
+              value: String(pregenDraft.perTurn ?? 0), disabled: !gameId || pregenRefillBusy,
+              onChange: event => updatePregenDraft('perTurn', Math.max(0, Math.min(20, Number(event.target.value) || 0))) })),
+            field('预生成自动退出轮数', h('input', { className: 'rh-input', type: 'number', min: 0, max: 99, step: 1,
+              value: String(pregenDraft.maxAge ?? 6), disabled: !gameId || pregenRefillBusy,
+              onChange: event => updatePregenDraft('maxAge', Math.max(0, Math.min(99, Number(event.target.value) || 0))) })),
+            h('label', { className: 'rh-check' }, h('input', { type: 'checkbox', checked: pregenDraft.review !== false,
+              disabled: !gameId || pregenRefillBusy,
+              onChange: event => {
+                updatePregenDraft('review', event.target.checked)
+                void savePregenSettings({ ...pregenDraft, review: event.target.checked })
+              } }), '每轮复审'),
+            button('保存设置', () => savePregenSettings(pregenDraft), !gameId || pregenRefillBusy, null, 'quiet')),
+          note('数量 0 表示关闭；每轮上限 0 表示一次补满；自动退出 0 表示不按轮数退。开启后每轮结束会调用后台模型规划并自动花积分，只在有对话的局生效。'),
+          pregen.lastError ? alert('后台规划失败：' + pregen.lastError) : null,
+          pregenError ? alert(pregenError) : null,
+          pregenNotice ? h('div', { className: 'rh-notice', role: 'status' }, pregenNotice) : null,
+          pregenLive.length ? h('div', { className: 'rh-pregen-grid' }, pregenLive.map(renderPregenEntry)) :
+            h('div', { className: 'rh-pregen-empty' }, icon('video', 24),
+              h('strong', null, pregen.settings?.count > 0 ? '池子还空着' : '预生成未开启'),
+              h('small', null, pregen.settings?.count > 0 ? '后台会在每轮结束后按剧情补；想马上要就点「补池」。' : '把目标数量设为 1–20，后台会在每轮结束后按剧情预生成备用视频。')),
+          pregenInactive.length ? h('details', { className: 'rh-fold' },
+            h('summary', null, '已用 / 已退 / 失败 · ' + pregenInactive.length),
+            h('div', { className: 'rh-pregen-grid' }, pregenInactive.map(renderPregenEntry))) : null,
+          h('div', { style: { marginTop: 12 } }, note('就绪的视频会列进正文提示词，模型用 runninghub_send_pregenerated 直接发，不花积分；用掉后台自动补。'))))
+        : null
 
       return h('div', { className: 'rh-studio', ref: rootRef, 'data-theme': theme },
         h('style', null, css),
@@ -707,11 +1820,15 @@ window.__ModuleLoader__.load({
               h('span', { className: 'rh-dot' }), summary == null ? '读取连接中' : summary.configured ? summary.gatewayError || refreshError ? '连接异常' : '网关已连接' : '待配置'),
             h('button', { type: 'button', className: 'rh-btn', ref: settingsButtonRef, 'aria-haspopup': 'dialog',
               onClick: () => setSettingsOpen(true) }, icon('settings'), '设置'))),
-        h('div', { className: 'rh-body', inert: settingsOpen ? '' : undefined },
+        h('div', { className: 'rh-body', inert: settingsOpen ? '' : undefined,
+          style: videoNotices.length ? { paddingBottom: view === 'create' ? 190 : 112 } : undefined },
           h('nav', { className: 'rh-nav', 'aria-label': '工作台导航' },
             h('div', { className: 'rh-tabs', role: 'tablist', 'aria-label': '工作台页面' },
               h('button', { type: 'button', role: 'tab', id: 'rh-create-tab', 'aria-controls': 'rh-create-view',
                 'aria-selected': view === 'create', className: 'rh-tab', onClick: () => setView('create') }, icon('create', 14), '单镜生成'),
+              h('button', { type: 'button', role: 'tab', id: 'rh-pregen-tab', 'aria-controls': 'rh-pregen-view',
+                'aria-selected': view === 'pregen', className: 'rh-tab', onClick: () => setView('pregen') }, icon('video', 14), '预生成',
+                pregen ? h('span', { className: 'rh-count' }, pregenLive.length) : null),
               h('button', { type: 'button', role: 'tab', id: 'rh-history-tab', 'aria-controls': 'rh-history-view',
                 'aria-selected': view === 'history', className: 'rh-tab', onClick: () => setView('history') }, icon('grid', 14), '任务历史', h('span', { className: 'rh-count' }, jobs.length))),
             h('div', { className: 'rh-context' }, icon('link', 12), gameId ? '已关联当前对话' : '独立创作')),
@@ -724,13 +1841,14 @@ window.__ModuleLoader__.load({
                 h('h2', null, '把故事，变成镜头'),
                 h('p', { className: 'rh-lead' }, '选择工作流、写下画面。生成在后台继续，你可以留在故事里。'),
                 h('label', { className: 'rh-workflow' }, h('span', { className: 'rh-workflow-label' }, '工作流'),
-                  h('select', { className: 'rh-input', 'aria-label': '工作流', value: model, disabled: locked || !aliases.length,
+                  h('select', { className: 'rh-input', 'aria-label': '工作流', value: model, disabled: locked || settingsBusy || !aliases.length,
                     onChange: event => selectModel(event.target.value) }, !aliases.length ? h('option', { value: '' }, '等待客户端工作流') : null,
                     aliases.map(alias => h('option', { key: alias, value: alias }, alias))),
                   h('span', { className: 'rh-workflow-hint' }, workflowBusy ? '读取参数中…' : workflow ? '已与客户端同步' : '等待连接')),
                 h('div', { className: 'rh-row', style: { marginTop: 10 } },
                   button('同步客户端', () => setRefreshVersion(value => value + 1), locked || refreshBusy || workflowBusy, null, 'link', 'refresh'),
-                  manualModel.current ? button('跟随客户端工作流', () => { manualModel.current = false; selectModel(summary?.model || aliases[0] || ''); manualModel.current = false }, locked, null, 'link') : note('默认工作流跟随客户端')),
+                  note(summary?.templateMode ? '提示词模板 · ' + summary.templateMode : '工作流由面板固定，AI 不选别名')),
+                alert(summary?.templateError ? '提示词模板读取失败：' + summary.templateError : ''),
                 alert(workflowError), workflowError ? button('重新读取工作流', () => setRefreshVersion(value => value + 1), locked, null, 'link') : null,
                 ...(workflow?.syncErrors || []).map((error, index) => alert(error, index))),
               h('div', { className: 'rh-composer' },
@@ -747,29 +1865,33 @@ window.__ModuleLoader__.load({
                 h('aside', { className: 'rh-side', 'aria-label': '生成参数' },
                   h('div', { className: 'rh-stack' },
                     h('div', { className: 'rh-section-label', style: { marginBottom: 0 } }, '生成参数',
-                      button('重置', () => { setDuration(''); setRatio(''); setMegapixels(''); setWidth(''); setHeight(''); setCustom({}); setApplyDefaults(true) }, formDisabled, null, 'link')),
+                      settingsBusy ? h('span', { className: 'rh-note' }, '正在同步…') :
+                        settingsDirty ? h('span', { className: 'rh-note' }, '改动待同步…') : null),
                     resolutionFields.has('aspect_ratio') ? field('画面比例', h('input', { className: 'rh-input', value: ratio,
-                      placeholder: String(effectiveResolution.aspect_ratio || workflow?.videoAspect?.ratio || '客户端默认'), disabled: formDisabled, onChange: event => setRatio(event.target.value) })) : null,
+                      placeholder: String(effectiveResolution.aspect_ratio || workflow?.videoAspect?.ratio || '客户端默认'), disabled: formDisabled, onChange: event => { setRatio(event.target.value); markSettings('resolution') } })) : null,
                     durationSupported ? field('片长 / 秒', h('input', { className: 'rh-input', type: 'number', min: 0.5, max: 120, step: 'any', value: duration,
-                      placeholder: durationDefault != null ? String(durationDefault) : '默认', disabled: formDisabled, onChange: event => setDuration(event.target.value) })) : null,
+                      placeholder: durationDefault != null ? String(durationDefault) : '默认', disabled: formDisabled, onChange: event => { setDuration(event.target.value); markSettings('duration') } })) : null,
                     resolutionFields.has('megapixels') ? field('像素量 / MP', h('input', { className: 'rh-input', type: 'number', min: 0.1, max: 16, step: 'any', value: megapixels,
-                      placeholder: String(effectiveResolution.megapixels ?? '默认'), disabled: formDisabled, onChange: event => setMegapixels(event.target.value) })) : null,
+                      placeholder: String(effectiveResolution.megapixels ?? '默认'), disabled: formDisabled, onChange: event => { setMegapixels(event.target.value); markSettings('resolution') } })) : null,
                     dimensionsSupported && !resolutionFields.has('aspect_ratio') ? h('div', { className: 'rh-grid2' },
                       field('宽度 / px', h('input', { className: 'rh-input', type: 'number', min: 64, max: 8192, step: 1, value: width,
-                        placeholder: String(effectiveResolution.width ?? '默认'), disabled: formDisabled, onChange: event => setWidth(event.target.value) })),
+                        placeholder: String(effectiveResolution.width ?? '默认'), disabled: formDisabled, onChange: event => { setWidth(event.target.value); markSettings('resolution') } })),
                       field('高度 / px', h('input', { className: 'rh-input', type: 'number', min: 64, max: 8192, step: 1, value: height,
-                        placeholder: String(effectiveResolution.height ?? '默认'), disabled: formDisabled, onChange: event => setHeight(event.target.value) }))) : null,
+                        placeholder: String(effectiveResolution.height ?? '默认'), disabled: formDisabled, onChange: event => { setHeight(event.target.value); markSettings('resolution') } }))) : null,
                     !resolutionFields.size ? note('分辨率沿用客户端工作流；未声明可覆盖字段。') : null,
-                    checkbox('应用工作流默认值', applyDefaults, setApplyDefaults, locked),
-                    checkbox('绑定当前对话轮次', bindToTurn, setBindToTurn, locked),
+                    checkbox('绑定当前对话轮次', bindToTurn, value => changePreference('bindToTurn', value), locked),
+                    preferenceError ? alert(preferenceError) : null,
                     h('details', { className: 'rh-fold' }, h('summary', null, '自定义参数', h('span', { className: 'rh-count' }, workflow?.customFields.length || 0)),
-                      h('div', { className: 'rh-fold-content' }, workflow?.customFields.length ? workflow.customFields.map(renderCustom) : note('此工作流暂无自定义参数。'))),
+                      h('div', { className: 'rh-fold-content' }, workflow?.customFields.length ? workflow.customFields.map(field => renderCustom(field)) : note('此工作流暂无自定义参数。'),
+                        note('开关、数值、LoRA 与强度改动会立即写回客户端；提示词类参数只对本次生成生效。'))),
                     h('details', { className: 'rh-fold' }, h('summary', null, '工作流默认设置'),
                       h('div', { className: 'rh-fold-content rh-meta-list' },
                         note('片长 ' + (durationDefault ?? '—') + ' 秒 · ' + (workflow?.videoDuration?.fps ?? '—') + ' fps'),
                         note('分辨率 ' + (workflow?.defaults?.resolution ? JSON.stringify(workflow.defaults.resolution) : '使用画布原值')),
                         ...(workflow?.defaults?.references || []).map((item, index) => note('素材 · ' + (item.name || '未命名'), index)),
-                        note('关闭默认值只停用已保存的覆盖，不清空画布素材。替换素材需覆盖所有启用槽位。')))))),
+                        note('模型字段 ' + (workflow?.modelFields?.length || 0) + ' 个 · 种子 ' + (workflow?.seedTargets?.length || 0) + ' 个'),
+                        note('这些默认值与 6888 管理页是同一份；改动在右上角「设置」里会自动同步。'),
+                        button('打开完整设置', () => setSettingsOpen(true), false, null, 'link')))))),
               h('section', { className: 'rh-references', 'aria-label': '参考素材' },
                 h('div', { className: 'rh-section-label', style: { marginBottom: 0 } }, h('span', null, '参考素材'),
                   h('span', { className: 'rh-note' }, selectedReferences ? '已选择 ' + selectedReferences + ' 份' : '图片 / 音频')),
@@ -778,7 +1900,7 @@ window.__ModuleLoader__.load({
                   h('h3', null, group.title + ' · ' + group.alias), h('div', { className: 'rh-slots' }, group.referenceSlots.map(slot => renderReference(slot, group))))) :
                 workflow?.referenceSlots.length ? h('div', { className: 'rh-slots' }, workflow.referenceSlots.map(slot => renderReference(slot))) :
                   h('div', { style: { paddingTop: 13 } }, note(workflow ? '此工作流无需上传参考素材。' : '连接工作流后显示参考素材槽位。')),
-                h('div', { style: { marginTop: 12 } }, note('槽位、默认素材、备注和随机池均读取客户端；每 5 秒同步。本次上传仅覆盖本次生成，不改客户端默认。单文件 ≤ 10MB，请求 ≤ 25MB。')))),
+                h('div', { style: { marginTop: 12 } }, note('槽位、默认素材、备注和随机池与客户端同步。主面板上传的素材只覆盖本次生成；要改客户端默认素材，请在右上角「设置」里上传（自动同步）。单文件 ≤ 10MB，请求 ≤ 25MB。')))),
             h('div', { className: 'rh-submitbar' },
               h('div', null, h('div', { className: 'rh-submit-summary' }, model + ' · ' + (ratio || '默认画幅') + (duration || durationDefault ? ' · ' + (duration || durationDefault) + 's' : '')),
                 h('div', { className: 'rh-submit-sub' }, activeCount ? activeCount + ' 个任务在后台运行' : '参数确认后提交，按实际工作流计费')),
@@ -790,11 +1912,16 @@ window.__ModuleLoader__.load({
               h('code', { className: 'rh-note' }, pending.body.requestId), alert(pending.error),
               h('div', { className: 'rh-row' }, button('手动重试原请求', () => submit(true), submitBusy || configBusy),
                 !pending.uncertain ? button('返回编辑', () => { rememberPending(null); setSubmitError('') }, submitBusy, null, 'quiet') : null)) : null),
-          h('section', { className: 'rh-results', id: 'rh-history-view', role: view === 'history' ? 'tabpanel' : undefined,
+          h('div', { id: 'rh-pregen-view', role: 'tabpanel', 'aria-labelledby': 'rh-pregen-tab', hidden: view !== 'pregen' },
+            pregenCard || h('div', { className: 'rh-empty' }, icon('video', 30),
+              h('strong', null, !gameId ? '请先打开一局游戏' : summary ? '预生成池还没就绪' : '正在读取预生成池…'),
+              h('small', null, !gameId ? '预生成按局保存；打开一局游戏后回来配置。' : '连接网关并设好目标数量后，这里会列出就绪与生成中的候补视频。'))),
+          view === 'pregen' ? null : h('section', { className: 'rh-results', id: 'rh-history-view', role: view === 'history' ? 'tabpanel' : undefined,
             'aria-labelledby': view === 'history' ? 'rh-history-tab' : undefined },
             h('div', { className: 'rh-results-head' }, h('div', { className: 'rh-results-title' }, h('h3', null, view === 'history' ? '任务历史' : '最近生成'),
               h('span', { className: 'rh-count' }, jobs.length)),
               button(refreshBusy ? '正在刷新…' : '刷新', () => setRefreshVersion(value => value + 1), refreshBusy || visible === false, null, 'quiet', 'refresh')),
+            regenerateNotice ? h('div', { className: 'rh-notice', role: 'status' }, regenerateNotice) : null,
             h('div', { className: 'rh-filters', role: 'group', 'aria-label': '任务筛选' },
               [['all', '全部'], ['active', '进行中'], ['ready', '已完成'], ['failed', '异常']].map(([value, label]) =>
                 h('button', { key: value, type: 'button', className: 'rh-filter', 'aria-pressed': jobFilter === value,
@@ -802,21 +1929,29 @@ window.__ModuleLoader__.load({
             shownJobs.length ? h('div', { className: 'rh-jobs' }, (view === 'create' ? shownJobs.slice(0, 6) : shownJobs).map(renderJob)) :
               h('div', { className: 'rh-empty' }, icon('image', 30), h('strong', null, jobs.length ? '暂无符合筛选的任务' : '你的第一个镜头，从这里开始'),
                 h('small', null, jobs.length ? '试试切换筛选条件。' : '生成结果会保存在本地。切换页面，不会打断后台任务。')),
-            h('div', { style: { marginTop: 12 } }, note(visible === false ? '面板隐藏时暂停轮询' : '每 5 秒自动更新 · 刷新不会重新生成')))),
+            h('div', { style: { marginTop: 12 } }, note(visible === false ? '面板隐藏时暂停轮询' : '每 5 秒自动更新 · 刷新只查询状态，不会重新提交')))),
         settingsOpen ? h('div', { className: 'rh-drawer-layer' },
           h('button', { type: 'button', className: 'rh-backdrop', 'aria-label': '关闭设置遮罩', tabIndex: -1, onClick: () => setSettingsOpen(false) }),
           h('section', { className: 'rh-drawer', role: 'dialog', 'aria-modal': true, 'aria-labelledby': 'rh-settings-title', ref: drawerRef },
-            h('div', { className: 'rh-drawer-head' }, h('div', null, h('h3', { id: 'rh-settings-title' }, '工作台设置'), note('连接网关与正文联动')),
+            h('div', { className: 'rh-drawer-head' }, h('div', null, h('h3', { id: 'rh-settings-title' }, '工作台设置'),
+              note('工作流、生成默认值与正文联动 · 与 6888 管理页互通')),
               h('button', { type: 'button', className: 'rh-btn rh-btn-quiet', 'aria-label': '关闭设置', onClick: () => setSettingsOpen(false) }, icon('close'))),
             h('div', { className: 'rh-drawer-content' },
-              h('section', { className: 'rh-setting-group' }, h('div', { className: 'rh-setting-heading' }, icon('link'), '网关连接'),
-                field('网关地址', h('input', { type: 'url', className: 'rh-input', value: baseURL, disabled: locked,
-                  onChange: event => { baseDirty.current = true; setBaseURL(event.target.value) } })),
-                field('网关 Key', h('input', { type: 'password', className: 'rh-input', autoComplete: 'new-password', value: apiKey,
-                  placeholder: summary?.configured ? '已配置，留空保留原 Key' : '输入网关 Key', disabled: locked, onChange: event => setApiKey(event.target.value) })),
-                note('经 Tavern 同源接口访问本地网关。Key 存入宿主凭据服务，不显示已保存的值。'),
-                button(configBusy ? '保存中…' : '保存连接设置', saveConfig, locked), alert(configError),
-                configNotice ? h('div', { className: 'rh-notice', role: 'status' }, configNotice) : null),
+              renderSettingsStatus(),
+              h('div', { className: 'rh-rule' }),
+              h('section', { className: 'rh-setting-group' },
+                h('div', { className: 'rh-setting-heading' }, icon('grid'), '工作流'),
+                field('工作流', h('select', { className: 'rh-input', 'aria-label': '设置里的工作流', value: model,
+                  disabled: locked || settingsBusy || !aliases.length, onChange: event => selectModel(event.target.value) },
+                !aliases.length ? h('option', { value: '' }, '等待客户端工作流') : null,
+                aliases.map(alias => h('option', { key: alias, value: alias }, alias)))),
+                summary?.templateMode ? note('提示词模板 · ' + summary.templateMode) : null,
+                note('与单镜生成页共用同一个选择；切换后自动载入该工作流的网关设置。'),
+                alert(workflowError)),
+              h('div', { className: 'rh-rule' }),
+              workflow ? renderGenerationSettings() : note('连接网关并选择工作流后，这里显示可保存的生成设置。'),
+              h('div', { className: 'rh-rule' }),
+              renderReferenceSettings(),
               h('div', { className: 'rh-rule' }),
               h('section', { className: 'rh-setting-group' }, h('div', { className: 'rh-setting-heading' }, icon('video'), '正文视频'),
                 h('label', { className: 'rh-toggle-row' }, h('span', null, '视频完成后自动插入对应正文'),
@@ -825,7 +1960,25 @@ window.__ModuleLoader__.load({
                 note('先输出正文，视频在后台生成，完成后补到原句或正文末尾。绑定提交时的版本，不随重生成串位。'),
                 h('details', { className: 'rh-fold' }, h('summary', null, '联动说明'), h('div', { className: 'rh-fold-content' },
                   note('开启后，模型可按正文提交三个分镜任务；仅切换开关不会生成或收费。'),
-                  note('关闭只影响新任务，已提交的任务仍按原约定插入。'))), alert(autoInsertError))))) : null)
+                  note('关闭只影响新任务，已提交的任务仍按原约定插入。'))), alert(autoInsertError)),
+              h('div', { className: 'rh-rule' }),
+              h('section', { className: 'rh-setting-group' }, h('div', { className: 'rh-setting-heading' }, icon('grid'), '预生成视频池'),
+                note('按局配置与查看：在「预生成」页里设置目标数量、每轮上限、自动退出轮数与复审。'),
+                note('开启后每轮结束会用 Tavern 后台模型按剧情规划并自动花积分；没有配置后台模型或当前工作流没有提示词模板时会明确失败，不会提交。')),
+              h('div', { className: 'rh-rule' }),
+              renderGenerationBehavior(),
+              h('div', { className: 'rh-rule' }),
+              h('section', { className: 'rh-setting-group' }, h('div', { className: 'rh-setting-heading' }, icon('link'), '网关连接'),
+                field('网关地址', h('input', { type: 'url', className: 'rh-input', value: baseURL, disabled: locked,
+                  onChange: event => { baseDirty.current = true; setBaseURL(event.target.value) } })),
+                field('网关 Key', h('input', { type: 'password', className: 'rh-input', autoComplete: 'new-password', value: apiKey,
+                  placeholder: summary?.configured ? '已配置，留空保留原 Key' : '输入网关 Key', disabled: locked, onChange: event => setApiKey(event.target.value) })),
+                note('经 Tavern 同源接口访问本地网关。Key 存入宿主凭据服务，不显示已保存的值。'),
+                button(configBusy ? '保存中…' : '保存连接设置', saveConfig, locked), alert(configError),
+                configNotice ? h('div', { className: 'rh-notice', role: 'status' }, configNotice) : null),
+              note('写在客户端里的设置（分辨率、片长、自定义参数、模型字段、种子、参考素材）与 6888 管理页「单镜生成」是同一份；这里的改动会立即同步，生成也永远以这份为准。')))) : null,
+        videoNotices.length ? h('div', { className: 'rh-video-toasts' + (view === 'create' ? ' rh-video-toasts-raised' : ''), 'aria-live': 'polite', 'aria-label': '视频生成完成' }, videoNotices.map(renderVideoNotice)) : null,
+        renderPlayer())
     }
 
     return {

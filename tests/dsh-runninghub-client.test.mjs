@@ -6,6 +6,7 @@ import {
   GatewayClient,
   GatewayError,
   sanitizeMessage,
+  splitPortPrompt,
   validateBaseURL,
   validateInput,
   validateReferences,
@@ -32,7 +33,8 @@ function makeResponse({ text, bytes, contentType = 'application/json', contentLe
       controller.close()
     },
   })
-  return { ok: status >= 200 && status < 300, status, headers, body: stream, redirected, url: '' }
+  return { ok: status >= 200 && status < 300, status, headers, body: stream, redirected, url: '',
+    text: async () => new TextDecoder().decode(data), json: async () => JSON.parse(new TextDecoder().decode(data)) }
 }
 
 // 默认网关行为可覆写。tasks 以 remoteTaskId 为键返回任务快照；media 返回字节或抛错。
@@ -49,9 +51,11 @@ function createGateway({
   referenceContentType = 'image/png',
   referenceBytes = pngBytes(),
   referenceContentLength,
+  optionGroups,
   onCall,
 } = {}) {
   const calls = []
+  const writes = []
   const fetchImpl = async (url, options = {}) => {
     const u = new URL(url)
     const method = options.method || 'GET'
@@ -60,11 +64,27 @@ function createGateway({
     onCall?.(record)
     if (u.pathname === '/api/workflows') return makeResponse({ text: JSON.stringify(workflows) })
     if (u.pathname === '/api/settings') return makeResponse({ text: JSON.stringify(settings ?? { defaultModel: '' }) })
+    if (u.pathname === '/api/option-groups') return makeResponse({ text: JSON.stringify({ groups: optionGroups ?? [] }) })
     if (/^\/api\/workflows\/[^/]+\/nodes$/.test(u.pathname)) return makeResponse({ text: JSON.stringify(nodes ?? []) })
     if (u.pathname === '/api/lora-library') return makeResponse({ text: JSON.stringify(loraLibrary ?? { loras: [], maxConcurrent: 1, enabled: true }) })
+    if (method === 'PUT' && /^\/api\/workflows\/[^/]+\/(defaults|duration|seed|model-field)$/.test(u.pathname)) {
+      const body = JSON.parse(options.body || '{}')
+      writes.push({ path: u.pathname, method, body, search: u.search })
+      return makeResponse({ text: JSON.stringify({ alias: decodeURIComponent(u.pathname.split('/')[3]), ...body, updatedAt: 'updated-2' }) })
+    }
+    if (method === 'PUT' && /^\/api\/workflows\/[^/]+\/reference-slots\/[^/]+$/.test(u.pathname)) {
+      const body = JSON.parse(options.body || '{}')
+      writes.push({ path: u.pathname, method, body, search: u.search })
+      return makeResponse({ text: JSON.stringify({ alias: 'demo', referenceSlots: [] }) })
+    }
     if (/^\/api\/workflows\/[^/]+\/defaults\/references\/[^/]+$/.test(u.pathname)) {
       const bytes = typeof referenceBytes === 'function' ? referenceBytes(u.pathname) : referenceBytes
       return makeResponse({ bytes, contentType: referenceContentType, status: referenceStatus, contentLength: referenceContentLength })
+    }
+    if (method === 'POST' && /^\/api\/workflows\/[^/]+\/port-directive$/.test(u.pathname)) {
+      const body = JSON.parse(options.body || '{}')
+      if (body.mode === 'bad') return makeResponse({ status: 400, text: JSON.stringify({ error: { message: '模板缺少参考图' } }) })
+      return makeResponse({ text: JSON.stringify({ text: '模板正文', mode: body.mode }) })
     }
     if (u.pathname === '/v1/images/generations') {
       const submitted = JSON.parse(options.body || '{}')
@@ -85,7 +105,7 @@ function createGateway({
     return makeResponse({ status: 404, text: '{}' })
   }
   const client = new GatewayClient({ baseURL, apiKey, fetchImpl, timeoutMs: 2000, maxMediaBytes: 64 * 1024 * 1024 })
-  return { client, calls, apiKey }
+  return { client, calls, writes, apiKey }
 }
 
 // 构造一个合法网关工作流，并附带可触发各类校验的字段。
@@ -650,4 +670,136 @@ test('broken 工作流必须拒绝提交（validateInput 拦截）', async () =>
   const { client } = createGateway({ workflows: [broken] })
   const description = (await client.listWorkflows()).find((w) => w.alias === 'broken-wf')
   assert.throws(() => validateInput({ model: 'broken-wf', prompt: 'x', custom: {} }, description), GatewayError)
+})
+
+test('splitPortPrompt：单段标记、管线双段、书名号还原与非法输入', () => {
+  assert.deepEqual(splitPortPrompt('image###\n《Picture 1》 镜头\n###'), { prompt: '<Picture 1> 镜头', imagePrompt: '' })
+  assert.deepEqual(splitPortPrompt('image###\n生图\n###\n\nvideo###\n视频\n###', 'first-frame'), { prompt: '视频', imagePrompt: '生图' })
+  assert.deepEqual(splitPortPrompt('纯手写提示词'), { prompt: '纯手写提示词', imagePrompt: '' })
+  assert.throws(() => splitPortPrompt('image###\n只有生图\n###', 'first-frame'), /两段提示词/)
+  assert.throws(() => splitPortPrompt('没有标记', 'first-frame'), /两段提示词/)
+  assert.throws(() => splitPortPrompt('   '), /不能为空/)
+})
+
+test('getOptionGroups：只回 id/label/values，丢弃非法项和私有字段', async () => {
+  const { client } = createGateway({ optionGroups: [
+    { id: 'g1', label: ' 组一 ', values: ['a', 'b', '', 'x'.repeat(600)], apiKey: 'SECRET' },
+    { id: '', label: '坏组', values: ['x'] },
+    { id: 'g2', label: '', values: 'not-array', account: 'SECRET' },
+  ] })
+  assert.deepEqual(await client.getOptionGroups(), [
+    { id: 'g1', label: '组一', values: ['a', 'b'] },
+    { id: 'g2', label: 'g2', values: [] },
+  ])
+})
+
+test('saveDefaults：整组提交预设/分辨率/自定义/素材/随机池，并带 baseUpdatedAt', async () => {
+  const { client, writes } = createGateway()
+  const data = Buffer.from(pngBytes()).toString('base64')
+  const result = await client.saveDefaults('h3参考', {
+    presetIds: ['cinematic'],
+    promptSuffix: '电影感',
+    resolution: { aspect_ratio: '16:9', megapixels: 1.5 },
+    custom: { quality: 2, stabilize: false },
+    references: [{ nodeId: '9', kind: 'image', name: 'a.png', mimeType: 'image/png', data, note: '女主' }],
+    referencePools: [{ nodeId: '9', galleryIds: ['00000000-0000-4000-8000-000000000001'], note: '池' }],
+    baseUpdatedAt: 'updated-1',
+  })
+  assert.equal(result.alias, 'h3参考')
+  assert.equal(writes.length, 1)
+  assert.equal(writes[0].path, '/api/workflows/h3%E5%8F%82%E8%80%83/defaults')
+  assert.deepEqual(writes[0].body, {
+    presetIds: ['cinematic'], promptSuffix: '电影感', resolution: { aspect_ratio: '16:9', megapixels: 1.5 },
+    custom: { quality: 2, stabilize: false },
+    references: [{ nodeId: '9', kind: 'image', note: '女主', name: 'a.png', mimeType: 'image/png', data }],
+    referencePools: [{ nodeId: '9', galleryIds: ['00000000-0000-4000-8000-000000000001'], note: '池' }],
+    baseUpdatedAt: 'updated-1',
+  })
+})
+
+test('saveDefaults：拒绝未知字段、非标准 base64 和 fileName 泄漏', async () => {
+  const { client, writes } = createGateway()
+  await assert.rejects(client.saveDefaults('demo', { nope: true }), /未知参数/)
+  await assert.rejects(client.saveDefaults('demo', { references: [{ nodeId: '9', name: 'a.png', mimeType: 'image/png', data: 'not base64 !' }] }), /base64/)
+  await assert.rejects(client.saveDefaults('demo', { references: [{ nodeId: '9', fileName: 'SECRET.png', kind: 'image' }] }), /未知参数/)
+  assert.equal(writes.length, 0)
+})
+
+test('saveDuration / saveSeed / saveModelField / setReferenceSlot：路径、站点与 body 精确', async () => {
+  const { client, writes } = createGateway()
+  await client.saveDuration('demo', 'international', 8)
+  await client.saveDuration('demo', '', null)
+  await client.saveSeed('demo', 'international', '9.noise_seed', 42)
+  await client.saveSeed('demo', 'international', '9.noise_seed', null)
+  await client.saveModelField('demo', 'international', '95.unet_name', { value: 'b.safetensors' })
+  await client.saveModelField('demo', 'international', '95.unet_name', { groupId: 'g1' })
+  await client.setReferenceSlot('demo', '10', true)
+  assert.deepEqual(writes.map(item => ({ path: item.path, search: item.search, body: item.body })), [
+    { path: '/api/workflows/demo/duration', search: '?site=international', body: { seconds: 8 } },
+    { path: '/api/workflows/demo/duration', search: '', body: { seconds: null } },
+    { path: '/api/workflows/demo/seed', search: '?site=international', body: { target: '9.noise_seed', value: 42 } },
+    { path: '/api/workflows/demo/seed', search: '?site=international', body: { target: '9.noise_seed', value: null } },
+    { path: '/api/workflows/demo/model-field', search: '?site=international', body: { target: '95.unet_name', value: 'b.safetensors' } },
+    { path: '/api/workflows/demo/model-field', search: '?site=international', body: { target: '95.unet_name', groupId: 'g1' } },
+    { path: '/api/workflows/demo/reference-slots/10', search: '', body: { enabled: true } },
+  ])
+})
+
+test('settings helpers：参数非法时在网络请求前拒绝', async () => {
+  const { client, writes } = createGateway()
+  await assert.rejects(client.saveDuration('demo', 'bad site', 8), /站点/)
+  await assert.rejects(client.saveDuration('demo', '', 0), /片长/)
+  await assert.rejects(client.saveSeed('demo', '', 'bad target', 1), /字段/)
+  await assert.rejects(client.saveSeed('demo', '', '9.seed', -1), /整数/)
+  await assert.rejects(client.saveModelField('demo', '', '9.seed', {}), /没有要保存/)
+  await assert.rejects(client.setReferenceSlot('demo', '../9', true), /槽位/)
+  await assert.rejects(client.saveDefaults('', {}), /别名/)
+  assert.equal(writes.length, 0)
+})
+
+test('portDirective：带参考素材清单/mediaLimits/片长，并校验标签与未知字段', async () => {
+  const { client, calls } = createGateway()
+  const result = await client.portDirective('demo', 'qwen-multi-h3', undefined, {
+    references: [{ kind: 'image', label: '生图·参考图 1', tag: '<image1>', note: '女主外貌' }],
+    mediaLimits: { picture: 1, video: 0, audio: 0 },
+    durationSeconds: 5,
+    aspectRatio: '16:9',
+  })
+  assert.deepEqual(result, { text: '模板正文', mode: 'qwen-multi-h3' })
+  const call = calls.at(-1)
+  assert.equal(call.path, '/api/workflows/demo/port-directive')
+  assert.deepEqual(JSON.parse(call.body), {
+    mode: 'qwen-multi-h3', prompt: '',
+    references: [{ kind: 'image', label: '生图·参考图 1', tag: '<image1>', note: '女主外貌' }],
+    mediaLimits: { picture: 1, video: 0, audio: 0 },
+    durationSeconds: 5,
+    aspectRatio: '16:9',
+  })
+  const before = calls.length
+  await assert.rejects(client.portDirective('demo', 'qwen-h3', undefined, { nope: true }), /未知参数/)
+  await assert.rejects(client.portDirective('demo', 'qwen-h3', undefined, {
+    references: [{ kind: 'image', label: 'x', tag: '<Bad 1>' }],
+  }), /标签/)
+  await assert.rejects(client.portDirective('demo', 'qwen-h3', undefined, { mediaLimits: { picture: -1 } }), /上限/)
+  assert.equal(calls.length, before, '非法参数必须在请求前拒绝')
+})
+
+test('portDirective：网关 400 的 error.message 会带进异常文本', async () => {
+  const { client } = createGateway()
+  await assert.rejects(client.portDirective('demo', 'bad'), (error) => {
+    assert.equal(error.status, 400)
+    assert.match(error.message, /模板缺少参考图/)
+    return true
+  })
+})
+
+test('splitPortPrompt：模型把标记写在同一行（image###正文###）也能拆成两段', () => {
+  const inline = 'image###真人照片感，女性躺在床上###\nvideo###The woman lies on the bed, breathing slowly.###'
+  assert.deepEqual(splitPortPrompt(inline, 'first-frame'), {
+    prompt: 'The woman lies on the bed, breathing slowly.',
+    imagePrompt: '真人照片感，女性躺在床上',
+  })
+  const sameLine = 'image###A shot### video###B shot###'
+  assert.deepEqual(splitPortPrompt(sameLine, 'first-frame'), { prompt: 'B shot', imagePrompt: 'A shot' })
+  assert.throws(() => splitPortPrompt('image###只有生图###', 'first-frame'), /两段提示词/)
 })
