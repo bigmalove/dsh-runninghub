@@ -124,6 +124,10 @@ test('RunningHub 重设计界面：jsdom + React DOM 隔离交互', {
     configured: true,
     autoInsert: false,
     baseURL,
+    model: 'h3参考',
+    minimal: false,
+    dimensions: false,
+    describeAlter: null,
     describeGate: Promise.withResolvers(),
     configureGate: null,
     submitGate: null,
@@ -136,18 +140,21 @@ test('RunningHub 重设计界面：jsdom + React DOM 隔离交互', {
   }
   function description(model) {
     const another = model === 'another'
-    return {
+    const base = {
       alias: model,
+      revision: another ? 'rev-another' : 'rev-h3',
       customFields: [
-        { key: 'stabilize', label: '镜头稳定', type: 'boolean', defaultValue: false },
+        { key: 'stabilize', label: '镜头稳定', type: 'boolean', defaultValue: !another },
         { key: 'quality', label: '质量档位', type: 'select',
           options: [{ value: 1, label: '标准' }, { value: 2, label: '精细' }], defaultValue: 2 },
         { key: 'strength', label: '参考强度', type: 'number', min: 1, max: 10, defaultValue: 9 },
+        { key: 'seed', label: '随机种子', type: 'number', randomize: true },
       ],
       referenceSlots: [
         { nodeId: 'image-ref', label: '参考图片', kind: 'image' },
         { nodeId: 'audio-ref', label: '参考音频', kind: 'audio', bypassed: true },
       ],
+      capabilities: { resolutionFields: ['aspect_ratio', 'megapixels'] },
       defaults: {
         custom: { stabilize: !another, quality: another ? 2 : 1, strength: another ? 4 : 2 },
         resolution: { aspect_ratio: '16:9', megapixels: another ? 2 : 1 },
@@ -155,6 +162,17 @@ test('RunningHub 重设计界面：jsdom + React DOM 隔离交互', {
       },
       videoDuration: { seconds: another ? 8 : 5, fps: 24 },
     }
+    if (state.minimal) {
+      delete base.capabilities
+      delete base.videoDuration
+      delete base.defaults.resolution
+    }
+    if (state.dimensions) {
+      base.capabilities = { resolutionFields: ['width', 'height'] }
+      delete base.defaults.resolution
+    }
+    if (state.describeAlter) state.describeAlter(base)
+    return base
   }
   const response = data => ({ ok: true, status: 200, json: async () => structuredClone(data) })
   // 所有 GET/POST 均为内存夹具，包括 configure 和 submit；没有真实网关、生成或费用。
@@ -169,7 +187,8 @@ test('RunningHub 重设计界面：jsdom + React DOM 隔离交互', {
     if (options.signal?.aborted) throw new window.DOMException('夹具请求已取消', 'AbortError')
     if (method === 'GET') {
       return response({ configured: state.configured, autoInsert: state.autoInsert, baseURL: state.baseURL,
-        adapter: 'ui-fixture', jobs: state.jobs, workflows: [{ alias: 'h3参考' }, { alias: 'another' }] })
+        model: state.model, adapter: 'ui-fixture', jobs: state.jobs,
+        workflows: [{ alias: 'h3参考', revision: 'rev-h3' }, { alias: 'another', revision: 'rev-another' }] })
     }
     switch (body.action) {
       case 'describe': {
@@ -531,7 +550,7 @@ test('RunningHub 重设计界面：jsdom + React DOM 隔离交互', {
         resolution: { aspect_ratio: '9:16', megapixels: 1.5 },
         custom: { stabilize: false, quality: 2, strength: 3.5 },
         references: [
-          { nodeId: 'image-ref', name: '主角参考图', mimeType: 'image/png', data: imageBytes.toString('base64') },
+          { nodeId: 'image-ref', name: 'fixture.png', mimeType: 'image/png', data: imageBytes.toString('base64'), note: '主角参考图' },
           { nodeId: 'audio-ref', name: 'fixture.mp3', mimeType: 'audio/mpeg', data: audioBytes.toString('base64'), enable: true },
         ],
       },
@@ -594,5 +613,165 @@ test('RunningHub 重设计界面：jsdom + React DOM 隔离交互', {
     assert.deepEqual({ emptyDisabled, whitespaceDisabled, submittedWhitespace },
       { emptyDisabled: true, whitespaceDisabled: true, submittedWhitespace: false },
       '客户端没有阻止空提示词提交；宿主 validateInput 明确拒绝空白 prompt')
+  })
+
+  async function waitWorkflow() {
+    await until(() => {
+      try { return field('参考强度').disabled === false } catch { return false }
+    }, '工作流加载完成')
+  }
+  function fieldLabelExists(label) {
+    return [...container.querySelectorAll('.rh-field-label')].some(node => node.textContent === label)
+  }
+  async function mountVariant(overrides = {}) {
+    state.model = overrides.model ?? 'h3参考'
+    state.minimal = overrides.minimal ?? false
+    state.dimensions = overrides.dimensions ?? false
+    state.describeAlter = overrides.alter ?? null
+    if (root) await act(async () => { root.unmount(); root = null })
+    await mount()
+    await waitWorkflow()
+  }
+
+  await t.test('默认素材预览仅用 src，不含 key/fileName', async () => {
+    await mountVariant()
+    const img = query('img[alt="客户端默认参考图片"]')
+    assert.ok(img.getAttribute('src').startsWith('/api/dsh-runninghub/reference?'), '默认素材走同源 reference 端点')
+    assert.match(img.getAttribute('src'), /[?&]model=/)
+    assert.match(img.getAttribute('src'), /[?&]nodeId=image-ref/)
+    assert.match(img.getAttribute('src'), /[?&]v=rev-h3/)
+    assert.equal(/key/i.test(img.getAttribute('src')), false, 'src 不得携带网关 Key')
+    assert.equal(img.getAttribute('src').includes('fileName'), false, 'src 不得携带上传文件名')
+    assert.equal(img.getAttribute('src').includes('name='), false, 'src 不得携带素材名称参数')
+  })
+
+  await t.test('默认模型非 h3 参考时跟随 summary，手动选择后不被全局变更强制切走', async () => {
+    await mountVariant({ model: 'another' })
+    assert.equal(query('select[aria-label="工作流"]').value, 'another', '非 h3 默认模型从 summary.model 跟随')
+    await input(query('select[aria-label="工作流"]'), 'h3参考')
+    await until(() => field('参考强度').value === '2', '手动切到 h3 参考并加载默认')
+    assert.equal(query('select[aria-label="工作流"]').value, 'h3参考', '已手动选择 h3 参考')
+    state.model = 'another'
+    await click(button('同步客户端'))
+    await until(() => query('select[aria-label="工作流"]').value === 'h3参考', '全局 model 变更后保留手动选择')
+    assert.equal(query('select[aria-label="工作流"]').value, 'h3参考', '手动选择不被跟随逻辑强制切走')
+  })
+
+  await t.test('无分辨率 / 时长能力时不出现对应字段', async () => {
+    await mountVariant({ minimal: true })
+    assert.equal(fieldLabelExists('画面比例'), false, '无 resolutionFields 不渲染画面比例')
+    assert.equal(fieldLabelExists('像素量 / MP'), false, '无 resolutionFields 不渲染像素量')
+    assert.equal(fieldLabelExists('片长 / 秒'), false, '无 videoDuration 不渲染片长')
+    assert.match(query('#rh-create-view').textContent, /分辨率沿用客户端工作流；未声明可覆盖字段/)
+    assert.ok(fieldLabelExists('镜头稳定'), '自定义字段仍随工作流描述渲染')
+  })
+
+  await t.test('只声明宽高能力时显示宽高并正确提交 width/height', async () => {
+    await mountVariant({ dimensions: true })
+    assert.equal(fieldLabelExists('宽度 / px'), true, '宽高能力渲染宽度')
+    assert.equal(fieldLabelExists('高度 / px'), true, '宽高能力渲染高度')
+    assert.equal(fieldLabelExists('画面比例'), false, '不渲染比例')
+    assert.equal(fieldLabelExists('像素量 / MP'), false, '不渲染像素量')
+    await input(query('#rh-prompt'), '仅宽高的构图测试')
+    await input(field('宽度 / px'), '512')
+    await input(field('高度 / px'), '288')
+    const before = submissions.length
+    await click(button('开始生成'))
+    await until(() => submissions.length === before + 1, '宽高提交触达夹具')
+    const input2 = submissions[submissions.length - 1].input
+    assert.deepEqual(input2.resolution, { width: 512, height: 288 }, '仅提交 width/height')
+    assert.equal(input2.duration_seconds, undefined, '未声明时长能力时不含 duration_seconds')
+    assert.equal(input2.apply_defaults, true)
+  })
+
+  await t.test('随机种子默认留空，不固化进提交', async () => {
+    await mountVariant()
+    await input(query('#rh-prompt'), '随机种子测试')
+    const before = submissions.length
+    await click(button('开始生成'))
+    await until(() => submissions.length === before + 1, '提交触达夹具')
+    const body = submissions[submissions.length - 1].input
+    assert.equal(body.custom, undefined, '未改动的随机种子不进入 custom')
+    assert.deepEqual(body, { model: 'h3参考', prompt: '随机种子测试', apply_defaults: true })
+  })
+
+  await t.test('默认未改值提交中省略，仅保留 apply_defaults:true', async () => {
+    await mountVariant()
+    await input(query('#rh-prompt'), '仅默认值的极简提交')
+    const before = submissions.length
+    await click(button('开始生成'))
+    await until(() => submissions.length === before + 1, '提交触达夹具')
+    assert.deepEqual(submissions[submissions.length - 1].input,
+      { model: 'h3参考', prompt: '仅默认值的极简提交', apply_defaults: true },
+      '分辨率/时长/自定义/素材未改动时全部省略')
+  })
+
+  await t.test('客户端更改 defaults/custom/notes/pools/slots 后同步：保留用户编辑且字段即时生效', async () => {
+    await mountVariant()
+    await input(query('#rh-prompt'), '同步前已写好的提示词')
+    await input(field('参考强度'), '7')
+    await upload('参考图片', imageFile())
+    await input(field('素材备注', query('.rh-slot')), '主角参考图')
+    assert.equal(field('镜头稳定').checked, true, '未改动项的默认值为 true')
+    state.describeAlter = base => {
+      base.customFields = base.customFields.filter(item => item.key !== 'quality')
+      base.customFields.push({ key: 'extra', label: '新参数', type: 'text' })
+      base.defaults.custom.stabilize = false
+    }
+    const before = submissions.length
+    await click(button('同步客户端'))
+    await until(() => fieldLabelExists('新参数'), '新增字段即时出现')
+    assert.equal(submissions.length, before, '同步本身不提交任何请求')
+    assert.equal(query('#rh-prompt').value, '同步前已写好的提示词', '用户提示词保留')
+    assert.equal(field('参考强度').value, '7', '用户自定义覆盖保留')
+    assert.ok(query('img[alt="已选参考图片"]'), '用户上传文件保留')
+    assert.equal(fieldLabelExists('质量档位'), false, '被移除字段即时消失')
+    assert.equal(field('镜头稳定').checked, false, '未改动项跟随新的工作流默认值更新')
+    await click(button('开始生成'))
+    await until(() => submissions.length === before + 1, '同步后提交触达夹具')
+    const body = submissions[submissions.length - 1].input
+    assert.deepEqual(body.custom, { strength: 7 }, '仅提交改动字段，不携带已移除 / 默认项')
+    assert.equal(body.resolution, undefined, '未改动分辨率不提交')
+    assert.equal(body.references[0].name, 'fixture.png', '文件名保留')
+    assert.equal(body.references[0].note, '主角参考图', '素材备注以 note 字段提交')
+    assert.equal(body.apply_defaults, true)
+  })
+
+  await t.test('同步期间不锁定现有表单，客户端备注与随机池实时更新', async () => {
+    await mountVariant()
+    await input(query('#rh-prompt'), '同步期间继续编辑')
+    state.describeGate = Promise.withResolvers()
+    state.describeAlter = base => {
+      base.revision = 'updated-assets'
+      base.defaults.references[0].note = '客户端更新的人物备注'
+      base.defaults.referencePools = [{ nodeId: 'image-ref', galleryIds: ['a', 'b'], note: '客户端随机池备注' }]
+      base.referenceSlots.push({ nodeId: 'new-slot', kind: 'image', label: '新增参考槽' })
+    }
+    await click(button('同步客户端'))
+    assert.equal(field('参考强度').disabled, false, '后台同步不能打断现有表单编辑')
+    await input(field('参考强度'), '6')
+    await releaseDescribe()
+    await until(() => container.querySelector('input[aria-label="上传新增参考槽"]'), '客户端新增槽位')
+    assert.match(query('.rh-slots').textContent, /客户端随机图库池 · 2 张/)
+    assert.equal(field('素材备注', query('.rh-slot')).value, '客户端随机池备注')
+    assert.equal(field('参考强度').value, '6')
+    assert.match(query('img[alt="客户端默认参考图片"]').getAttribute('src'), /updated-assets/)
+  })
+
+  await t.test('LoRA 动态候选与推荐强度同源，恢复默认一并清除强度覆盖', async () => {
+    await mountVariant({ alter: base => {
+      base.customFields.push({ key: 'lora', label: '姿势 LoRA', type: 'string', aiLora: true, strengthKey: 'strength',
+        aiLoraOptions: [{ value: 'pose.safetensors', label: '客户端姿势', strength: 0.8 }] })
+      base.customFields.find(item => item.key === 'strength').min = 0
+    } })
+    await input(field('姿势 LoRA'), 'pose.safetensors')
+    assert.equal(field('参考强度').value, '0.8')
+    await input(field('姿势 LoRA'), '')
+    assert.equal(field('参考强度').value, '2', '回到客户端强度默认值')
+    await input(query('#rh-prompt'), '清除 LoRA 覆盖')
+    const before = submissions.length
+    await click(button('开始生成'))
+    await until(() => submissions.length === before + 1, '仅默认参数提交')
+    assert.equal(submissions.at(-1).input.custom, undefined, '不残留孤儿强度参数')
   })
 })

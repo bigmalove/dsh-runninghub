@@ -5,7 +5,6 @@ window.__ModuleLoader__.load({
     const h = React.createElement
     const { useEffect, useRef, useState } = React
     const API = '/api/dsh-runninghub'
-    const DEFAULT_MODEL = 'h3参考'
     const DEFAULT_BASE = 'http://127.0.0.1:6888'
     const MB = 1024 * 1024
     // 仅在内存中保留未确认请求；面板重新挂载时也不生成新的请求 ID。
@@ -113,7 +112,7 @@ window.__ModuleLoader__.load({
     }
 
     function button(label, onClick, disabled, key, variant = '', symbol) {
-      return h('button', { key, type: 'button', className: 'rh-btn' + (variant ? ' rh-btn-' + variant : ''), onClick, disabled },
+      return h('button', { key: key ?? undefined, type: 'button', className: 'rh-btn' + (variant ? ' rh-btn-' + variant : ''), onClick, disabled },
         symbol ? icon(symbol) : null, label)
     }
     function field(label, control, key) {
@@ -139,6 +138,17 @@ window.__ModuleLoader__.load({
       return url ? h('img', { src: url, alt: '已选参考图片', className: 'rh-reference-image' }) : null
     }
 
+    function SavedReference({ model, asset, revision }) {
+      const [failed, setFailed] = useState(false)
+      useEffect(() => setFailed(false), [model, asset.nodeId, revision])
+      const src = API + '/reference?model=' + encodeURIComponent(model) + '&nodeId=' + encodeURIComponent(asset.nodeId) + '&v=' + encodeURIComponent(revision || '')
+      if (failed) return note('默认素材预览读取失败；生成仍由客户端读取原素材。')
+      if (asset.kind === 'audio' || asset.mimeType?.startsWith('audio/')) return h('audio', {
+        src, controls: true, preload: 'none', style: { width: '100%' }, 'aria-label': '客户端默认音频', onError: () => setFailed(true),
+      })
+      return h('img', { src, alt: '客户端默认参考图片', loading: 'lazy', style: { width: '100%', height: 112, objectFit: 'contain', borderRadius: 8 }, onError: () => setFailed(true) })
+    }
+
     function Panel({ gameId, visible }) {
       const contextKey = gameId == null ? '__unbound__' : String(gameId)
       const [view, setView] = useState('create')
@@ -161,7 +171,9 @@ window.__ModuleLoader__.load({
       const [refreshVersion, setRefreshVersion] = useState(0)
       const [refreshBusy, setRefreshBusy] = useState(false)
       const [refreshError, setRefreshError] = useState('')
-      const [model, setModel] = useState(DEFAULT_MODEL)
+      const [model, setModel] = useState('')
+      const manualModel = useRef(false)
+      const [draftContext, setDraftContext] = useState('')
       const [workflow, setWorkflow] = useState(null)
       const [workflowBusy, setWorkflowBusy] = useState(false)
       const [workflowError, setWorkflowError] = useState('')
@@ -170,6 +182,8 @@ window.__ModuleLoader__.load({
       const [duration, setDuration] = useState('')
       const [ratio, setRatio] = useState('')
       const [megapixels, setMegapixels] = useState('')
+      const [width, setWidth] = useState('')
+      const [height, setHeight] = useState('')
       const [custom, setCustom] = useState({})
       const [references, setReferences] = useState({})
       const [referenceErrors, setReferenceErrors] = useState({})
@@ -262,7 +276,7 @@ window.__ModuleLoader__.load({
             }
             setSummary({ configured: data.configured, baseURL: data.baseURL,
               autoInsert: data.autoInsert === true, adapter: data.adapter, model: data.model, jobs: data.jobs, workflows: data.workflows,
-              gatewayError: data.gatewayError || '' })
+              gatewayError: data.gatewayError || '', settingsError: data.settingsError || '' })
             if (!baseInitialized.current) {
               if (!baseDirty.current) setBaseURL(data.baseURL || DEFAULT_BASE)
               baseInitialized.current = true
@@ -285,19 +299,39 @@ window.__ModuleLoader__.load({
         }
       }, [visible, refreshVersion])
 
+      const workflowListVersion = JSON.stringify((summary?.workflows || []).map(item => [item.alias, item.revision || item]))
+      const syncContext = model + ':' + configVersion
       useEffect(() => {
-        if (!summary?.configured || visible === false) return
+        if (!summary?.configured || lockedForSync()) return
+        const available = (summary.workflows || []).filter(item => !item.broken)
+        const preferred = available.some(item => item.alias === summary.model) ? summary.model : available[0]?.alias || ''
+        if (!available.some(item => item.alias === model) || !manualModel.current && model !== preferred) {
+          manualModel.current = false
+          setModel(preferred)
+        }
+      }, [workflowListVersion, summary?.model, summary?.configured, configBusy, submitBusy, pending])
+      function lockedForSync() { return configBusy || submitBusy || Boolean(pendingRef.current) }
+      useEffect(() => {
+        if (draftContext === syncContext) return
+        setDraftContext(syncContext)
+        setCustom({}); setReferences({}); setReferenceErrors({})
+        setDuration(''); setRatio(''); setMegapixels(''); setWidth(''); setHeight('')
+        setSubmitError(''); setSubmitNotice('')
+      }, [syncContext])
+      useEffect(() => {
+        if (!summary?.configured || !model || visible === false) return
         let active = true
         const current = controller()
-        setWorkflow(null)
-        setWorkflowBusy(true)
+        // Background synchronization must not interrupt typing or disable uploads.
+        if (workflow?.syncContext !== syncContext) setWorkflowBusy(true)
         setWorkflowError('')
         request({ action: 'describe', model }, current.signal).then(data => {
           if (!active || !alive.current) return
-          if (!data || !Array.isArray(data.customFields) || !Array.isArray(data.referenceSlots)) {
+          if (!data || data.alias !== model || !Array.isArray(data.customFields) || !Array.isArray(data.referenceSlots)) {
             throw new Error('工作流描述格式无效：缺少 customFields 或 referenceSlots')
           }
-          setWorkflow(data)
+          if (data.broken) throw new Error(data.brokenReason || '客户端工作流已损坏')
+          setWorkflow({ ...data, syncContext })
         }).catch(error => {
           if (active && alive.current && error.name !== 'AbortError') setWorkflowError(message(error))
         }).finally(() => {
@@ -305,7 +339,7 @@ window.__ModuleLoader__.load({
           if (active && alive.current) setWorkflowBusy(false)
         })
         return () => { active = false; current.abort(); controllers.current.delete(current) }
-      }, [model, summary?.configured, configVersion, visible])
+      }, [model, summary?.workflows, summary?.configured, configVersion, visible, refreshVersion])
 
       async function saveConfig() {
         if (configLock.current || submitLock.current || pendingRef.current) return
@@ -357,6 +391,7 @@ window.__ModuleLoader__.load({
       }
 
       function selectModel(value) {
+        manualModel.current = true
         setModel(value)
         setWorkflow(null)
         setCustom({})
@@ -365,6 +400,7 @@ window.__ModuleLoader__.load({
         setDuration('')
         setRatio('')
         setMegapixels('')
+        setWidth(''); setHeight('')
         setSubmitError('')
         setSubmitNotice('')
       }
@@ -387,7 +423,8 @@ window.__ModuleLoader__.load({
       }
 
       async function makeInput(signal) {
-        if (!workflow) throw new Error('请先加载工作流描述。')
+        if (!workflow || workflow.syncContext !== syncContext || draftContext !== syncContext || workflowError || workflowBusy) throw new Error('请先同步当前工作流描述。')
+        if (workflow.pipeline && Object.values(references).some(entry => entry.file || entry.note)) throw new Error('管线素材请在本地客户端修改，插件同步沿用。')
         if (!prompt.trim()) throw new Error('请先写下提示词。')
         const input = { model, prompt, apply_defaults: applyDefaults }
         function positive(value, label) {
@@ -395,10 +432,15 @@ window.__ModuleLoader__.load({
           if (!Number.isFinite(number) || number <= 0) throw new Error(label + '必须是大于 0 的数字。')
           return number
         }
-        if (duration.trim()) input.duration_seconds = positive(duration, '时长')
+        if (durationSupported && duration.trim()) input.duration_seconds = positive(duration, '时长')
         const resolution = {}
-        if (ratio.trim()) resolution.aspect_ratio = ratio.trim()
-        if (megapixels.trim()) resolution.megapixels = positive(megapixels, '百万像素')
+        if (resolutionFields.has('aspect_ratio') && ratio.trim()) resolution.aspect_ratio = ratio.trim()
+        if (resolutionFields.has('megapixels') && megapixels.trim()) resolution.megapixels = positive(megapixels, '百万像素')
+        if (dimensionsSupported && !resolutionFields.has('aspect_ratio') && (width.trim() || height.trim())) {
+          resolution.width = positive(width, '宽度')
+          resolution.height = positive(height, '高度')
+          if (!Number.isInteger(resolution.width) || !Number.isInteger(resolution.height)) throw new Error('宽高必须是整数。')
+        }
         if (Object.keys(resolution).length) input.resolution = resolution
         const values = {}
         for (const definition of workflow.customFields) {
@@ -422,21 +464,27 @@ window.__ModuleLoader__.load({
         }
         if (Object.keys(values).length) input.custom = values
         const selected = workflow.referenceSlots.filter(slot => references[slot.nodeId]?.file)
+        const notes = workflow.referenceSlots.filter(slot => !references[slot.nodeId]?.file && own(references[slot.nodeId], 'note'))
         for (const slot of selected) {
           if (slot.bypassed && !references[slot.nodeId].enable) {
             throw new Error((slot.label || slot.nodeId) + '处于旁路状态，请显式勾选启用后再提交。')
           }
         }
-        if (Object.values(referenceErrors).some(Boolean)) throw new Error('请先修正参考素材错误。')
+        if (workflow.referenceSlots.some(slot => referenceErrors[slot.nodeId])) throw new Error('请先修正参考素材错误。')
         const total = selected.reduce((sum, slot) => sum + references[slot.nodeId].file.size, 0)
         if (total > 25 * MB) throw new Error('参考文件总大小不能超过 25MB。')
         const files = []
         for (const slot of selected) {
           const entry = references[slot.nodeId]
           if (entry.file.size > 10 * MB) throw new Error('单个文件不能超过 10MB。')
-          files.push({ nodeId: slot.nodeId, name: entry.note?.trim() || entry.file.name,
+          files.push({ nodeId: slot.nodeId, name: entry.file.name,
             mimeType: entry.file.type, data: await readBase64(entry.file, signal),
+            ...(own(entry, 'note') ? { note: entry.note.trim() } : {}),
             ...(slot.bypassed ? { enable: true } : {}) })
+        }
+        for (const slot of notes) {
+          if (!applyDefaults || slot.bypassed) continue
+          files.push({ nodeId: slot.nodeId, note: references[slot.nodeId].note.trim() })
         }
         if (files.length) input.references = files
         return input
@@ -514,28 +562,45 @@ window.__ModuleLoader__.load({
       }
 
       const locked = configBusy || submitBusy || Boolean(pending)
-      const formDisabled = locked || workflowBusy || !workflow
-      const aliases = Array.from(new Set([DEFAULT_MODEL, ...(summary?.workflows || []).map(item => item.alias)]))
-        .filter(Boolean)
+      const formDisabled = locked || workflowBusy || !workflow || workflow.syncContext !== syncContext || draftContext !== syncContext || Boolean(workflowError)
+      const aliases = Array.from(new Set((summary?.workflows || []).filter(item => !item.broken).map(item => item.alias))).filter(Boolean)
+      const resolutionFields = new Set(workflow?.capabilities?.resolutionFields || Object.keys(workflow?.capabilities?.resolutionSchema?.properties || {}))
+      const dimensionsSupported = resolutionFields.has('width') && resolutionFields.has('height')
+      const durationSupported = Boolean(workflow?.videoDuration || workflow?.capabilities?.durationSchema)
+      const effectiveResolution = {
+        ...(workflow?.pipeline?.kind === 'first-frame' ? workflow.pipeline.imageResolution : workflow?.pipeline?.gridResolution),
+        ...(applyDefaults ? workflow?.defaults?.resolution : {}),
+      }
+      const referenceGroups = workflow?.pipeline ? workflow.referenceGroups || [] : []
       function renderCustom(definition) {
         const changed = own(custom, definition.key)
-        const defaultValue = own(workflow.defaults?.custom, definition.key)
-          ? workflow.defaults.custom[definition.key] : definition.defaultValue
+        const defaultValue = applyDefaults && own(workflow.defaults?.custom, definition.key)
+          ? workflow.defaults.custom[definition.key] : definition.randomize ? '' : definition.defaultValue
         const value = changed ? custom[definition.key] : defaultValue ?? ''
-        const change = next => setCustom(previous => ({ ...previous, [definition.key]: next }))
+        const change = next => setCustom(previous => {
+          const values = { ...previous }
+          if (next === '') {
+            delete values[definition.key]
+            if (definition.aiLora && definition.strengthKey) delete values[definition.strengthKey]
+          } else values[definition.key] = next
+          const option = definition.aiLoraOptions?.find(item => String(item.value) === String(next))
+          if (option?.strength != null && definition.strengthKey) values[definition.strengthKey] = option.strength
+          return values
+        })
         const props = { className: 'rh-input', disabled: formDisabled }
         let control
         if (definition.type === 'boolean') {
           control = h('input', { type: 'checkbox', checked: value === true || value === 'true',
             disabled: formDisabled, onChange: event => change(event.target.checked) })
-        } else if (definition.type === 'select') {
-          const options = (definition.options || []).map(option =>
+        } else if (definition.aiLora || definition.type === 'select') {
+          const options = (definition.aiLora ? definition.aiLoraOptions || [] : definition.options || []).map(option =>
             typeof option === 'object' && option !== null ? option : { value: option, label: String(option) })
           control = h('select', { ...props, value: String(value), onChange: event => {
             const option = options.find(item => String(item.value) === event.target.value)
             change(option ? option.value : event.target.value)
           } }, !options.some(option => String(option.value) === String(value))
-            ? h('option', { value: String(value) }, value === '' ? '使用默认值' : String(value)) : null,
+            ? h('option', { key: 'current', value: String(value) }, value === '' ? '使用默认值' : String(value)) : null,
+          value !== '' ? h('option', { key: 'default', value: '' }, '使用客户端默认') : null,
           options.map((option, index) => h('option', { key: index, value: String(option.value) },
             option.label ?? String(option.value))))
         } else if (definition.type === 'text') {
@@ -550,31 +615,38 @@ window.__ModuleLoader__.load({
         return h('div', { key: definition.key, className: 'rh-stack', style: { gap: 5 } },
           field(definition.label || definition.key, control),
           definition.randomize ? note('留空使用随机种子') : null,
-          changed ? button('恢复默认', () => setCustom(previous => {
-            const next = { ...previous }; delete next[definition.key]; return next
-          }), formDisabled, null, 'link') : null)
+          changed ? button('恢复默认', () => change(''), formDisabled, null, 'link') : null)
       }
-      function renderReference(slot) {
-        const entry = references[slot.nodeId] || {}
-        const supported = slot.kind === 'image' || slot.kind === 'audio'
+      function renderReference(slot, group) {
+        const readonly = Boolean(group)
+        const source = group || workflow
+        const entry = readonly ? {} : references[slot.nodeId] || {}
+        const supported = !readonly && (slot.kind === 'image' || slot.kind === 'audio')
         const label = slot.label || slot.nodeId
-        const defaults = (workflow?.defaults?.references || []).find(item => String(item.nodeId) === String(slot.nodeId))
+        const defaults = (source?.defaults?.references || []).find(item => String(item.nodeId) === String(slot.nodeId))
+        const pool = (source?.defaults?.referencePools || []).find(item => String(item.nodeId) === String(slot.nodeId))
+        const usesDefaults = applyDefaults || readonly
+        const automatic = readonly && workflow.pipeline?.kind === 'first-frame' && group.title === '视频' && /first_frame/i.test(slot.role || '')
         return h('div', { key: slot.nodeId, className: 'rh-slot' },
           h('div', { className: 'rh-slot-head' }, h('span', { className: 'rh-slot-title' }, label),
-            h('span', { className: 'rh-slot-tag' }, slot.kind === 'audio' ? 'AUDIO' : 'IMAGE')),
+            h('span', { className: 'rh-slot-tag' }, slot.tag || (slot.kind === 'audio' ? 'AUDIO' : 'IMAGE'))),
+          !entry.file && defaults && usesDefaults && !automatic ? h(SavedReference, { model: source.alias, asset: defaults, revision: source.revision || defaults.updatedAt }) : null,
+          automatic ? note('由生图阶段自动填充') : null,
+          !entry.file && pool && usesDefaults && !automatic ? note('客户端随机图库池 · ' + pool.galleryIds.length + ' 张，生成时随机抽取') : null,
           supported ? h('label', { className: 'rh-upload', 'data-selected': Boolean(entry.file) },
             entry.file?.type.startsWith('image/') ? h(ReferencePreview, { file: entry.file }) : icon(entry.file ? 'audio' : 'upload', 22),
             !entry.file?.type.startsWith('image/') ? h('strong', null, entry.file ? entry.file.name : '点击上传' + (slot.kind === 'audio' ? '音频' : '图片')) : null,
             !entry.file ? h('small', null, '单个文件不超过 10MB') : null,
             h('input', { key: model + ':' + slot.nodeId + ':' + (entry.file?.name || ''), type: 'file', accept: slot.kind + '/*',
-              'aria-label': '上传' + label, disabled: formDisabled, onChange: event => chooseFile(slot, event) })) : note('暂不支持此素材类型'),
+              'aria-label': '上传' + label, disabled: formDisabled, onChange: event => chooseFile(slot, event) })) : readonly ? note('与客户端共用素材 · 在客户端修改') : note('暂不支持此素材类型'),
           entry.file ? h('div', { className: 'rh-filename' }, h('span', null, (entry.file.size / MB).toFixed(2) + ' MB'),
             h('button', { type: 'button', className: 'rh-remove', disabled: formDisabled,
               onClick: () => { updateReference(slot.nodeId, { file: null }); setReferenceErrors(previous => ({ ...previous, [slot.nodeId]: '' })) } }, '移除素材')) :
-            note(defaults ? '默认 · ' + (defaults.name || '工作流素材') : '未上传时保留工作流素材'),
-          field('素材备注', h('input', { type: 'text', className: 'rh-input', value: entry.note || '', placeholder: '可选，仅作为素材名称',
-            disabled: formDisabled, onChange: event => updateReference(slot.nodeId, { note: event.target.value }) })),
-          slot.bypassed ? checkbox('启用此旁路节点', Boolean(entry.enable), enable => updateReference(slot.nodeId, { enable }), formDisabled) : null,
+            note(defaults && usesDefaults ? '默认 · ' + (defaults.name || '工作流素材') : !usesDefaults ? '已停用客户端保存的默认素材' : '未上传时保留工作流素材'),
+          field('素材备注', h('input', { type: 'text', className: 'rh-input', maxLength: 200,
+            value: own(entry, 'note') ? entry.note : usesDefaults ? pool?.note || defaults?.note || '' : '', placeholder: '可选：人物身份、声音或用途',
+            disabled: formDisabled || readonly, onChange: event => updateReference(slot.nodeId, { note: event.target.value }) })),
+          !readonly && slot.bypassed ? checkbox('启用此旁路节点', Boolean(entry.enable), enable => updateReference(slot.nodeId, { enable }), formDisabled) : null,
           alert(referenceErrors[slot.nodeId]))
       }
       function renderAttachment(item, index) {
@@ -643,7 +715,7 @@ window.__ModuleLoader__.load({
               h('button', { type: 'button', role: 'tab', id: 'rh-history-tab', 'aria-controls': 'rh-history-view',
                 'aria-selected': view === 'history', className: 'rh-tab', onClick: () => setView('history') }, icon('grid', 14), '任务历史', h('span', { className: 'rh-count' }, jobs.length))),
             h('div', { className: 'rh-context' }, icon('link', 12), gameId ? '已关联当前对话' : '独立创作')),
-          alert(refreshError), alert(summary?.gatewayError),
+          alert(refreshError), alert(summary?.gatewayError), alert(summary?.settingsError ? '客户端默认模型读取失败：' + summary.settingsError : ''),
           summary && !summary.configured ? h('div', { className: 'rh-notice' }, '连接本地网关后，即可读取工作流并开始创作。 ',
             button('配置连接', () => setSettingsOpen(true), false, null, 'link')) : null,
           h('div', { id: 'rh-create-view', role: 'tabpanel', 'aria-labelledby': 'rh-create-tab', hidden: view !== 'create' },
@@ -652,10 +724,15 @@ window.__ModuleLoader__.load({
                 h('h2', null, '把故事，变成镜头'),
                 h('p', { className: 'rh-lead' }, '选择工作流、写下画面。生成在后台继续，你可以留在故事里。'),
                 h('label', { className: 'rh-workflow' }, h('span', { className: 'rh-workflow-label' }, '工作流'),
-                  h('select', { className: 'rh-input', 'aria-label': '工作流', value: model, disabled: locked,
-                    onChange: event => selectModel(event.target.value) }, aliases.map(alias => h('option', { key: alias, value: alias }, alias))),
-                  h('span', { className: 'rh-workflow-hint' }, workflowBusy ? '读取参数中…' : workflow ? '参数已同步' : '等待连接')),
-                alert(workflowError), workflowError ? button('重新读取工作流', () => setConfigVersion(value => value + 1), locked, null, 'link') : null),
+                  h('select', { className: 'rh-input', 'aria-label': '工作流', value: model, disabled: locked || !aliases.length,
+                    onChange: event => selectModel(event.target.value) }, !aliases.length ? h('option', { value: '' }, '等待客户端工作流') : null,
+                    aliases.map(alias => h('option', { key: alias, value: alias }, alias))),
+                  h('span', { className: 'rh-workflow-hint' }, workflowBusy ? '读取参数中…' : workflow ? '已与客户端同步' : '等待连接')),
+                h('div', { className: 'rh-row', style: { marginTop: 10 } },
+                  button('同步客户端', () => setRefreshVersion(value => value + 1), locked || refreshBusy || workflowBusy, null, 'link', 'refresh'),
+                  manualModel.current ? button('跟随客户端工作流', () => { manualModel.current = false; selectModel(summary?.model || aliases[0] || ''); manualModel.current = false }, locked, null, 'link') : note('默认工作流跟随客户端')),
+                alert(workflowError), workflowError ? button('重新读取工作流', () => setRefreshVersion(value => value + 1), locked, null, 'link') : null,
+                ...(workflow?.syncErrors || []).map((error, index) => alert(error, index))),
               h('div', { className: 'rh-composer' },
                 h('div', { className: 'rh-prompt-pane' },
                   h('div', { className: 'rh-section-label' }, h('label', { htmlFor: 'rh-prompt' }, '提示词'),
@@ -670,15 +747,19 @@ window.__ModuleLoader__.load({
                 h('aside', { className: 'rh-side', 'aria-label': '生成参数' },
                   h('div', { className: 'rh-stack' },
                     h('div', { className: 'rh-section-label', style: { marginBottom: 0 } }, '生成参数',
-                      button('重置', () => { setDuration(''); setRatio(''); setMegapixels(''); setCustom({}); setApplyDefaults(true) }, formDisabled, null, 'link')),
-                    field('画面比例', h('input', { className: 'rh-input', list: 'rh-ratio-options', value: ratio,
-                      placeholder: '默认 · 可输入自定义比例', disabled: formDisabled, onChange: event => setRatio(event.target.value) })),
-                    h('datalist', { id: 'rh-ratio-options' }, ['auto', '16:9', '9:16', '1:1', '4:3', '3:4', '21:9'].map(value => h('option', { key: value, value }))),
-                    h('div', { className: 'rh-grid2' },
-                      field('片长 / 秒', h('input', { className: 'rh-input', type: 'number', min: 0.1, step: 'any', value: duration,
-                        placeholder: durationDefault != null ? String(durationDefault) : '默认', disabled: formDisabled, onChange: event => setDuration(event.target.value) })),
-                      field('像素量 / MP', h('input', { className: 'rh-input', type: 'number', min: 0.1, step: 'any', value: megapixels,
-                        placeholder: String(workflow?.defaults?.resolution?.megapixels ?? '默认'), disabled: formDisabled, onChange: event => setMegapixels(event.target.value) }))),
+                      button('重置', () => { setDuration(''); setRatio(''); setMegapixels(''); setWidth(''); setHeight(''); setCustom({}); setApplyDefaults(true) }, formDisabled, null, 'link')),
+                    resolutionFields.has('aspect_ratio') ? field('画面比例', h('input', { className: 'rh-input', value: ratio,
+                      placeholder: String(effectiveResolution.aspect_ratio || workflow?.videoAspect?.ratio || '客户端默认'), disabled: formDisabled, onChange: event => setRatio(event.target.value) })) : null,
+                    durationSupported ? field('片长 / 秒', h('input', { className: 'rh-input', type: 'number', min: 0.5, max: 120, step: 'any', value: duration,
+                      placeholder: durationDefault != null ? String(durationDefault) : '默认', disabled: formDisabled, onChange: event => setDuration(event.target.value) })) : null,
+                    resolutionFields.has('megapixels') ? field('像素量 / MP', h('input', { className: 'rh-input', type: 'number', min: 0.1, max: 16, step: 'any', value: megapixels,
+                      placeholder: String(effectiveResolution.megapixels ?? '默认'), disabled: formDisabled, onChange: event => setMegapixels(event.target.value) })) : null,
+                    dimensionsSupported && !resolutionFields.has('aspect_ratio') ? h('div', { className: 'rh-grid2' },
+                      field('宽度 / px', h('input', { className: 'rh-input', type: 'number', min: 64, max: 8192, step: 1, value: width,
+                        placeholder: String(effectiveResolution.width ?? '默认'), disabled: formDisabled, onChange: event => setWidth(event.target.value) })),
+                      field('高度 / px', h('input', { className: 'rh-input', type: 'number', min: 64, max: 8192, step: 1, value: height,
+                        placeholder: String(effectiveResolution.height ?? '默认'), disabled: formDisabled, onChange: event => setHeight(event.target.value) }))) : null,
+                    !resolutionFields.size ? note('分辨率沿用客户端工作流；未声明可覆盖字段。') : null,
                     checkbox('应用工作流默认值', applyDefaults, setApplyDefaults, locked),
                     checkbox('绑定当前对话轮次', bindToTurn, setBindToTurn, locked),
                     h('details', { className: 'rh-fold' }, h('summary', null, '自定义参数', h('span', { className: 'rh-count' }, workflow?.customFields.length || 0)),
@@ -693,9 +774,11 @@ window.__ModuleLoader__.load({
                 h('div', { className: 'rh-section-label', style: { marginBottom: 0 } }, h('span', null, '参考素材'),
                   h('span', { className: 'rh-note' }, selectedReferences ? '已选择 ' + selectedReferences + ' 份' : '图片 / 音频')),
                 workflowBusy ? h('div', { className: 'rh-skeleton' }) : null,
-                workflow?.referenceSlots.length ? h('div', { className: 'rh-slots' }, workflow.referenceSlots.map(renderReference)) :
+                workflow?.pipeline ? referenceGroups.map(group => h('section', { key: group.alias + group.title, style: { marginTop: 14 } },
+                  h('h3', null, group.title + ' · ' + group.alias), h('div', { className: 'rh-slots' }, group.referenceSlots.map(slot => renderReference(slot, group))))) :
+                workflow?.referenceSlots.length ? h('div', { className: 'rh-slots' }, workflow.referenceSlots.map(slot => renderReference(slot))) :
                   h('div', { style: { paddingTop: 13 } }, note(workflow ? '此工作流无需上传参考素材。' : '连接工作流后显示参考素材槽位。')),
-                h('div', { style: { marginTop: 12 } }, note('单个文件 ≤ 10MB，总计及编码后请求 ≤ 25MB。未上传时保留原素材。')))),
+                h('div', { style: { marginTop: 12 } }, note('槽位、默认素材、备注和随机池均读取客户端；每 5 秒同步。本次上传仅覆盖本次生成，不改客户端默认。单文件 ≤ 10MB，请求 ≤ 25MB。')))),
             h('div', { className: 'rh-submitbar' },
               h('div', null, h('div', { className: 'rh-submit-summary' }, model + ' · ' + (ratio || '默认画幅') + (duration || durationDefault ? ' · ' + (duration || durationDefault) + 's' : '')),
                 h('div', { className: 'rh-submit-sub' }, activeCount ? activeCount + ' 个任务在后台运行' : '参数确认后提交，按实际工作流计费')),

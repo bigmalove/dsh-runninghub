@@ -10,7 +10,7 @@ import { join } from 'node:path'
 import { createServer } from 'node:http'
 import { test, describe, afterEach } from 'node:test'
 
-import { createRunningHubHost, apply, API, MEDIA } from '../index.mjs'
+import { createRunningHubHost, apply, API, MEDIA, REFERENCE } from '../index.mjs'
 
 const BASE = 'http://127.0.0.1:6888'
 const NEW_BASE = 'http://127.0.0.1:6889'
@@ -63,7 +63,18 @@ function resBody(res) {
 }
 
 // ---- gateway fetch stub implementing the local gateway protocol ----
-function makeGatewayFetch({ kind = 'image', taskStatus = 'succeeded', workflows = null, onGenerations } = {}) {
+function makeGatewayFetch({
+  kind = 'image',
+  taskStatus = 'succeeded',
+  workflows = null,
+  onGenerations,
+  settings,
+  nodes,
+  loraLibrary,
+  referenceBytes,
+  referenceType,
+  referenceStatus = 200,
+} = {}) {
   const ext = kind === 'video' ? 'mp4' : 'png'
   const fileBytes = kind === 'video' ? MP4_BYTES : PNG_BYTES
   const fileType = kind === 'video' ? 'video/mp4' : 'image/png'
@@ -74,6 +85,19 @@ function makeGatewayFetch({ kind = 'image', taskStatus = 'succeeded', workflows 
     const u = new URL(url)
     if (u.pathname === '/api/workflows') {
       return new Response(JSON.stringify(list), { status: 200, headers: { 'content-type': 'application/json' } })
+    }
+    if (u.pathname === '/api/settings') {
+      return new Response(JSON.stringify(settings ?? { defaultModel: 'demo' }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }
+    if (/^\/api\/workflows\/[^/]+\/nodes$/.test(u.pathname)) {
+      return new Response(JSON.stringify(nodes ?? []), { status: 200, headers: { 'content-type': 'application/json' } })
+    }
+    if (u.pathname === '/api/lora-library') {
+      return new Response(JSON.stringify(loraLibrary ?? { loras: [], maxConcurrent: 1, enabled: true }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }
+    if (/^\/api\/workflows\/[^/]+\/defaults\/references\/[^/]+$/.test(u.pathname)) {
+      const bytes = referenceBytes ?? fileBytes
+      return new Response(bytes, { status: referenceStatus, headers: { 'content-type': referenceType ?? fileType } })
     }
     if (u.pathname === '/v1/images/generations' && (opts.method ?? 'GET') === 'POST') {
       generations += 1
@@ -126,7 +150,7 @@ function makeAttachments(calls) {
 let tmpRoot = tmpdir()
 const liveHosts = []
 
-async function makeHost({ baseURL = BASE, configured = true, gateway = null, tavernImpl = null, pollMs = 5 } = {}) {
+async function makeHost({ baseURL = BASE, configured = true, gateway = null, tavernImpl = null, clientFactory = null, pollMs = 5 } = {}) {
   const dataDirectory = await mkdtemp(join(tmpRoot, 'rh-test-'))
   const calls = { saveImage: [], saveFile: [], getTurnState: [], getTurn: [], credentialsSet: [], effects: [] }
   const credentialStore = new Map()
@@ -147,6 +171,7 @@ async function makeHost({ baseURL = BASE, configured = true, gateway = null, tav
   const ctx = { attachments, credentials, tavern }
   const options = { pollMs }
   if (gateway) options.fetchImpl = gateway.fetchImpl
+  if (clientFactory) options.clientFactory = clientFactory
   const host = await createRunningHubHost(ctx, { dataDirectory, baseURL }, options)
   liveHosts.push({ host, dataDirectory, calls, credentialStore })
   return { host, calls, credentialStore, ctx, dataDirectory }
@@ -560,6 +585,142 @@ describe('media serving via a real temporary HTTP server', () => {
 })
 
 // =====================================================================
+describe('summary: model follows server defaultModel then first usable, settings errors isolated', () => {
+  function wfList(aliases, broken = []) {
+    return aliases.map((alias) => broken.includes(alias)
+      ? { alias, broken: true, brokenReason: 'x', capabilities: {} }
+      : { alias, customFields: [], referenceSlots: [], capabilities: {}, defaults: { references: [], updatedAt: 'u' } })
+  }
+
+  test('model follows settings defaultModel when it matches a usable workflow', async () => {
+    const { host } = await makeHost({ configured: true, gateway: makeGatewayFetch({ workflows: wfList(['img', 'vid']), settings: { defaultModel: 'vid' } }) })
+    const res = fakeRes()
+    await host.route(fakeReq({ method: 'GET', url: API }), res)
+    assert.equal(resBody(res).model, 'vid', 'summary.model 应为服务端默认 vid')
+  })
+
+  test('model falls back to first usable workflow when defaultModel missing or invalid', async () => {
+    const { host } = await makeHost({ configured: true, gateway: makeGatewayFetch({ workflows: wfList(['img', 'vid']), settings: { defaultModel: 'nope' } }) })
+    const res = fakeRes()
+    await host.route(fakeReq({ method: 'GET', url: API }), res)
+    assert.equal(resBody(res).model, 'img', '应回落到第一个可用工作流')
+  })
+
+  test('broken workflow is never selected as model', async () => {
+    const { host } = await makeHost({ configured: true, gateway: makeGatewayFetch({ workflows: wfList(['broken1', 'ok'], ['broken1']), settings: { defaultModel: 'broken1' } }) })
+    const res = fakeRes()
+    await host.route(fakeReq({ method: 'GET', url: API }), res)
+    assert.equal(resBody(res).model, 'ok', 'broken 工作流不得作为 model')
+  })
+
+  test('settings fetch failure surfaces settingsError but keeps workflows', async () => {
+    const gateway = makeGatewayFetch({ workflows: wfList(['ok']) })
+    const orig = gateway.fetchImpl
+    gateway.fetchImpl = async (url, opts) => {
+      if (new URL(url).pathname === '/api/settings') throw new Error('settings unavailable')
+      return orig(url, opts)
+    }
+    const { host } = await makeHost({ configured: true, gateway })
+    const res = fakeRes()
+    await host.route(fakeReq({ method: 'GET', url: API }), res)
+    const body = resBody(res)
+    assert.ok(body.settingsError, 'settings 失败应单独告知')
+    assert.ok(Array.isArray(body.workflows) && body.workflows.length === 1, 'workflows 不得因 settings 失败丢失')
+    assert.equal(body.model, 'ok', 'settings 失败时回落到第一个可用')
+  })
+
+  test('old clientFactory without getSettings degrades to first usable', async () => {
+    const oldClient = { listWorkflows: async () => wfList(['img', 'vid']), describe: async (alias) => wfList(['img', 'vid']).find((w) => w.alias === alias) }
+    const { host } = await makeHost({ configured: true, gateway: makeGatewayFetch({ workflows: wfList(['img', 'vid']) }), clientFactory: () => oldClient })
+    const res = fakeRes()
+    await host.route(fakeReq({ method: 'GET', url: API }), res)
+    assert.equal(resBody(res).model, 'img', '无 getSettings 时应回落到第一个可用')
+  })
+})
+
+// =====================================================================
+describe('reference route: same-origin binary, no key/address leak', () => {
+  function refWorkflows() {
+    return [{
+      alias: 'demo',
+      customFields: [],
+      referenceSlots: [{ nodeId: '9', kind: 'image' }],
+      capabilities: {},
+      defaults: { references: [{ nodeId: '9', kind: 'image', name: 'ref.png', fileName: 'SECRET.png', mimeType: 'image/png', size: 16, note: 'x' }], updatedAt: 'u' },
+    }]
+  }
+  async function serveRef(host) {
+    const server = createServer((req, res) => { host.route(req, res) })
+    await new Promise((r) => server.listen(0, r))
+    const port = server.address().port
+    const base = `http://127.0.0.1:${port}`
+    return { base, server, close: () => new Promise((r) => server.close(r)) }
+  }
+
+  test('GET 返回同源二进制、no-store、nosniff，且不泄露密钥/地址', async () => {
+    const gateway = makeGatewayFetch({ workflows: refWorkflows(), referenceBytes: PNG_BYTES, referenceType: 'image/png' })
+    const { host } = await makeHost({ configured: true, gateway })
+    const srv = await serveRef(host)
+    try {
+      const res = await fetch(`${srv.base}${REFERENCE}?model=demo&nodeId=9`)
+      assert.equal(res.status, 200)
+      assert.equal(res.headers.get('cache-control'), 'no-store')
+      assert.equal(res.headers.get('x-content-type-options'), 'nosniff')
+      assert.equal(res.headers.get('content-type'), 'image/png')
+      const buf = Buffer.from(await res.arrayBuffer())
+      assert.ok(buf.equals(PNG_BYTES), '返回的字节必须等于素材原文件')
+      const text = buf.toString('latin1')
+      assert.ok(!text.includes(DEFAULT_API_KEY), '响应体不得含网关密钥')
+      assert.ok(!text.includes('127.0.0.1:6888'), '响应体不得含网关地址')
+    } finally { await srv.close() }
+  })
+
+  test('HEAD 只回头部不回主体', async () => {
+    const gateway = makeGatewayFetch({ workflows: refWorkflows(), referenceBytes: PNG_BYTES, referenceType: 'image/png' })
+    const { host } = await makeHost({ configured: true, gateway })
+    const srv = await serveRef(host)
+    try {
+      const res = await fetch(`${srv.base}${REFERENCE}?model=demo&nodeId=9`, { method: 'HEAD' })
+      assert.equal(res.status, 200)
+      assert.equal(Number(res.headers.get('content-length')), PNG_BYTES.length)
+      assert.equal((await res.arrayBuffer()).byteLength, 0)
+    } finally { await srv.close() }
+  })
+
+  test('缺少 model/nodeId 返回 400', async () => {
+    const gateway = makeGatewayFetch({ workflows: refWorkflows(), referenceBytes: PNG_BYTES, referenceType: 'image/png' })
+    const { host } = await makeHost({ configured: true, gateway })
+    const srv = await serveRef(host)
+    try {
+      const res = await fetch(`${srv.base}${REFERENCE}?model=demo`)
+      assert.equal(res.status, 400)
+    } finally { await srv.close() }
+  })
+
+  test('网关对素材端点返回 401 时路由返回错误（沿用既有错误处理）', async () => {
+    const gateway = makeGatewayFetch({ workflows: refWorkflows(), referenceStatus: 401 })
+    const { host } = await makeHost({ configured: true, gateway })
+    const srv = await serveRef(host)
+    try {
+      const res = await fetch(`${srv.base}${REFERENCE}?model=demo&nodeId=9`)
+      assert.equal(res.status, 502)
+      const body = await res.json()
+      assert.ok(body.error, '错误应以 JSON 形式回传')
+    } finally { await srv.close() }
+  })
+
+  test('缺槽（nodeId 不在默认素材）返回 400', async () => {
+    const gateway = makeGatewayFetch({ workflows: refWorkflows(), referenceBytes: PNG_BYTES, referenceType: 'image/png' })
+    const { host } = await makeHost({ configured: true, gateway })
+    const srv = await serveRef(host)
+    try {
+      const res = await fetch(`${srv.base}${REFERENCE}?model=demo&nodeId=99`)
+      assert.equal(res.status, 400)
+    } finally { await srv.close() }
+  })
+})
+
+// =====================================================================
 describe('apply: registration and cleanup (apply 不再返回 host)', () => {
   test('apply 注册 2 HTTP 路由、3 callHost handler、3 工具，且不返回 host', async () => {
     const dataDirectory = await mkdtemp(join(tmpRoot, 'rh-test-'))
@@ -581,8 +742,8 @@ describe('apply: registration and cleanup (apply 不再返回 host)', () => {
     const result = await apply(ctx, { dataDirectory, baseURL: BASE })
     assert.equal(result, undefined, 'apply 不再返回 host（交由真实 loader 处理 effect）')
 
-    assert.equal(registered.length, 2, 'two HTTP routes must be registered')
-    assert.deepEqual(registered.map(r => r.path).sort(), [API, MEDIA].sort())
+    assert.equal(registered.length, 3, 'three HTTP routes must be registered (API, MEDIA, REFERENCE)')
+    assert.deepEqual(registered.map(r => r.path).sort(), [API, MEDIA, REFERENCE].sort())
     for (const spec of registered) {
       assert.equal(spec.kind, 'exact')
       assert.equal(typeof spec.handler, 'function', 'route handler 须为函数（即 host.route）')
@@ -591,7 +752,7 @@ describe('apply: registration and cleanup (apply 不再返回 host)', () => {
     assert.deepEqual(Object.keys(handles).sort(), ['dsh-runninghub/describe', 'dsh-runninghub/list'].sort())
     assert.equal(tools.length, 3)
     assert.deepEqual(tools.map(t => t.name).sort(), ['runninghub_describe', 'runninghub_generate', 'runninghub_status'].sort())
-    assert.equal(effects.length, 3, 'dispose + 2 route effects expected')
+    assert.equal(effects.length, 4, 'dispose + 3 route effects expected')
   })
 
   test('callHost handlers delegate to dispatch', async () => {
@@ -627,8 +788,8 @@ describe('apply: registration and cleanup (apply 不再返回 host)', () => {
       inject: (names, fn) => { if (names[0] === 'tools') fn({ tools: { register: (spec) => tools.push(spec) } }) },
     }
     await apply(ctx, { dataDirectory, baseURL: BASE })
-    assert.equal(effects.length, 3, 'dispose + 2 route effects expected')
-    // The dispose effect is registered first; the two route effects return their own disposers.
+    assert.equal(effects.length, 4, 'dispose + 3 route effects expected')
+    // The dispose effect is registered first; the three route effects return their own disposers.
     const disposeFn = effects[0]
     assert.equal(typeof disposeFn, 'function', 'apply must register a dispose effect (no Invalid return)')
     // host 由 apply 内部创建，经由已注册的 tool.execute 验证其已被拆除。

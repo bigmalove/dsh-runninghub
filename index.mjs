@@ -11,6 +11,7 @@ export const name = 'dsh-runninghub'
 export const inject = ['tavern', 'attachments', 'credentials', 'webServer']
 export const API = '/api/dsh-runninghub'
 export const MEDIA = API + '/media'
+export const REFERENCE = API + '/reference'
 const DEFAULT_BASE = 'http://127.0.0.1:6888'
 const ACTIVE = new Set(['preparing', 'submitting', 'submit_unknown', 'queued', 'running', 'downloading'])
 const fail = (message, code = 'VALIDATION_ERROR') => new GatewayError(message, { code, rejected: true })
@@ -176,13 +177,30 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
   }
   async function summary() {
     let configured = Boolean((await ctx.credentials.resolve(credentialName(baseURL)))?.value)
+    let settingsError = ''
+    let model = ''
     if (configured) {
-      try { const active = await connect(); workflows = await active.client.listWorkflows(); workflowError = '' }
+      try {
+        const active = await connect()
+        workflows = await active.client.listWorkflows()
+        workflowError = ''
+        let defaultModel = ''
+        // 模型取服务端默认；获取失败不让工作流列表丢失，单独记录同步错误。
+        try {
+          if (typeof active.client.getSettings === 'function') {
+            const settings = await active.client.getSettings()
+            defaultModel = settings?.defaultModel ?? ''
+          }
+        } catch (error) { settingsError = sanitizeMessage(error.message) }
+        const usable = workflows.filter((w) => !w.broken)
+        if (defaultModel && usable.some((w) => w.alias === defaultModel)) model = defaultModel
+        else if (usable[0]) model = usable[0].alias
+      }
       catch (error) { workflowError = sanitizeMessage(error.message) }
     }
     await reconcile()
-    return { configured, baseURL, autoInsert, adapter: 'gateway', model: 'h3参考', jobs: (await store.list()).map(job => ({ ...job,
-      ...(insertionErrors.has(job.id) ? { insertionError: insertionErrors.get(job.id) } : {}) })), workflows, ...(workflowError ? { gatewayError: workflowError } : {}) }
+    return { configured, baseURL, autoInsert, adapter: 'gateway', model, jobs: (await store.list()).map(job => ({ ...job,
+      ...(insertionErrors.has(job.id) ? { insertionError: insertionErrors.get(job.id) } : {}) })), workflows, ...(workflowError ? { gatewayError: workflowError } : {}), ...(settingsError ? { settingsError } : {}) }
   }
   async function configure(input) {
     keys(input, ['action', 'baseURL', 'apiKey'])
@@ -295,11 +313,37 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
       await pipeline(createReadStream(file, { fd: handle.fd, autoClose: false, start, end }), res)
     } finally { await handle?.close() }
   }
+  async function readReferenceRoute(req, res) {
+    if (!['GET', 'HEAD'].includes(req.method)) throw fail('仅支持 GET 或 HEAD', 'METHOD_NOT_ALLOWED')
+    const query = new URL(req.url, 'http://localhost').searchParams
+    const alias = query.get('model')
+    const nodeId = query.get('nodeId')
+    if (typeof alias !== 'string' || !alias.trim()) throw fail('缺少 model 参数', 'VALIDATION_ERROR')
+    if (typeof nodeId !== 'string' || !nodeId.trim()) throw fail('缺少 nodeId 参数', 'VALIDATION_ERROR')
+    const active = await connect()
+    const controller = new AbortController()
+    const abort = () => controller.abort()
+    res.on?.('close', abort)
+    // 密钥与网关地址只在服务端持有，绝不经由本路由下发到浏览器。
+    let media
+    try { media = await active.client.readReference(alias, nodeId, controller.signal) }
+    finally { res.off?.('close', abort) }
+    const headers = {
+      'content-type': media.mediaType,
+      'content-length': String(media.data.byteLength),
+      'cache-control': 'no-store',
+      'x-content-type-options': 'nosniff',
+    }
+    if (req.method === 'HEAD') { res.writeHead(200, headers); return res.end() }
+    res.writeHead(200, headers)
+    res.end(Buffer.from(media.data))
+  }
   async function route(req, res) {
     try {
       if (!sameOrigin(req)) return json(res, 403, { error: '拒绝跨站请求' })
       const pathname = new URL(req.url, 'http://localhost').pathname
       if (pathname === MEDIA) return await readMedia(req, res)
+      if (pathname === REFERENCE) return await readReferenceRoute(req, res)
       if (pathname !== API) return json(res, 404, { error: '接口不存在' })
       if (req.method === 'GET') return json(res, 200, await dispatch({ action: 'list' }))
       if (req.method !== 'POST') return json(res, 405, { error: '请求方法不支持' })
@@ -324,7 +368,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
 export async function apply(ctx, config = {}) {
   const host = await createRunningHubHost(ctx, config)
   ctx.effect(() => () => host.dispose())
-  for (const route of [API, MEDIA]) ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: route, handler: host.route }))
+  for (const route of [API, MEDIA, REFERENCE]) ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: route, handler: host.route }))
   ctx.tavern.handle('dsh-runninghub/list', () => host.dispatch({ action: 'list' }))
   ctx.tavern.handle('dsh-runninghub/describe', ({ model }) => host.dispatch({ action: 'describe', model }))
   if (ctx.tavern.onTurnSettled) ctx.tavern.onTurnSettled(() => host.reconcile())
