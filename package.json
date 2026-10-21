@@ -10,7 +10,16 @@
     "test:ui": "node --test tests/dsh-runninghub-ui.test.mjs"
   },
   "files": ["index.mjs", "client.js", "lib/"],
-  "description": "RunningHub local gateway studio and asynchronous image/video tasks for DSH Tavern",
+  "description": "RunningHub 本地网关工作室：在 DSH Tavern 里异步提交图片/视频任务，预览参考素材与 LoRA",
+  "license": "AGPL-3.0-only",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bigmalove/dsh-runninghub.git"
+  },
+  "homepage": "https://github.com/bigmalove/dsh-runninghub#readme",
+  "bugs": {
+    "url": "https://github.com/bigmalove/dsh-runninghub/issues"
+  },
   "exports": {
     ".": "./index.mjs",
     "./client": "./client.js"
