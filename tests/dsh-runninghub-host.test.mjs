@@ -131,8 +131,10 @@ function makeGatewayFetch({
       if (portDirectiveRejectModes?.includes(body.mode)) {
         return new Response(JSON.stringify({ error: { message: '模板缺少参考图' } }), { status: 400, headers: { 'content-type': 'application/json' } })
       }
-      if (typeof portDirectiveText !== 'string') return new Response(JSON.stringify({ error: 'not found' }), { status: 404 })
-      return new Response(JSON.stringify({ text: portDirectiveText, mode: body.mode }), { status: 200, headers: { 'content-type': 'application/json' } })
+      if (typeof portDirectiveText !== 'string' && typeof portDirectiveText !== 'function') return new Response(JSON.stringify({ error: 'not found' }), { status: 404 })
+      const text = typeof portDirectiveText === 'function' ? portDirectiveText(body.mode, body) : portDirectiveText
+      if (typeof text !== 'string') return new Response(JSON.stringify({ error: 'not found' }), { status: 404 })
+      return new Response(JSON.stringify({ text, mode: body.mode }), { status: 200, headers: { 'content-type': 'application/json' } })
     }
     if (u.pathname === '/api/lora-library') {
       return new Response(JSON.stringify(loraLibrary ?? { loras: [], maxConcurrent: 1, enabled: true }), { status: 200, headers: { 'content-type': 'application/json' } })
@@ -201,6 +203,9 @@ async function makeHost({ baseURL = BASE, configured = true, gateway = null, tav
   const tavern = tavernImpl ?? {
     getTurnState: async ({ gameId }) => { calls.getTurnState.push(gameId); return { settled: true, busy: false, turn: 5, textVersion: 'v1' } },
     getTurn: async ({ gameId, turn }) => { calls.getTurn.push({ gameId, turn }); return { gameId, turn, textVersion: 'v1' } },
+    captureGeneration: async ({ gameId }) => ({ gameId, generationId: 'g'.repeat(64) }),
+    resolveGeneration: async () => null,
+    onTurnSettled: () => () => {},
     list: async () => [],
     update: async () => {},
     attach: async () => {},
@@ -464,6 +469,28 @@ describe('submit: concurrent requestId submits once; retry does not rebind turn'
     assert.equal(turnStateCalls.length, 1, 'retry must NOT re-run bindingOf (getTurnState)')
     assert.equal(retry.id, first.id)
     assert.equal(retry.binding?.turn, 5, 'returned job must keep the original bound turn')
+  })
+})
+
+// =====================================================================
+describe('jobs: lightweight status feed for the composer dock', () => {
+  test('returns only this game’s jobs and never connects to the gateway', async () => {
+    const gateway = makeGatewayFetch({ taskStatus: 'running' })
+    const { host } = await makeHost({ configured: true, gateway })
+    const bound = await host.dispatch({ action: 'submit', requestId: 'dock-bound', input: { model: 'demo', prompt: 'x' }, bindToTurn: true, gameId: 'game-dock' })
+    await host.dispatch({ action: 'submit', requestId: 'dock-free', input: { model: 'demo', prompt: 'x' }, bindToTurn: false })
+    await waitForJob(host, bound.id, job => Boolean(job.remoteTaskId))
+    const generations = gateway.generations()
+    const result = await host.dispatch({ action: 'jobs', gameId: 'game-dock' })
+    assert.deepEqual(result.jobs.map(job => job.id), [bound.id], 'other games / unbound jobs must not leak into the dock')
+    assert.equal(result.jobs[0].binding?.gameId, 'game-dock')
+    assert.ok(['queued', 'running'].includes(result.jobs[0].status), 'the dock needs a live status while the video is running')
+    assert.equal(gateway.generations(), generations, 'jobs stays local: no gateway call')
+  })
+
+  test('a bad gameId is rejected instead of listing every job', async () => {
+    const { host } = await makeHost({ configured: true, gateway: makeGatewayFetch() })
+    await assert.rejects(host.dispatch({ action: 'jobs', gameId: 42 }), (e) => e.code === 'VALIDATION_ERROR')
   })
 })
 
@@ -735,6 +762,26 @@ describe('workflow selection: panel state drives tools and prompt template', () 
     assert.equal(body.durationSeconds, 5)
   })
 
+  test('reference workflows inject the picture-binding rule and rewrite “只引用用户提到过的素材”', async () => {
+    const refFlow = {
+      alias: 'h3-ref', revision: 'r-ref', defaultEnhanceMode: 'h3-ref2va', videoDuration: { seconds: 7 },
+      customFields: [], capabilities: {},
+      referenceSlots: [{ nodeId: '37', kind: 'image', label: '参考图 1', role: 'ref_images.ref_image_0', tag: '<Picture 1>', bypassed: false }],
+      defaults: { references: [{ nodeId: '37', kind: 'image', name: '人物设定.png', note: '女主身高1米7,外貌、身材' }] },
+    }
+    const directive = '【模板】\n- **只引用用户真的提到过的素材**，不要为了凑格式编出 <Picture 2>。\n模板正文。'
+    const gateway = makeGatewayFetch({ workflows: [refFlow], settings: { defaultModel: 'h3-ref' }, portDirectiveText: directive })
+    const { host } = await makeHost({ configured: true, gateway })
+    await host.dispatch({ action: 'select-model', model: 'h3-ref' })
+    const text = host.promptText()
+    assert.match(text, /【参考素材 · 优先级最高】/)
+    assert.match(text, /<Picture 1>：人物设定\.png，女主身高1米7,外貌、身材/)
+    assert.match(text, /is the woman in <Picture 1>/)
+    assert.match(text, /漏了参考图就不参与生成/)
+    assert.equal(text.includes('只引用用户真的提到过的素材'), false, '这句会被模型读成“没提到就不用写”')
+    assert.match(text, /默认素材清单里的标签要按用途写进提示词/)
+  })
+
   test('a 400 template falls back to the next compatible mode', async () => {
     const qwenPipe = {
       alias: 'qwen-pipe-empty', revision: 'r-qwen-empty', defaultEnhanceMode: 'qwen-multi-h3',
@@ -752,47 +799,129 @@ describe('workflow selection: panel state drives tools and prompt template', () 
     assert.deepEqual(gateway.portDirectiveCalls.map((call) => call.body.mode), ['qwen-multi-h3', 'qwen-h3'])
   })
 
-  test('promptText points at the current skill; the skill carries the template and strips the human-only note', async () => {
-    const { host, dataDirectory } = await makeHost({ configured: true,
+  test('auto-insert injects the template and the current-turn generation flow', async () => {
+    const { host } = await makeHost({ configured: true,
       gateway: makeGatewayFetch({ workflows, settings: { defaultModel: 'demo' }, portDirectiveText: template }) })
     await host.dispatch({ action: 'preferences', autoInsert: true })
     await host.dispatch({ action: 'select-model', model: 'video' })
     const text = host.promptText()
-    assert.match(text, /当前工作流固定为「video」/)
-    assert.match(text, /runninghub-current/)
-    assert.match(text, /不要传 model/)
-    const skill = await readFile(join(dataDirectory, 'skills', 'runninghub-current', 'SKILL.md'), 'utf8')
-    assert.match(skill, /【模板】/)
-    assert.match(skill, /purpose: writing/)
-    assert.equal(skill.includes('用法说明'), false, '给人看的用法说明不应进入 Skill')
+    assert.match(text, /【模板】/)
+    assert.match(text, /本回合生成 3 段视频/)
+    assert.match(text, /提交 3 段（不要多也不要少）/)
+    assert.match(text, /本轮正文草稿/)
+    assert.match(text, /不要重播上一轮已经写过的画面/)
+    assert.equal(text.includes('只有玩家明确要求'), false)
+    assert.equal(text.includes('玩家没要求'), false)
   })
 
-  test('auto-insert off still tells the model to read the skill before any generation', async () => {
+  test('auto-insert off still injects the template but not the generation flow', async () => {
     const { host } = await makeHost({ configured: true,
       gateway: makeGatewayFetch({ workflows, settings: { defaultModel: 'demo' }, portDirectiveText: template }) })
     await host.dispatch({ action: 'select-model', model: 'video' })
     assert.equal(host.autoInsert, false)
     const text = host.promptText()
-    assert.match(text, /当前工作流固定为「video」/)
-    assert.match(text, /要生成图片或视频时/)
-    assert.match(text, /runninghub-current/)
-    assert.match(text, /不要拿工作流模式名/)
-    assert.match(text, /只有玩家明确要求生成图片或视频时才调用 runninghub_generate/)
-    assert.equal(text.includes('拆成三个分镜'), false, '自动插入关闭时不应注入自动插入流程')
+    assert.match(text, /【模板】/)
+    assert.equal(text.includes('本回合生成'), false, '自动插入关闭时不应注入自动插入流程')
+    assert.equal(text.includes('只有玩家明确要求'), false, '不应再保留旧的玩家要求条件')
+    assert.equal(text.includes('玩家没要求'), false)
   })
 
-  test('describe returns promptSkill and a mode alias skill exists', async () => {
-    const { host, dataDirectory } = await makeHost({ configured: true,
+  test('videosPerTurn changes the count in both the prompt and the per-turn reminder', async () => {
+    const { host } = await makeHost({ configured: true,
+      gateway: makeGatewayFetch({ workflows, settings: { defaultModel: 'demo' }, portDirectiveText: template }) })
+    await host.dispatch({ action: 'preferences', autoInsert: true })
+    await host.dispatch({ action: 'select-model', model: 'video' })
+    assert.match(host.turnReminder(), /挑 3 个瞬间/)
+    assert.match(host.promptText(), /本回合生成 3 段视频/)
+    const saved = await host.dispatch({ action: 'preferences', videosPerTurn: 5 })
+    assert.equal(saved.videosPerTurn, 5)
+    assert.match(host.turnReminder(), /挑 5 个瞬间/)
+    assert.match(host.promptText(), /本回合生成 5 段视频/)
+    for (const value of [0, 11, 2.5, '5']) {
+      await assert.rejects(host.dispatch({ action: 'preferences', videosPerTurn: value }), /1–10 的整数/)
+    }
+    assert.equal((await host.dispatch({ action: 'list' })).videosPerTurn, 5)
+    await host.dispatch({ action: 'preferences', autoInsert: false })
+    assert.equal(host.turnReminder(), '', '自动插入关闭时不应每轮提醒')
+  })
+
+  test('describe reports the template is sent and no longer advertises a skill', async () => {
+    const { host } = await makeHost({ configured: true,
       gateway: makeGatewayFetch({ workflows, settings: { defaultModel: 'demo' }, portDirectiveText: template }) })
     await host.dispatch({ action: 'select-model', model: 'video' })
     const described = await host.dispatch({ action: 'describe' })
-    assert.equal(described.promptSkill, 'runninghub-current')
+    assert.equal('promptSkill' in described, false)
     assert.equal(described.promptTemplateReady, true)
+    assert.equal(described.promptTemplateEnabled, true)
+    assert.equal(described.promptTemplateSent, true)
     assert.equal(described.promptMode, 't2i-h3')
-    // 模型把 defaultEnhanceMode（t2i-h3）当 skill 名时也能读到同一份模板。
-    const alias = await readFile(join(dataDirectory, 'skills', 'runninghub-alias-mode', 'SKILL.md'), 'utf8')
-    assert.match(alias, /^name: t2i-h3$/m)
-    assert.match(alias, /【模板】/)
+  })
+
+  test('long templates are split into ordered prompt sections under the 8000-char limit', async () => {
+    const bigTemplate = Array.from({ length: 600 }, (_, index) => `line ${String(index).padStart(3, '0')} ` + 'x'.repeat(48)).join('\n')
+    const { host } = await makeHost({ configured: true,
+      gateway: makeGatewayFetch({ workflows, settings: { defaultModel: 'demo' }, portDirectiveText: bigTemplate }) })
+    await host.dispatch({ action: 'select-model', model: 'video' })
+    const full = host.promptText()
+    assert.ok(full.length > 8000, 'fixture should exceed one prompt section')
+    const sections = host.promptSections()
+    assert.ok(sections.length > 1)
+    for (const section of sections) assert.ok(section.length <= 7600, '每段必须低于 Tavern 的 8000 字上限')
+    const joined = sections.join('\n')
+    assert.match(joined, /line 000 /)
+    assert.match(joined, /line 599 /)
+    assert.ok(joined.indexOf('line 000 ') < joined.indexOf('line 599 '), '模板片段顺序不能乱')
+  })
+
+  test('switching the selected workflow updates the injected template on the next read', async () => {
+    const { host } = await makeHost({ configured: true,
+      gateway: makeGatewayFetch({ workflows, settings: { defaultModel: 'demo' }, portDirectiveText: mode => `【模板】${mode}` }) })
+    await host.dispatch({ action: 'select-model', model: 'video' })
+    assert.match(host.promptText(), /【模板】t2i-h3/)
+    await host.dispatch({ action: 'select-model', model: 'demo' })
+    const text = host.promptText()
+    assert.match(text, /【模板】krea2-image/)
+    assert.equal(text.includes('【模板】t2i-h3'), false)
+  })
+
+  test('turning the prompt switch off stops injection and rejects model submissions, but the panel still works', async () => {
+    const { host } = await makeHost({ configured: true,
+      gateway: makeGatewayFetch({ workflows, settings: { defaultModel: 'demo' }, portDirectiveText: template }) })
+    await host.dispatch({ action: 'select-model', model: 'video' })
+    const saved = await host.dispatch({ action: 'preferences', alwaysSendPrompt: false })
+    assert.equal(saved.alwaysSendPrompt, false)
+    assert.equal((await host.dispatch({ action: 'list' })).alwaysSendPrompt, false)
+    assert.equal(host.promptText(), '')
+    assert.deepEqual(host.promptSections(), [])
+    const described = await host.dispatch({ action: 'describe' })
+    assert.equal(described.promptTemplateEnabled, false)
+    assert.equal(described.promptTemplateSent, false)
+    const toolExec = { agent: { session: { id: 'game-1' } } }
+    await assert.rejects(
+      host.dispatch({ action: 'submit', requestId: 'req-switch-off', bindToTurn: false,
+        input: { prompt: 'B shot' } }, toolExec),
+      /总是发送提示词模板/,
+    )
+    // 面板手动提交不经过 exec，仍然允许（玩家可能只想快速试参数）。
+    const job = await host.dispatch({ action: 'submit', requestId: 'req-panel-off', bindToTurn: false,
+      input: { prompt: 'B shot', image_prompt: 'A shot' } })
+    await waitForJob(host, job.id, value => Boolean(value.remoteTaskId))
+  })
+
+  test('auto-insert off rejects model submissions at the host, but the panel still works', async () => {
+    const { host } = await makeHost({ configured: true,
+      gateway: makeGatewayFetch({ workflows, settings: { defaultModel: 'demo' }, portDirectiveText: template }) })
+    await host.dispatch({ action: 'select-model', model: 'video' })
+    assert.equal(host.autoInsert, false)
+    const toolExec = { agent: { session: { id: 'game-1' } } }
+    await assert.rejects(
+      host.dispatch({ action: 'submit', requestId: 'req-model-auto-off', bindToTurn: false,
+        input: { prompt: 'B shot' } }, toolExec),
+      /自动插入已关闭/,
+    )
+    const job = await host.dispatch({ action: 'submit', requestId: 'req-panel-auto-off', bindToTurn: false,
+      input: { prompt: 'B shot', image_prompt: 'A shot' } })
+    await waitForJob(host, job.id, value => Boolean(value.remoteTaskId))
   })
 
   test('submit uses the selected workflow and splits image### / video### into custom.image_prompt + prompt', async () => {
@@ -834,10 +963,11 @@ describe('workflow selection: panel state drives tools and prompt template', () 
     assert.equal((await host.store.list()).length, 0)
   })
 
-  test('skill is rewritten for native tool calls, without image### / video### fences', async () => {
+  test('injected template is rewritten for native tool calls, without image### / video### fences', async () => {
     const gatewayTemplate = [
       '【提示词写法 · 测试】',
       '两段都要写。',
+      '需要出视频时，按这些规则写好提示词。',
       '',
       '【输出格式】',
       '两段各自用末尾那节【输出包裹格式】给的标记包起来：image### 包住生图段，video### 包住视频段。',
@@ -851,15 +981,15 @@ describe('workflow selection: panel state drives tools and prompt template', () 
       '###',
       '- 标记逐字写成 `image###`、`video###` 与 `###`。',
     ].join('\n')
-    const { host, dataDirectory } = await makeHost({ configured: true,
+    const { host } = await makeHost({ configured: true,
       gateway: makeGatewayFetch({ workflows, settings: { defaultModel: 'demo' }, portDirectiveText: gatewayTemplate }) })
     await host.dispatch({ action: 'select-model', model: 'video' })
-    const skill = await readFile(join(dataDirectory, 'skills', 'runninghub-current', 'SKILL.md'), 'utf8')
-    assert.match(skill, /原生工具调用/)
-    assert.match(skill, /input\.image_prompt/)
-    assert.match(skill, /input\.prompt/)
-    assert.equal(skill.includes('输出包裹格式'), false, '原生工具不应再让模型看包裹格式')
-    assert.equal(/image###|video###/.test(skill), false, '原生工具 Skill 不应再出现文本标记')
+    const injected = host.promptText()
+    assert.match(injected, /生图段放进 input\.image_prompt/)
+    assert.match(injected, /视频段放进 input\.prompt/)
+    assert.equal(injected.includes('需要出视频时'), false, '条件句式应被删掉')
+    assert.equal(injected.includes('输出包裹格式'), false, '原生工具不应再让模型看包裹格式')
+    assert.equal(/image###|video###/.test(injected), false, '注入的模板不应再出现文本标记')
   })
 
   test('the model cannot override the panel selection', async () => {
@@ -873,88 +1003,18 @@ describe('workflow selection: panel state drives tools and prompt template', () 
     assert.equal((await host.store.list()).length, 0)
   })
 
-  test('Ref2VA rejects prose prompts before spending credits', async () => {
-    const refWorkflow = {
-      alias: 'h3参考', revision: 'r-ref', defaultEnhanceMode: 'h3-ref2va',
-      videoDuration: { seconds: 5, fps: 24 }, customFields: [], capabilities: {},
-      referenceSlots: [{ nodeId: '37', kind: 'image', label: '参考图 1', tag: '<Picture 1>', role: 'ref_images.ref_image_0' }],
-      defaults: { references: [{ nodeId: '37', kind: 'image', name: 'a.png', mimeType: 'image/png' }] },
-    }
-    const { host } = await makeHost({ configured: true,
-      gateway: makeGatewayFetch({ kind: 'video', workflows: [refWorkflow], settings: { defaultModel: 'h3参考' }, portDirectiveText: template }) })
-    await host.dispatch({ action: 'select-model', model: 'h3参考' })
-    const guidance = host.promptText()
-    assert.match(guidance, /六段/)
-    assert.match(guidance, /subject_definitions/)
-    assert.match(guidance, /<Subject 1>/)
-    const toolExec = { agent: { session: { id: 'game-1' } } }
-    await assert.rejects(
-      host.dispatch({ action: 'submit', requestId: 'req-ref-prose', bindToTurn: false,
-        input: { prompt: 'The woman from <Picture 1> lies on a futon.' } }, toolExec),
-      (error) => /全参考工作流要求六段/.test(error.message) && /subject_definitions/.test(error.message),
-    )
-    assert.equal((await host.store.list()).length, 0, '被拦下的提交不应留下任务或计费')
-  })
-
-  test('Ref2VA accepts a six-section prompt with <Subject N> and rejects a Picture-only body', async () => {
-    const refWorkflow = {
-      alias: 'h3参考', revision: 'r-ref', defaultEnhanceMode: 'h3-ref2va',
-      videoDuration: { seconds: 5, fps: 24 }, customFields: [], capabilities: {},
-      referenceSlots: [{ nodeId: '37', kind: 'image', label: '参考图 1', tag: '<Picture 1>', role: 'ref_images.ref_image_0' }],
-      defaults: { references: [{ nodeId: '37', kind: 'image', name: 'a.png', mimeType: 'image/png' }] },
-    }
-    const structured = [
-      'subject_definitions:',
-      '<Subject 1> is the woman in <Picture 1>, with long dark hair.',
-      '',
-      'summary: [reference generation]',
-      '',
-      'retention_analysis:',
-      '<Subject 1> (appears in [Shot 1]): fully_preserved - face and hair.',
-      '',
-      'detailed_description:',
-      'A woman in a warm room.',
-      '',
-      'overall_soundscape:',
-      'Room tone.',
-      '',
-      'non_diegetic_music:',
-      'N/A',
-    ].join('\n')
-    let body
-    const { host } = await makeHost({ configured: true,
-      gateway: makeGatewayFetch({ kind: 'video', workflows: [refWorkflow], settings: { defaultModel: 'h3参考' }, portDirectiveText: template,
-        onGenerations: (_url, opts) => { body = JSON.parse(opts.body) } }) })
-    await host.dispatch({ action: 'select-model', model: 'h3参考' })
-    const guidance = host.promptText()
-    assert.match(guidance, /六段/)
-    assert.match(guidance, /subject_definitions/)
-    assert.match(guidance, /<Subject 1>/)
-    const toolExec = { agent: { session: { id: 'game-1' } } }
-    await assert.rejects(
-      host.dispatch({ action: 'submit', requestId: 'req-ref-no-subject', bindToTurn: false,
-        input: { prompt: structured.replaceAll('<Subject 1>', '<Picture 1>') } }, toolExec),
-      (error) => /<Subject N>/.test(error.message),
-    )
-    const job = await host.dispatch({ action: 'submit', requestId: 'req-ref-structured', bindToTurn: false,
-      input: { prompt: structured } }, toolExec)
-    await waitForJob(host, job.id, value => Boolean(value.remoteTaskId))
-    assert.equal(body.model, 'h3参考')
-    assert.match(body.prompt, /^subject_definitions:/m)
-    assert.match(body.prompt, /<Subject 1>/)
-  })
-
   test('template fetch failure is surfaced but does not break selection', async () => {
-    const { host, dataDirectory } = await makeHost({ configured: true,
+    const { host } = await makeHost({ configured: true,
       gateway: makeGatewayFetch({ workflows, settings: { defaultModel: 'demo' } }) })
-    await host.dispatch({ action: 'preferences', autoInsert: true })
     const selected = await host.dispatch({ action: 'select-model', model: 'video' })
     assert.equal(selected.model, 'video')
     assert.ok(selected.templateError, '模板不可用时应给出错误')
-    assert.match(host.promptText(), /runninghub-current/)
-    const skill = await readFile(join(dataDirectory, 'skills', 'runninghub-current', 'SKILL.md'), 'utf8')
-    assert.match(skill, /提示词模板暂不可用/)
-    assert.match(skill, /不要调用 runninghub_generate/)
+    const text = host.promptText()
+    assert.match(text, /当前工作流的提示词模板不可用/)
+    assert.match(text, /不要调用 runninghub_generate/)
+    assert.equal(text.includes('请让玩家'), false)
+    assert.equal(text.includes('只有玩家'), false)
+    assert.equal(text.includes('runninghub-current'), false)
   })
 })
 
@@ -1045,14 +1105,18 @@ describe('workflow settings: save-settings writes the same gateway defaults as t
   })
 })
 
-describe('preferences: applyDefaults and bindToTurn persist with connection.json', () => {
-  test('saves both booleans, rejects non-booleans, and restores them after reboot', async () => {
+describe('preferences: alwaysSendPrompt, videosPerTurn, applyDefaults and bindToTurn persist with connection.json', () => {
+  test('saves booleans and the video count, rejects invalid values, and restores them after reboot', async () => {
     const gateway = makeGatewayFetch({ workflows: [{ alias: 'demo', customFields: [], referenceSlots: [], capabilities: {} }] })
     const { host, dataDirectory, ctx } = await makeHost({ configured: true, gateway })
-    assert.deepEqual(await host.dispatch({ action: 'preferences', applyDefaults: false, bindToTurn: false }),
-      { autoInsert: false, applyDefaults: false, bindToTurn: false })
+    assert.deepEqual(await host.dispatch({ action: 'preferences', alwaysSendPrompt: false, videosPerTurn: 6, applyDefaults: false, bindToTurn: false }),
+      { autoInsert: false, alwaysSendPrompt: false, videosPerTurn: 6, applyDefaults: false, bindToTurn: false })
     await assert.rejects(host.dispatch({ action: 'preferences', applyDefaults: 'false' }), /布尔/)
+    await assert.rejects(host.dispatch({ action: 'preferences', alwaysSendPrompt: 'false' }), /布尔/)
+    await assert.rejects(host.dispatch({ action: 'preferences', videosPerTurn: 0 }), /1–10 的整数/)
     const listed = await host.dispatch({ action: 'list' })
+    assert.equal(listed.alwaysSendPrompt, false)
+    assert.equal(listed.videosPerTurn, 6)
     assert.equal(listed.applyDefaults, false)
     assert.equal(listed.bindToTurn, false)
     host.dispose()
@@ -1060,6 +1124,8 @@ describe('preferences: applyDefaults and bindToTurn persist with connection.json
       { dataDirectory, baseURL: BASE }, { fetchImpl: gateway.fetchImpl, pollMs: 5 })
     try {
       const state = await restored.dispatch({ action: 'list' })
+      assert.equal(state.alwaysSendPrompt, false)
+      assert.equal(state.videosPerTurn, 6)
       assert.equal(state.applyDefaults, false)
       assert.equal(state.bindToTurn, false)
     } finally { restored.dispose() }
@@ -1157,14 +1223,16 @@ describe('apply: registration and cleanup (apply 不再返回 host)', () => {
     const registered = []
     const handles = {}
     const tools = []
-    let promptSection, settledHandler, removedHandler
+    let settledHandler, removedHandler, turnSectionSpec
+    const promptSections = []
     const attachments = makeAttachments({ saveImage: [], saveFile: [], getTurnState: [], getTurn: [], credentialsSet: [] })
     const ctx = {
       attachments,
       credentials: { resolve: async () => undefined, set: async () => {}, describe: async () => undefined },
       tavern: {
         handle: (name, fn) => { handles[name] = fn },
-        promptSection: spec => { promptSection = spec },
+        promptSection: spec => { promptSections.push(spec) },
+        turnSection: spec => { turnSectionSpec = spec },
         onTurnSettled: handler => { settledHandler = handler },
         onGameRemoved: handler => { removedHandler = handler },
       },
@@ -1189,9 +1257,18 @@ describe('apply: registration and cleanup (apply 不再返回 host)', () => {
     assert.deepEqual(Object.keys(handles).sort(), ['dsh-runninghub/describe', 'dsh-runninghub/list'].sort())
     assert.equal(tools.length, 4)
     assert.deepEqual(tools.map(t => t.name).sort(), ['runninghub_describe', 'runninghub_generate', 'runninghub_send_pregenerated', 'runninghub_status'].sort())
-    assert.equal(promptSection?.name, 'auto-insert')
-    assert.equal(typeof promptSection?.text, 'function')
-    assert.equal(promptSection.text({ gameId: 'fixture-game' }), '', '没有自动插入与预生成时不注入段落')
+    const generate = tools.find(t => t.name === 'runninghub_generate')
+    assert.equal(/explicit player request|auto-insert off/i.test(generate.description), false, '关闭态保护应由宿主拒绝，不写进工具说明')
+    assert.equal(promptSections.length, 8, '模板按 8 段注册，避开 Tavern 单段 8000 字上限')
+    assert.deepEqual(promptSections.map(spec => spec.name),
+      ['auto-insert', ...Array.from({ length: 7 }, (_, index) => 'auto-insert-' + String(index + 1).padStart(2, '0'))])
+    for (const spec of promptSections) {
+      assert.equal(typeof spec.text, 'function')
+      assert.equal(spec.text({ gameId: 'fixture-game' }), '', '没有工作流、自动插入与预生成时不注入段落')
+    }
+    assert.equal(turnSectionSpec?.name, 'auto-insert-reminder')
+    assert.equal(typeof turnSectionSpec?.text, 'function')
+    assert.equal(turnSectionSpec.text({ gameId: 'fixture-game' }), '', '自动插入关闭时不注入每轮提醒')
     assert.equal(typeof settledHandler, 'function')
     assert.equal(typeof removedHandler, 'function')
     assert.equal(effects.length, 4, 'dispose + 3 route effects expected')

@@ -361,6 +361,143 @@ window.__ModuleLoader__.load({
       return data
     }
 
+    // 输入框上方的生成状态：任务一提交就显示「生成中」，不等正文结算。
+    // 正文走工具调用时正文要到最后才落版，正文里的媒体卡会晚几分钟才出现；
+    // 这块停靠区只轮询本地任务记录（action: jobs），与网关、正文渲染都无关。
+    const DOCK_ACTIVE = new Set(['preparing', 'submitting', 'queued', 'running', 'downloading'])
+    const DOCK_STAGE = { preparing: '准备中', submitting: '提交中', queued: '排队中', running: '生成中', downloading: '下载中' }
+    const DOCK_FLASH_MS = 6000
+
+    // 只把最近这批任务算进「已就绪 / 失败」：历史任务不该让停靠区报一个虚高的数字。
+    const DOCK_RECENT_MS = 20 * 60 * 1000
+    function dockRecent(job, now) {
+      const created = Date.parse(job.createdAt)
+      if (!Number.isFinite(created)) return false
+      const age = now - created
+      return age < DOCK_RECENT_MS && age > -2 * 60 * 1000
+    }
+
+    function dockSummary(jobs, now = Date.now()) {
+      const list = Array.isArray(jobs) ? jobs.filter(job => job && typeof job === 'object') : []
+      const active = list.filter(job => DOCK_ACTIVE.has(job.status))
+      const ready = list.filter(job => job.status === 'ready' && dockRecent(job, now)).length
+      const failed = list.filter(job => ['failed', 'download_failed', 'submit_unknown'].includes(job.status) && dockRecent(job, now)).length
+      const stages = []
+      for (const status of ['preparing', 'submitting', 'queued', 'running', 'downloading']) {
+        const count = active.filter(job => job.status === status).length
+        if (count) stages.push(DOCK_STAGE[status] + ' ' + count)
+      }
+      return { active: active.length, ready, failed, stages }
+    }
+
+    const dockCSS = `
+.rh-dock{display:flex;align-items:center;gap:10px;box-sizing:border-box;margin:0 0 6px;padding:7px 12px;border:1px solid var(--dsw-alias-border-l2,rgba(127,127,127,.28));border-radius:12px;background:var(--dsw-alias-bg-layer-1,rgba(127,127,127,.07));color:var(--dsw-alias-label-secondary,#667085);font:12px/1.5 Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;overflow:hidden}
+.rh-dock-dot{flex:none;width:7px;height:7px;border-radius:50%;background:#175cd3;animation:rh-dock-pulse 1.8s ease-out infinite}
+.rh-dock[data-state="done"] .rh-dock-dot{background:#087a55;animation:none}
+.rh-dock[data-state="failed"] .rh-dock-dot{background:#b42318;animation:none}
+.rh-dock-copy{flex:1 1 auto;min-width:0;display:flex;flex-direction:column;gap:1px}
+.rh-dock-title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-primary,#18212f)}
+.rh-dock-title b{font-weight:650}
+.rh-dock-detail{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;color:var(--dsw-alias-label-tertiary,#98a2b3)}
+.rh-dock-bar{flex:none;width:64px;height:3px;border-radius:3px;background:var(--dsw-alias-border-l2,rgba(127,127,127,.3));overflow:hidden}
+.rh-dock-bar>span{display:block;width:40%;height:100%;border-radius:3px;background:#175cd3;animation:rh-dock-slide 1.4s ease-in-out infinite}
+@keyframes rh-dock-pulse{0%{box-shadow:0 0 0 0 rgba(23,92,211,.4)}70%{box-shadow:0 0 0 6px rgba(23,92,211,0)}100%{box-shadow:0 0 0 0 rgba(23,92,211,0)}}
+@keyframes rh-dock-slide{0%{transform:translateX(-100%)}100%{transform:translateX(250%)}}
+@media (prefers-reduced-motion:reduce){.rh-dock-dot{animation:none}.rh-dock-bar>span{animation:none;width:100%}}
+`
+
+    function GenerationDock(props) {
+      const sessionId = typeof props?.sessionId === 'string' ? props.sessionId : ''
+      const [jobs, setJobs] = useState(null)
+      const [flash, setFlash] = useState(null)
+      const activeRef = useRef(false)
+      const seenActive = useRef(false)
+      const flashTimer = useRef(null)
+
+      useEffect(() => {
+        if (!sessionId) return undefined
+        // 换局时先清掉上一局的数字，等第一轮轮询回来再显示。
+        setJobs(null)
+        setFlash(null)
+        seenActive.current = false
+        let live = true
+        let timer = null
+        let controller = null
+        let inFlight = false
+        const schedule = ms => { timer = setTimeout(poll, ms) }
+        async function poll() {
+          if (!live || inFlight) return
+          // 页面在后台时不打扰：任务状态本来就要等回来再看。
+          if (typeof document !== 'undefined' && document.visibilityState === 'hidden') { schedule(8000); return }
+          inFlight = true
+          controller = new AbortController()
+          // 下一轮间隔跟着这次拿到的状态走：有任务在跑就 2.5 秒一问，闲下来就放慢。
+          let nextDelay = activeRef.current ? 2500 : 5000
+          try {
+            const data = await request({ action: 'jobs', gameId: sessionId }, controller.signal)
+            if (!live) return
+            const list = Array.isArray(data?.jobs) ? data.jobs : []
+            setJobs(list)
+            nextDelay = list.some(job => job && DOCK_ACTIVE.has(job.status)) ? 2500 : 5000
+          } catch (error) {
+            // 读不到任务状态就保持上一次显示；停靠区不该把网络噪声塞进玩家界面。
+          } finally {
+            inFlight = false
+            if (live) schedule(nextDelay)
+          }
+        }
+        poll()
+        return () => {
+          live = false
+          if (timer) clearTimeout(timer)
+          if (controller) controller.abort()
+        }
+      }, [sessionId])
+
+      const summary = dockSummary(jobs)
+      useEffect(() => { activeRef.current = summary.active > 0 }, [summary.active])
+      // 从「有任务在跑」变成「全跑完」时亮一小会儿结果，之后自己收起来。
+      useEffect(() => {
+        if (summary.active > 0) {
+          seenActive.current = true
+          setFlash(null)
+          return undefined
+        }
+        if (!seenActive.current) return undefined
+        seenActive.current = false
+        setFlash({ ready: summary.ready, failed: summary.failed })
+        if (flashTimer.current) clearTimeout(flashTimer.current)
+        flashTimer.current = setTimeout(() => setFlash(null), DOCK_FLASH_MS)
+        return undefined
+      }, [summary.active, summary.ready, summary.failed])
+      useEffect(() => () => { if (flashTimer.current) clearTimeout(flashTimer.current) }, [])
+
+      if (!summary.active && !flash) return null
+      const failed = flash ? flash.failed : 0
+      const ready = flash ? flash.ready : summary.ready
+      // 任务被删掉或没有近期结果时，不亮一个空的结果条。
+      if (!summary.active && !failed && !ready) return null
+      let title, detail = ''
+      if (summary.active) {
+        title = '生成中 ' + summary.active + ' 段' + (ready ? ' · 已就绪 ' + ready + ' 段' : '')
+        detail = summary.stages.join(' · ')
+      } else if (failed) {
+        title = failed + ' 段生成失败'
+        detail = '可到 RunningHub 面板查看'
+      } else {
+        title = ready + ' 段视频已就绪'
+        detail = '可到 RunningHub 面板查看'
+      }
+      return h('div', { className: 'rh-dock', 'data-state': summary.active ? 'active' : failed ? 'failed' : 'done',
+        role: 'status', 'aria-live': 'polite', 'aria-label': 'RunningHub 生成状态' },
+      h('style', null, dockCSS),
+      h('span', { className: 'rh-dock-dot', 'aria-hidden': true }),
+      h('div', { className: 'rh-dock-copy' },
+        h('div', { className: 'rh-dock-title' }, h('b', null, 'RunningHub'), ' · ', title),
+        detail ? h('div', { className: 'rh-dock-detail' }, detail) : null),
+      summary.active ? h('span', { className: 'rh-dock-bar', 'aria-hidden': true }, h('span', null)) : null)
+    }
+
     function readBase64(file, signal) {
       return new Promise((resolve, reject) => {
         const reader = new FileReader()
@@ -464,6 +601,9 @@ window.__ModuleLoader__.load({
       const [references, setReferences] = useState({})
       const [referenceErrors, setReferenceErrors] = useState({})
       const [bindToTurn, setBindToTurn] = useState(true)
+      const [alwaysSendPrompt, setAlwaysSendPrompt] = useState(true)
+      const [videosPerTurn, setVideosPerTurn] = useState(3)
+      const [videosPerTurnDraft, setVideosPerTurnDraft] = useState('3')
       const [settingsBusy, setSettingsBusy] = useState(false)
       const [settingsStatus, setSettingsStatus] = useState('idle')
       const [settingsDirty, setSettingsDirty] = useState(false)
@@ -600,7 +740,9 @@ window.__ModuleLoader__.load({
               throw new Error('宿主状态格式无效：缺少 jobs 或 workflows')
             }
             setSummary({ configured: data.configured, baseURL: data.baseURL,
-              autoInsert: data.autoInsert === true, applyDefaults: data.applyDefaults !== false,
+              autoInsert: data.autoInsert === true, alwaysSendPrompt: data.alwaysSendPrompt !== false,
+              videosPerTurn: Number.isInteger(data.videosPerTurn) ? data.videosPerTurn : 3,
+              applyDefaults: data.applyDefaults !== false,
               bindToTurn: data.bindToTurn !== false, workflowSettings: data.workflowSettings === true,
               adapter: data.adapter, model: data.model, defaultModel: data.defaultModel || '',
               templateMode: data.templateMode || '', templateError: data.templateError || '',
@@ -610,6 +752,10 @@ window.__ModuleLoader__.load({
             if (!prefsLoaded.current) {
               prefsLoaded.current = true
               setBindToTurn(data.bindToTurn !== false)
+              setAlwaysSendPrompt(data.alwaysSendPrompt !== false)
+              const videos = Number.isInteger(data.videosPerTurn) ? data.videosPerTurn : 3
+              setVideosPerTurn(videos)
+              setVideosPerTurnDraft(String(videos))
             }
             if (!baseInitialized.current) {
               if (!baseDirty.current) setBaseURL(data.baseURL || DEFAULT_BASE)
@@ -794,6 +940,8 @@ window.__ModuleLoader__.load({
           if (!alive.current) return data
           setSummary(previous => ({ ...(previous || {}),
             ...(typeof data?.autoInsert === 'boolean' ? { autoInsert: data.autoInsert } : {}),
+            ...(typeof data?.alwaysSendPrompt === 'boolean' ? { alwaysSendPrompt: data.alwaysSendPrompt } : {}),
+            ...(Number.isInteger(data?.videosPerTurn) ? { videosPerTurn: data.videosPerTurn } : {}),
             ...(typeof data?.bindToTurn === 'boolean' ? { bindToTurn: data.bindToTurn } : {}) }))
           return data
         } catch (error) {
@@ -812,6 +960,34 @@ window.__ModuleLoader__.load({
         catch {
           if (alive.current) setBindToTurn(previous)
         }
+      }
+
+      async function changeAlwaysSendPrompt(value) {
+        const previous = alwaysSendPrompt
+        setAlwaysSendPrompt(value)
+        try { await savePreference({ alwaysSendPrompt: value }) }
+        catch {
+          if (alive.current) setAlwaysSendPrompt(previous)
+        }
+      }
+
+      function commitVideosPerTurn() {
+        setPreferenceError('')
+        const value = Number(videosPerTurnDraft)
+        if (!Number.isInteger(value) || value < 1 || value > 10) {
+          setPreferenceError('每回合视频段数必须是 1–10 的整数')
+          setVideosPerTurnDraft(String(videosPerTurn))
+          return
+        }
+        if (value === videosPerTurn) return
+        const previous = videosPerTurn
+        setVideosPerTurn(value)
+        setVideosPerTurnDraft(String(value))
+        savePreference({ videosPerTurn: value }).catch(() => {
+          if (!alive.current) return
+          setVideosPerTurn(previous)
+          setVideosPerTurnDraft(String(previous))
+        })
       }
 
       function settingsResolution() {
@@ -1694,9 +1870,14 @@ window.__ModuleLoader__.load({
       function renderGenerationBehavior() {
         return h('section', { className: 'rh-setting-group' },
           h('div', { className: 'rh-setting-heading' }, icon('settings'), '生成行为'),
+          h('label', { className: 'rh-toggle-row' }, h('span', null, '总是发送当前工作流的提示词模板',
+            h('span', { className: 'rh-switch' }, h('input', { type: 'checkbox', checked: alwaysSendPrompt,
+              disabled: locked || preferenceBusy, onChange: event => changeAlwaysSendPrompt(event.target.checked) }),
+            h('span', { className: 'rh-switch-track', 'aria-hidden': true })))),
+          note('开启后，每轮把当前工作流完整的提示词模板直接发给模型，不再让模型多一步读 Skill；切换工作流后下一次请求自动使用新模板。关闭后不发送模板，模型工具生成会被拒绝，面板手动生成不受影响。'),
           checkbox('绑定当前对话轮次', bindToTurn, value => changePreference('bindToTurn', value), locked),
           note('提交时绑定当前正文版本，成片完成后插回对应位置；关闭只影响新任务。'),
-          note('生成永远套用客户端保存的分辨率、参考素材、模型字段、自定义参数和随机种子，不再有单独的插件开关。'),
+          note('生成永远套用客户端保存的分辨率、参考素材、模型字段、自定义参数和随机种子，不再单独提供「套用默认值」开关。'),
           preferenceError ? alert(preferenceError) : null)
       }
 
@@ -2018,6 +2199,8 @@ window.__ModuleLoader__.load({
                 'aria-selected': view === 'history', className: 'rh-tab', onClick: () => setView('history') }, icon('grid', 14), '任务历史', h('span', { className: 'rh-count' }, jobs.length))),
             h('div', { className: 'rh-context' }, icon('link', 12), gameId ? '已关联当前对话' : '独立创作')),
           alert(refreshError), alert(summary?.gatewayError), alert(summary?.settingsError ? '客户端默认模型读取失败：' + summary.settingsError : ''),
+          alert(summary?.autoInsert === true && summary?.alwaysSendPrompt === false
+            ? '自动插入已开启，但「总是发送提示词模板」关闭：模型不会收到生成说明，工具生成会被拒绝。' : ''),
           summary && !summary.configured ? h('div', { className: 'rh-notice' }, '连接本地网关后，即可读取工作流并开始创作。 ',
             button('配置连接', () => setSettingsOpen(true), false, null, 'link')) : null,
           h('div', { id: 'rh-create-view', role: 'tabpanel', 'aria-labelledby': 'rh-create-tab', hidden: view !== 'create' },
@@ -2032,7 +2215,9 @@ window.__ModuleLoader__.load({
                   h('span', { className: 'rh-workflow-hint' }, workflowBusy ? '读取参数中…' : workflow ? '已与客户端同步' : '等待连接')),
                 h('div', { className: 'rh-row', style: { marginTop: 10 } },
                   button('同步客户端', () => setRefreshVersion(value => value + 1), locked || refreshBusy || workflowBusy, null, 'link', 'refresh'),
-                  note(summary?.templateMode ? '提示词模板 · ' + summary.templateMode : '工作流由面板固定，AI 不选别名')),
+                  note(summary?.templateMode
+                    ? '提示词模板 · ' + summary.templateMode + (summary?.alwaysSendPrompt === false ? ' · 开关关闭，未发送' : ' · 每轮发送')
+                    : '工作流由面板固定，AI 不选别名')),
                 alert(summary?.templateError ? '提示词模板读取失败：' + summary.templateError : ''),
                 alert(workflowError), workflowError ? button('重新读取工作流', () => setRefreshVersion(value => value + 1), locked, null, 'link') : null,
                 ...(workflow?.syncErrors || []).map((error, index) => alert(error, index))),
@@ -2046,7 +2231,7 @@ window.__ModuleLoader__.load({
                   h('div', { className: 'rh-notice' }, h('div', { className: 'rh-row' }, icon('link', 14),
                     h('span', null, summary?.autoInsert ? '正文视频自动插入已开启' : '创作与正文可以同步进行'),
                     button('联动设置', () => setSettingsOpen(true), false, null, 'link')),
-                    note(summary?.autoInsert ? 'AI 生成的镜头会绑定提交时的正文版本，完成后自动补入。' : '在设置里开启自动插入，AI 可先写正文，视频完成后再补入。'))),
+                    note(summary?.autoInsert ? 'AI 生成的镜头会按设置（每回合 ' + (summary?.videosPerTurn || 3) + ' 段）绑定提交时的正文版本，完成后自动补入。' : '在设置里开启自动插入，AI 可先写正文，视频完成后再补入。'))),
                 h('aside', { className: 'rh-side', 'aria-label': '生成参数' },
                   h('div', { className: 'rh-stack' },
                     h('div', { className: 'rh-section-label', style: { marginBottom: 0 } }, '生成参数',
@@ -2134,7 +2319,9 @@ window.__ModuleLoader__.load({
                   disabled: locked || settingsBusy || !aliases.length, onChange: event => selectModel(event.target.value) },
                 !aliases.length ? h('option', { value: '' }, '等待客户端工作流') : null,
                 aliases.map(alias => h('option', { key: alias, value: alias }, alias)))),
-                summary?.templateMode ? note('提示词模板 · ' + summary.templateMode) : null,
+                summary?.templateMode
+                  ? note('提示词模板 · ' + summary.templateMode + (summary?.alwaysSendPrompt === false ? ' · 开关关闭，未发送' : ' · 每轮发送'))
+                  : null,
                 note('与单镜生成页共用同一个选择；切换后自动载入该工作流的网关设置。'),
                 alert(workflowError)),
               h('div', { className: 'rh-rule' }),
@@ -2146,10 +2333,16 @@ window.__ModuleLoader__.load({
                 h('label', { className: 'rh-toggle-row' }, h('span', null, '视频完成后自动插入对应正文'),
                   h('span', { className: 'rh-switch' }, h('input', { type: 'checkbox', checked: summary?.autoInsert === true,
                     disabled: autoInsertBusy || !summary, onChange: event => saveAutoInsert(event.target.checked) }), h('span', { className: 'rh-switch-track', 'aria-hidden': true }))),
-                note('先输出正文，视频在后台生成，完成后补到原句或正文末尾。绑定提交时的版本，不随重生成串位。'),
+                note('开启后每回合都会自动生成视频，不需要玩家额外说“生成视频”；视频在后台生成，完成后补到原句或正文末尾。绑定提交时的版本，不随重生成串位。'),
+                field('每回合生成视频段数', h('input', { className: 'rh-input', type: 'number', min: 1, max: 10, step: 1,
+                  value: videosPerTurnDraft, disabled: locked || preferenceBusy,
+                  onChange: event => { setVideosPerTurnDraft(event.target.value); if (preferenceError) setPreferenceError('') },
+                  onBlur: commitVideosPerTurn,
+                  onKeyDown: event => { if (event.key === 'Enter') { event.preventDefault(); commitVideosPerTurn() } } })),
+                note('自动插入开启时，模型会按这个数量拆分镜并提交；默认 3 段。保存后下一轮提示词立即使用新数量。'),
                 h('details', { className: 'rh-fold' }, h('summary', null, '联动说明'), h('div', { className: 'rh-fold-content' },
-                  note('开启后，模型可按正文提交三个分镜任务；仅切换开关不会生成或收费。'),
-                  note('关闭只影响新任务，已提交的任务仍按原约定插入。'))), alert(autoInsertError)),
+                  note('开启后，模型每回合都会按「每回合生成视频段数」自动拆分镜并提交（当前 ' + (summary?.videosPerTurn || 3) + ' 段）；仅切换开关不会生成或收费。'),
+                  note('关闭后模型工具提交会被宿主拒绝，面板手动生成仍可用；已提交的任务仍按原约定插入。'))), alert(autoInsertError)),
               h('div', { className: 'rh-rule' }),
               h('section', { className: 'rh-setting-group' }, h('div', { className: 'rh-setting-heading' }, icon('grid'), '预生成视频池'),
                 note('按局配置与查看：在「预生成」页里设置目标数量、每轮上限、自动退出轮数与复审。'),
@@ -2178,6 +2371,16 @@ window.__ModuleLoader__.load({
           id: 'studio', title: 'RunningHub',
           render: ({ gameId, visible }) => h(Panel, { key: gameId ?? '__unbound__', gameId, visible }),
         })
+        // 输入框上方的生成状态（Tavern 插件接口 v6）。只登记 story 模式：卡片工作台的
+        // 停靠区是独占的，留给桌宠这类先注册的插件，别把它们挤掉。
+        if (typeof ctx.tavernUi.registerComposerSlot === 'function') {
+          try {
+            ctx.tavernUi.registerComposerSlot({
+              id: 'status', modes: ['story'],
+              render: ({ sessionId }) => h(GenerationDock, { sessionId }),
+            })
+          } catch (error) { console.warn('[dsh-runninghub] 生成状态停靠区注册失败', error) }
+        }
       },
     }
   },

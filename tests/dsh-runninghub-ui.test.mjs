@@ -124,6 +124,8 @@ test('RunningHub 重设计界面：jsdom + React DOM 隔离交互', {
   const state = {
     configured: true,
     autoInsert: false,
+    alwaysSendPrompt: true,
+    videosPerTurn: 3,
     applyDefaults: true,
     bindToTurn: true,
     baseURL,
@@ -221,6 +223,7 @@ test('RunningHub 重设计界面：jsdom + React DOM 隔离交互', {
     if (options.signal?.aborted) throw new window.DOMException('夹具请求已取消', 'AbortError')
     if (method === 'GET') {
       return response({ configured: state.configured, autoInsert: state.autoInsert,
+        alwaysSendPrompt: state.alwaysSendPrompt !== false, videosPerTurn: state.videosPerTurn,
         applyDefaults: state.applyDefaults !== false, bindToTurn: state.bindToTurn !== false, workflowSettings: true, baseURL: state.baseURL,
         model: state.model, defaultModel: 'h3参考', templateMode: 'h3-ref2va', adapter: 'ui-fixture', jobs: state.jobs,
         pregen: structuredClone(state.pregen),
@@ -238,13 +241,19 @@ test('RunningHub 重设计界面：jsdom + React DOM 隔离交互', {
         return response(description(body.model))
       }
       case 'preferences': {
-        const keys = ['autoInsert', 'applyDefaults', 'bindToTurn'].filter(key => body[key] !== undefined)
-        assert.ok(keys.length, 'preferences 至少带一个布尔值')
+        const keys = ['autoInsert', 'alwaysSendPrompt', 'applyDefaults', 'bindToTurn'].filter(key => body[key] !== undefined)
+        const hasVideos = body.videosPerTurn !== undefined
+        assert.ok(keys.length || hasVideos, 'preferences 至少带一个设置')
         for (const key of keys) {
           assert.equal(typeof body[key], 'boolean')
           state[key] = body[key]
         }
-        return response({ autoInsert: state.autoInsert, applyDefaults: state.applyDefaults, bindToTurn: state.bindToTurn })
+        if (hasVideos) {
+          assert.ok(Number.isInteger(body.videosPerTurn) && body.videosPerTurn >= 1 && body.videosPerTurn <= 10)
+          state.videosPerTurn = body.videosPerTurn
+        }
+        return response({ autoInsert: state.autoInsert, alwaysSendPrompt: state.alwaysSendPrompt,
+          videosPerTurn: state.videosPerTurn, applyDefaults: state.applyDefaults, bindToTurn: state.bindToTurn })
       }
       case 'pregen-settings': {
         assert.equal(body.gameId, 'fixture-game')
@@ -305,6 +314,9 @@ test('RunningHub 重设计界面：jsdom + React DOM 隔离交互', {
         state.jobs = [job, ...state.jobs]
         return response(job)
       }
+      case 'jobs':
+        assert.equal(body.gameId, 'fixture-game', '停靠区只读当前这局的任务')
+        return response({ jobs: state.jobs.filter(job => job.binding?.gameId === body.gameId) })
     }
     unexpectedRequests.push({ url, method, body })
     throw new Error('未声明的夹具请求：' + JSON.stringify(body))
@@ -327,11 +339,20 @@ test('RunningHub 重设计界面：jsdom + React DOM 隔离交互', {
     assert.equal(name, 'react', '客户端只能加载明确共享的 React')
     return React
   })
-  plugin.apply({ tavernUi: { registerPanel(definition) {
-    assert.equal(panel, undefined)
-    panel = definition
-  } } })
+  let dockSlot
+  plugin.apply({ tavernUi: {
+    registerPanel(definition) {
+      assert.equal(panel, undefined)
+      panel = definition
+    },
+    registerComposerSlot(definition) {
+      assert.equal(dockSlot, undefined)
+      dockSlot = definition
+    },
+  } })
   assert.equal(panel.id, 'studio')
+  assert.equal(dockSlot.id, 'status')
+  assert.equal(Array.from(dockSlot.modes).join(','), 'story', '卡片工作台的停靠区留给桌宠，本插件只登记 story')
 
   function query(selector, scope = container) {
     const node = scope.querySelector(selector)
@@ -377,8 +398,8 @@ test('RunningHub 重设计界面：jsdom + React DOM 隔离交互', {
       node.dispatchEvent(new window.Event('change', { bubbles: true }))
     })
   }
-  async function until(predicate, message) {
-    for (let attempt = 0; attempt < 200; attempt++) {
+  async function until(predicate, message, attempts = 200) {
+    for (let attempt = 0; attempt < attempts; attempt++) {
       if (predicate()) return
       await act(async () => { await delay(5) })
     }
@@ -469,6 +490,34 @@ test('RunningHub 重设计界面：jsdom + React DOM 隔离交互', {
     assert.equal(submissions.length, 0)
   })
 
+  await t.test('提示词模板开关保存到宿主，界面显示已关闭', async () => {
+    await click(button('设置'))
+    const drawer = query('[role="dialog"]')
+    const row = [...drawer.querySelectorAll('.rh-toggle-row')].find(item => /总是发送/.test(item.textContent))
+    assert.ok(row, '设置里应有「总是发送当前工作流的提示词模板」开关')
+    const toggle = row.querySelector('input')
+    assert.equal(toggle.checked, true)
+    await click(toggle)
+    await until(() => !toggle.checked && !toggle.disabled, '提示词模板开关保存')
+    assert.deepEqual(actionCalls('preferences').at(-1).body, { action: 'preferences', alwaysSendPrompt: false })
+    assert.equal(state.alwaysSendPrompt, false)
+    assert.match(drawer.textContent, /开关关闭，未发送/)
+    await click(query('button[aria-label="关闭设置"]', drawer))
+  })
+
+  await t.test('每回合视频段数保存到宿主', async () => {
+    await click(button('设置'))
+    const drawer = query('[role="dialog"]')
+    const node = field('每回合生成视频段数', drawer)
+    assert.equal(node.value, '3')
+    await input(node, '5')
+    await change(() => node.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Enter', bubbles: true })))
+    await until(() => state.videosPerTurn === 5, '每回合视频段数保存')
+    assert.deepEqual(actionCalls('preferences').at(-1).body, { action: 'preferences', videosPerTurn: 5 })
+    assert.equal(node.value, '5')
+    await click(query('button[aria-label="关闭设置"]', drawer))
+  })
+
   await t.test('重新挂载 Panel 后从 GET 恢复自动插入偏好，Escape 关闭设置', async () => {
     await change(() => root.unmount())
     root = null
@@ -477,6 +526,7 @@ test('RunningHub 重设计界面：jsdom + React DOM 隔离交互', {
     await until(() => container.querySelector('input[aria-label="上传参考图片"]'), '重新挂载的工作流')
     assert.ok(calls.filter(call => call.method === 'GET').length > getCount)
     assert.equal(container.querySelector('[role="dialog"]'), null)
+    assert.match(query('#rh-create-view').textContent, /开关关闭，未发送/)
     await click(button('设置'))
     assert.equal(query('.rh-toggle-row input').checked, true)
     await change(() => window.document.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true })))
@@ -721,6 +771,7 @@ test('RunningHub 重设计界面：jsdom + React DOM 隔离交互', {
     // 每个用例从插件默认偏好和干净的客户端设置开始，避免上一条用例的自动同步串场。
     state.applyDefaults = true
     state.bindToTurn = true
+    state.videosPerTurn = 3
     state.savedDefaults = undefined
     state.savedDuration = undefined
     if (root) await act(async () => { root.unmount(); root = null })
@@ -1097,5 +1148,39 @@ test('RunningHub 重设计界面：jsdom + React DOM 隔离交互', {
     assert.equal(container.querySelector('.rh-video-toast'), null, '已收起的通知不会因轮询重新弹出')
 
     state.jobs = state.jobs.filter(job => job.id !== jobId && job.id !== oldId)
+  })
+
+  await t.test('输入框停靠区：任务一提交就显示生成中，不等正文结算', async () => {
+    const dockHost = window.document.createElement('div')
+    window.document.body.appendChild(dockHost)
+    const dockRoot = ReactDOM.createRoot(dockHost)
+    const video = { kind: 'video', name: 'dock.mp4', mediaType: 'video/mp4',
+      url: '/api/dsh-runninghub/media?id=dock-running&index=0' }
+    const created = new Date().toISOString()
+    state.jobs = [
+      { id: 'dock-running', status: 'running', createdAt: created, binding: { gameId: 'fixture-game' }, attachments: [] },
+      { id: 'dock-queued', status: 'queued', createdAt: created, binding: { gameId: 'fixture-game' }, attachments: [] },
+    ]
+    try {
+      await act(async () => { dockRoot.render(dockSlot.render({ sessionId: 'fixture-game', busy: true })) })
+      await until(() => dockHost.querySelector('.rh-dock'), '生成中停靠区')
+      const dock = dockHost.querySelector('.rh-dock')
+      assert.equal(dock.getAttribute('data-state'), 'active')
+      assert.match(dock.textContent, /RunningHub/)
+      assert.match(dock.textContent, /生成中 2 段/)
+      assert.match(dock.textContent, /排队中 1 · 生成中 1/)
+      assert.ok(dockHost.querySelector('.rh-dock-bar'), '生成中才有进度条')
+
+      // 全部就绪：停靠区亮一下结果，随后自己收起。
+      state.jobs = state.jobs.map(job => ({ ...job, status: 'ready', attachments: [video] }))
+      await until(() => /已就绪/.test(dockHost.textContent), '完成提示', 700)
+      assert.equal(dockHost.querySelector('.rh-dock').getAttribute('data-state'), 'done')
+      assert.match(dockHost.textContent, /2 段视频已就绪/)
+      assert.equal(dockHost.querySelector('.rh-dock-bar'), null, '完成后不再显示进度条')
+    } finally {
+      await act(async () => { dockRoot.unmount() })
+      dockHost.remove()
+      state.jobs = state.jobs.filter(job => !job.id.startsWith('dock-'))
+    }
   })
 })

@@ -182,6 +182,28 @@ test('TaskStore：写入含私密字段的任务后，落盘文件与读取结�
   assert.equal(saved.apiKey, undefined, 'apiKey 字段不得持久化')
 })
 
+test('TaskStore：附件的字节数保留（宿主发 Content-Length 要用），字节数组仍然剥离', async (t) => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'tavern-store-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const store = new TaskStore({ directory: dir })
+  await store.init()
+  const id = randomUUID()
+  const ref = { attachmentId: 'sha256:' + 'a'.repeat(64), name: 'clip.mp4' }
+  await store.write(baseJob({
+    id, requestId: 'bytes-req', status: 'ready',
+    attachments: [
+      { kind: 'video', name: 'clip.mp4', mediaType: 'video/mp4', attachment: { ...ref, bytes: 2765508 } },
+      { kind: 'video', name: 'raw.bin', attachment: { ...ref, bytes: [1, 2, 3] } },
+    ],
+  }))
+  const saved = await store.read(id)
+  assert.equal(saved.attachments[0].attachment.bytes, 2765508, '字节数必须保留')
+  assert.deepEqual(saved.attachments[1].attachment, ref, '数组形式的 bytes 不能被当成字节数写入')
+  const raw = await readFile(path.join(dir, `${id}.json`), 'utf8')
+  assert.ok(raw.includes('2765508'))
+  assert.ok(!raw.includes('[1,2,3]'))
+})
+
 test('TaskStore：原子落盘——成功后只保留最终文件、无残留临时文件', async (t) => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'tavern-store-'))
   t.after(() => rm(dir, { recursive: true, force: true }))

@@ -168,9 +168,9 @@ test('预生成：设置目标后在后台规划、提交、就绪并进入正�
     assert.match(prompt, new RegExp(entry.id))
     assert.match(prompt, new RegExp(entry.description))
   }
-  // 没绑定预生成池的局仍要拿到「生成前读 skill」的通用指令；只是没有池子内容。
+  // 没绑定预生成池的局仍要拿到直接注入的模板；只是没有池子内容。
   const otherGame = f.host.promptText('__other_game__')
-  assert.match(otherGame, /runninghub-current/)
+  assert.match(otherGame, /TEMPLATE /)
   assert.doesNotMatch(otherGame, /预生成视频池/)
 
   // 就绪条目可以发送到当前已结算的一轮；发送不经过网关、不新增任务。
