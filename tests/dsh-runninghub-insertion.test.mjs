@@ -7,13 +7,17 @@ import { createRunningHubHost } from '../index.mjs'
 
 const generationId = 'a'.repeat(64)
 const binding = { gameId: 'game-1', turn: 5, textVersion: 'v1' }
-async function setup(t) {
+async function setup(t, { legacyHost = false, turnState: initialTurnState } = {}) {
   const directory = await mkdtemp(path.join(tmpdir(), 'rh-insertion-'))
   const items = [], calls = [], hosts = []
   let resolved = null, remoteReady = false, broken = false, count = 0
+  let turnState = initialTurnState ?? { turn: 5, textVersion: 'v1', settled: true, busy: false }
   const tavern = {
     captureGeneration: async ({ gameId }) => ({ gameId, generationId }),
     resolveGeneration: async () => resolved,
+    getTurnState: async ({ gameId }) => ({ gameId, ...turnState }),
+    getTurn: async ({ gameId, turn }) => ({ gameId, turn, textVersion: turnState.textVersion, text: '正文' }),
+    onTurnSettled: () => () => {},
     list: async ({ gameId, turn }) => items.filter(item => item.gameId === gameId && item.turn === turn),
     attach: async spec => {
       if (broken) throw new Error('insertion unavailable')
@@ -23,6 +27,7 @@ async function setup(t) {
     },
     update: async (id, value) => Object.assign(items.find(item => item.id === id), value),
   }
+  if (legacyHost) delete tavern.captureGeneration
   const ctx = { tavern, credentials: { resolve: async () => ({ value: 'test-key' }) },
     attachments: { saveFile: async ({ data, name }) => ({ attachmentId: 'file-' + (++count), name, bytes: data.length }) } }
   const client = {
@@ -47,7 +52,8 @@ async function setup(t) {
   const exec = { agent: { session: { id: 'game-1' } } }
   const submit = (id, extra = {}) => host.dispatch({ action: 'submit', requestId: id, input: { model: 'h3参考', prompt: 'scene' }, bindToTurn: false, ...extra }, exec)
   return { host, boot, exec, submit, items, calls, directory, setResolved(value) { resolved = value },
-    setReady() { remoteReady = true }, setBroken(value) { broken = value } }
+    setReady() { remoteReady = true }, setBroken(value) { broken = value },
+    setTurnState(value) { turnState = value } }
 }
 async function until(host, id, status) {
   for (let step = 0; step < 200; step++) {
@@ -190,4 +196,48 @@ test('自动插入：工具会话优先，拒绝伪造game_id和缺失核心支�
   await assert.rejects(f.submit('wrong-game', { gameId: 'other-game' }), /不一致/)
   assert.equal(f.calls.length, 0)
   assert.equal((await f.host.store.list()).length, 0)
+})
+
+test('自动插入：旧宿主没有生成身份接口时，正文写完再绑定这一轮', async t => {
+  const f = await setup(t, { legacyHost: true, turnState: { turn: 5, textVersion: 'v5', settled: false, busy: true } })
+  await f.host.dispatch({ action: 'preferences', autoInsert: true })
+  const job = await f.submit('legacy-pending', { anchor: '场景。' })
+  const running = await until(f.host, job.id, 'running')
+  assert.equal(running.binding.pending, true)
+  assert.equal(running.binding.afterTurn, 5)
+  await f.host.reconcile()
+  assert.equal(f.items.length, 0, '正文结算前不能挂到上一轮')
+  await f.host.handleTurn({ gameId: 'game-1', turn: 5, textVersion: 'v5', text: '旧的正文' })
+  assert.equal(f.items.length, 0, '不能挂到提交前就已经存在的轮次')
+  await f.host.handleTurn({ gameId: 'game-1', turn: 6, textVersion: 'v6', text: '新的正文' })
+  const frozen = JSON.parse(await readFile(path.join(f.directory, 'bindings', job.id + '.json'), 'utf8'))
+  assert.equal(frozen.turn, 6)
+  assert.equal(frozen.textVersion, 'v6')
+  assert.equal(frozen.anchor, '场景。')
+  assert.equal(f.items.length, 1, '成片还没下载时先挂占位，锁住这一版正文')
+  assert.equal(f.items[0].turn, 6)
+  assert.equal(f.items[0].textVersion, 'v6')
+  assert.equal(f.items[0].anchor, '场景。')
+  assert.equal(f.items[0].status, 'pending')
+  f.setReady()
+  const saved = await until(f.host, job.id, 'ready')
+  assert.equal(saved.attachments.length, 1)
+  await f.host.reconcile()
+  assert.equal(f.items.length, 1)
+  assert.equal(f.items[0].status, 'ready')
+  assert.equal(f.items[0].attachment.attachmentId, saved.attachments[0].attachment.attachmentId)
+  assert.equal(f.calls.length, 1)
+})
+
+test('自动插入：旧宿主当前轮已结算时直接绑定，不必等下一轮', async t => {
+  const f = await setup(t, { legacyHost: true, turnState: { turn: 5, textVersion: 'v1', settled: true, busy: false } })
+  await f.host.dispatch({ action: 'preferences', autoInsert: true })
+  f.setReady()
+  const job = await f.submit('legacy-settled')
+  const saved = await until(f.host, job.id, 'ready')
+  assert.equal(saved.binding.turn, 5)
+  assert.equal(saved.binding.pending, undefined)
+  await f.host.reconcile()
+  assert.equal(f.items.length, 1)
+  assert.equal(f.items[0].textVersion, 'v1')
 })

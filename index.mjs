@@ -176,10 +176,16 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     return next.finally(() => { if (bindingQueues.get(job.id) === next) bindingQueues.delete(job.id) })
   }
   async function resolvedBinding(job, resolutions) {
-    if (!job.binding?.generationId) return job.binding
+    // A pending binding only has a gameId until the host settles the turn that was
+    // being written. onTurnSettled writes the frozen turn/textVersion below; until
+    // then there is nowhere to attach yet, and inserting into the previous turn
+    // would put the video under the wrong text.
+    if (!job.binding?.generationId && !job.binding?.pending) return job.binding
     const file = path.join(linksDirectory, job.id + '.json')
     try { return JSON.parse(await readFile(file, 'utf8')) }
     catch (error) { if (error.code !== 'ENOENT') throw error }
+    if (job.binding.pending && !job.binding.generationId) return null
+    if (typeof ctx.tavern.resolveGeneration !== 'function') return null
     const generationKey = JSON.stringify([job.binding.gameId, job.binding.generationId])
     let value
     if (resolutions?.has(generationKey)) value = resolutions.get(generationKey)
@@ -213,7 +219,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
       try {
         if (job.attachments?.length) {
           for (let index = 0; index < job.attachments.length; index++) await insert(job, job.attachments[index], index, resolutions)
-        } else if (job.binding.generationId) await insert(job, undefined, 0, resolutions)
+        } else if (job.binding.generationId || job.binding.pending) await insert(job, undefined, 0, resolutions)
         insertionErrors.delete(job.id)
       } catch (error) { insertionErrors.set(job.id, sanitizeMessage(error.message)) }
     })
@@ -617,7 +623,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     return true
   }
 
-  async function flushPregenSends(gameId, existing) {
+  async function flushPregenSends(gameId, existing, settledTurn) {
     const state = existing ?? await loadPregen(gameId)
     if (!state.sends?.length) return false
     let changed = false
@@ -637,10 +643,18 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
         changed = true
         continue
       }
-      if (typeof ctx.tavern.resolveGeneration !== 'function' || typeof ctx.tavern.attach !== 'function') continue
       let binding = null
-      try { binding = await ctx.tavern.resolveGeneration({ gameId, generationId: send.generationId }) }
-      catch { binding = null }
+      if (send.pending && !send.generationId) {
+        // 等到了提交时那一轮结算：直接挂上它的正文版本。
+        const after = Number.isInteger(send.afterTurn) ? send.afterTurn : 0
+        if (settledTurn?.gameId === gameId && Number.isInteger(settledTurn.turn) && settledTurn.turn > after
+          && typeof settledTurn.textVersion === 'string' && settledTurn.textVersion) {
+          binding = { turn: settledTurn.turn, textVersion: settledTurn.textVersion }
+        }
+      } else if (typeof ctx.tavern.resolveGeneration === 'function' && typeof ctx.tavern.attach === 'function') {
+        try { binding = await ctx.tavern.resolveGeneration({ gameId, generationId: send.generationId }) }
+        catch { binding = null }
+      }
       // 正文还在写、或还没有可落位的版本：留到下一次对账再试；超过十分钟多半是回退/重写了，还回池子。
       if (!binding) {
         const created = Date.parse(send.createdAt || '')
@@ -1088,8 +1102,8 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     const info = await pregenTurnInfo(gameId)
     let queued = false
     // 正在写、或刚开始结算：优先挂到这次生成上，等正文版本确定后落位。
-    const generation = !info.settled && typeof ctx.tavern.captureGeneration === 'function'
-      ? await ctx.tavern.captureGeneration({ gameId }) : null
+    const canCapture = typeof ctx.tavern.captureGeneration === 'function'
+    const generation = !info.settled && canCapture ? await ctx.tavern.captureGeneration({ gameId }) : null
     if (generation?.generationId) {
       state.sends = state.sends ?? []
       state.sends.push({
@@ -1100,12 +1114,27 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
         createdAt: new Date().toISOString(),
       })
       queued = true
+    } else if (!info.settled && !canCapture && typeof ctx.tavern.onTurnSettled === 'function' && typeof ctx.tavern.attach === 'function') {
+      // 旧宿主没有生成身份接口：等这一轮结算的 onTurnSettled 再挂，不能猜上一轮。
+      const afterTurn = Number.isInteger(info.turn) ? Math.max(0, info.turn - 1) : 0
+      state.sends = state.sends ?? []
+      state.sends.push({
+        entryId: entry.id,
+        pending: true,
+        afterTurn,
+        ...(anchor ? { anchor } : {}),
+        ...(caption ? { caption } : {}),
+        createdAt: new Date().toISOString(),
+      })
+      queued = true
     } else if (info.settled && Number.isInteger(info.turn) && info.turn > 0) {
       const turn = await ctx.tavern.getTurn({ gameId, turn: info.turn })
       if (!turn) throw fail('当前正文还没写完，请稍后再发送')
       await attachPregenItem({ gameId, turn: turn.turn, textVersion: turn.textVersion, item, entryId: entry.id })
     } else {
-      throw fail('当前没有可发送的正文轮次')
+      throw fail(canCapture && !info.settled
+        ? '当前不是前台正文生成，不能把视频绑到正文；请等正文生成时再发送'
+        : '当前没有可发送的正文轮次')
     }
     entry.status = 'used'
     entry.usedAt = new Date().toISOString()
@@ -1122,8 +1151,37 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     }
   }
 
+  // 没有生成身份接口的宿主：把提交期间还没结算的自动插入任务，绑到这一轮
+  // 刚写完的正文版本上。写文件和插入都排在该任务自己的 bindingSerial 里，
+  // 避免和下载完成后的 bindMedia 抢同一个落位文件。
+  async function resolvePendingBindings(value) {
+    if (typeof value?.gameId !== 'string' || !Number.isInteger(value.turn) || value.turn < 1
+      || typeof value.textVersion !== 'string' || !value.textVersion) return false
+    let changed = false
+    for (const job of await store.list()) {
+      if (!job.binding?.pending || job.binding.generationId || job.binding.gameId !== value.gameId) continue
+      const after = Number.isInteger(job.binding.afterTurn) ? job.binding.afterTurn : 0
+      if (value.turn <= after) continue
+      try {
+        const written = await bindingSerial(job, async () => {
+          const file = path.join(linksDirectory, job.id + '.json')
+          try { await readFile(file); return false }
+          catch (error) { if (error.code !== 'ENOENT') throw error }
+          await atomicJSON(file, {
+            gameId: value.gameId, turn: value.turn, textVersion: value.textVersion,
+            anchor: job.binding.anchor || '',
+          })
+          return true
+        })
+        if (written) changed = true
+      } catch (error) { insertionErrors.set(job.id, sanitizeMessage(error.message)) }
+    }
+    return changed
+  }
+
   async function handleTurn(value = {}) {
     if (disposed) return
+    if (await resolvePendingBindings(value)) await reconcile()
     const gameId = pregenGameId(value.gameId)
     // 不依赖 onChange 一定送达：每轮先把任务状态对一遍，再补过期与发送落位。
     try { await reconcilePregen(gameId) } catch { /* 池子出错不阻断正文 */ }
@@ -1135,7 +1193,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
       expireStaleEntries(state, turn, new Date().toISOString())
       await persistPregen(gameId).catch(() => {})
     }
-    await flushPregenSends(gameId, state).catch(() => {})
+    await flushPregenSends(gameId, state, value).catch(() => {})
     if (state.settings.count > 0) await planPregen(gameId, 'turn', { turn, text: value.text })
   }
 
@@ -1246,6 +1304,42 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     const turn = await ctx.tavern.getTurn({ gameId: input.gameId, turn: state.turn })
     if (!turn || turn.textVersion !== state.textVersion) throw fail('当前正文版本已变化，请刷新后提交')
     return { gameId: turn.gameId, turn: turn.turn, textVersion: turn.textVersion }
+  }
+  // 自动插入优先绑定「生成 attempt」：视频要等正文写完才落位，仅凭当前轮次不够。
+  // 旧宿主没有 captureGeneration 时退回结算绑定：正文正在写就等这一轮结算
+  // （onTurnSettled 再写死 turn/textVersion），已经结算则直接绑当前轮。
+  async function autoInsertBinding(gameId, anchor = '') {
+    if (typeof ctx.tavern.captureGeneration === 'function') {
+      const generation = await ctx.tavern.captureGeneration({ gameId })
+      if (!generation?.generationId) {
+        throw fail('当前不是前台正文生成（生成候选或后台任务不能自动插入），请关闭自动插入后重试')
+      }
+      return { ...generation, anchor }
+    }
+    if (typeof ctx.tavern.onTurnSettled !== 'function' || typeof ctx.tavern.attach !== 'function') {
+      throw fail('当前 Tavern 宿主不支持自动插入，请更新 DSH Tavern 或关闭自动插入')
+    }
+    let state
+    try { state = await ctx.tavern.getTurnState?.({ gameId }) } catch { state = null }
+    if (state && !state.busy && state.settled && Number.isInteger(state.turn) && state.turn > 0) {
+      try {
+        const turn = await ctx.tavern.getTurn({ gameId, turn: state.turn })
+        if (turn && turn.textVersion === state.textVersion) {
+          return { gameId, turn: turn.turn, textVersion: turn.textVersion, anchor }
+        }
+      } catch { /* 读不到这一轮就按未结算处理 */ }
+    }
+    let afterTurn = 0
+    if (state && Number.isInteger(state.turn)) {
+      // 正在写时，state.turn 可能已经是这一轮（占位正文已存在），也可能是上一轮；
+      // 能读到就说明它已经结算，只需等更晚的轮次。
+      let readable = null
+      if (state.busy) {
+        try { readable = await ctx.tavern.getTurn({ gameId, turn: state.turn }) } catch { readable = null }
+      }
+      afterTurn = readable ? state.turn : Math.max(0, state.turn - (state.busy ? 1 : 0))
+    }
+    return { gameId, pending: true, afterTurn, anchor }
   }
   async function dispatch(input = { action: 'list' }, exec) {
     return serial(async () => {
@@ -1470,10 +1564,8 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
         if (autoInsert && sessionId) {
           exec.signal?.throwIfAborted()
           if (input.gameId && input.gameId !== sessionId) throw fail('game_id 与当前工具调用会话不一致')
-          const generation = await ctx.tavern.captureGeneration?.({ gameId: sessionId })
+          binding = await autoInsertBinding(sessionId, input.anchor || '')
           exec.signal?.throwIfAborted()
-          if (!generation?.generationId) throw fail('当前宿主尚未就绪或不是前台正文生成，请重启 Tavern 后再试')
-          binding = { ...generation, anchor: input.anchor || '' }
         } else binding = await bindingOf(input)
         const job = await active.engine.submit(clean, { binding, requestId: input.requestId })
         try { await replays.save(job.id, clean); job.replayable = true } catch { /* 任务已提交，快照失败只影响下次重放 */ }

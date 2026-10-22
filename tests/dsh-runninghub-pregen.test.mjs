@@ -174,3 +174,21 @@ test('规划提示词：模板、数量、复审 id 与 JSON 输出约定', () =
   assert.match(user, /请写出 3 条/)
   assert.match(user, /当前是第 5 轮，池子目标 4 条/)
 })
+
+test('发送队列：旧宿主的待结算发送可落盘，重启后仍等同一轮', () => {
+  const state = normalizePregenState({
+    sends: [
+      { entryId: 'pg-abcd', pending: true, afterTurn: 5, anchor: '她推门进来。', createdAt: '2026-10-22T00:00:00.000Z' },
+      { entryId: 'pg-efgh', generationId: 'g'.repeat(64) },
+      { entryId: 'pg-ijkl' },
+    ],
+  }, 'game-1')
+  assert.equal(state.sends.length, 2)
+  assert.deepEqual(state.sends[0], {
+    entryId: 'pg-abcd', pending: true, afterTurn: 5, anchor: '她推门进来。', createdAt: '2026-10-22T00:00:00.000Z',
+  })
+  assert.equal(state.sends[1].generationId, 'g'.repeat(64))
+  const serialized = serializePregenState(state, 'game-1')
+  assert.equal(serialized.sends[0].pending, true)
+  assert.equal(serialized.sends[0].afterTurn, 5)
+})

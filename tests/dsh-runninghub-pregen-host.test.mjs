@@ -85,6 +85,7 @@ async function setup(t, { plan, tavernSetup, pipeline } = {}) {
     backgroundModel: async () => ({ provider: 'fake', model: 'planner' }),
     captureGeneration: async ({ gameId }) => ({ gameId, generationId: 'g'.repeat(64) }),
     resolveGeneration: async () => generationResolved,
+    onTurnSettled: () => () => {},
     list: async () => items,
     attach: async spec => {
       const item = { ...spec, ...spec.item, id: 'media-' + (attached.length + 1) }
@@ -215,6 +216,42 @@ test('预生成：正文生成中调用时排队，本轮结算后补入；正�
   f.turnState.generating = false
   f.setResolved({ gameId: 'game-1', turn: 6, textVersion: 'v6' })
   await f.host.handleTurn({ gameId: 'game-1', turn: 6, text: '新的正文' })
+  assert.equal(f.attached.length, 1)
+  assert.equal(f.attached[0].textVersion, 'v6')
+  assert.equal(f.attached[0].caption, '回头')
+})
+
+test('预生成：旧宿主没有生成身份接口时，排队到本轮结算再落位', async t => {
+  const f = await setup(t, {
+    tavernSetup(tavern) {
+      delete tavern.captureGeneration
+      delete tavern.resolveGeneration
+    },
+  })
+  await f.host.dispatch({ action: 'pregen-settings', gameId: 'game-1', count: 1 })
+  const ready = await until(async () => {
+    const entries = (await summary(f.host)).pregen.entries.filter(entry => entry.status === 'ready')
+    return entries[0] ?? null
+  }, '一条预生成视频就绪')
+  await f.host.dispatch({ action: 'pregen-settings', gameId: 'game-1', count: 0 })
+
+  f.turnState.settled = false
+  f.turnState.busy = true
+  f.turnState.generating = true
+  f.turnState.turn = 6
+  f.turnState.textVersion = 'v6'
+  const sent = await f.host.dispatch({ action: 'pregen-send', gameId: 'game-1', id: ready.id, caption: '回头' })
+  assert.equal(sent.queued, true)
+  assert.equal(f.attached.length, 0, '正文没写完前不能落位')
+  assert.equal((await summary(f.host)).pregen.entries.find(entry => entry.id === ready.id).status, 'used')
+
+  await f.host.handleTurn({ gameId: 'game-1', turn: 5, textVersion: 'v5', text: '旧的正文' })
+  assert.equal(f.attached.length, 0, '不能挂到上一轮')
+
+  f.turnState.settled = true
+  f.turnState.busy = false
+  f.turnState.generating = false
+  await f.host.handleTurn({ gameId: 'game-1', turn: 6, textVersion: 'v6', text: '新的正文' })
   assert.equal(f.attached.length, 1)
   assert.equal(f.attached[0].textVersion, 'v6')
   assert.equal(f.attached[0].caption, '回头')
