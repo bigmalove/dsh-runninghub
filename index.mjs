@@ -1742,7 +1742,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
       parts.push(`当前工作流的提示词模板不可用${promptDirective.error ? '（' + promptDirective.error + '）' : ''}，本回合不要调用 runninghub_generate；正文照常写。`)
     } else {
       if (autoInsert) {
-        parts.push(`本回合生成 ${videosPerTurn} 段视频。严格按顺序：1) 先根据玩家本轮指引写出完整的本轮正文草稿，从上一轮结束后的下一个动作开始，不要重播上一轮已经写过的画面；2) 只从这份本轮草稿里挑 ${videosPerTurn} 个最精彩的瞬间写视频提示词，上一轮和历史正文不能作为本轮视频内容；3) 每条视频的 anchor 必须逐字引用本轮草稿里的原句；4) 先调用 runninghub_generate 提交 ${videosPerTurn} 段（不要多也不要少），全部提交后再调用 submit_story 提交同一份正文。`)
+        parts.push(`本回合生成 ${videosPerTurn} 段视频。严格按顺序：1) 先在思考里定稿完整的本轮正文，从上一轮结束后的下一个动作开始，不要重播上一轮已经写过的画面；2) 只从这份本轮正文里挑 ${videosPerTurn} 个最精彩的瞬间写视频提示词，上一轮和历史正文不能作为本轮视频内容；3) 每条视频的 anchor 必须逐字引用本轮正文里的原句；4) 在同一条回复里先调用 runninghub_generate 提交 ${videosPerTurn} 段（不要多也不要少），紧接着在同一条回复里调用 submit_story，把同一份完整正文放进 content；submit_story 必须是这条回复的最后一个工具调用。不要只提交视频、等工具结果再补正文——那样正文会丢，视频也白生成；anchor 只是定位句，不能代替正文。`)
       }
       parts.push(promptDirective.text)
       if (promptDirective.mode === 'h3-ref2va' || promptDirective.mode === 'h3-hybrid') {
@@ -1769,7 +1769,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     if (!alwaysSendPrompt || !autoInsert || !model) return ''
     if (promptDirective.model !== model || !promptDirective.text) return ''
     const lead = typeof input === 'string' && input.trim() ? `本轮玩家指引：${input.trim().slice(0, 500)}。` : ''
-    return `【RunningHub】${lead}先按这条指引写出本轮正文草稿，再从草稿里挑 ${videosPerTurn} 个瞬间生成视频（anchor 用草稿原句），最后提交正文；不要用上一轮画面。`
+    return `【RunningHub】${lead}先按这条指引定稿本轮正文，再从正文里挑 ${videosPerTurn} 个瞬间写视频提示词（anchor 用正文原句）；然后在同一条回复里调用 runninghub_generate 提交 ${videosPerTurn} 段，并紧接着调用 submit_story 提交完整正文（最后一个工具调用）。不要等工具结果再补正文，也不要用上一轮画面。`
   }
   function dispose() {
     disposed = true
@@ -1817,7 +1817,7 @@ export async function apply(ctx, config = {}) {
       ['runninghub_describe', 'Read the panel-selected workflow parameters and reference slots. Does not submit or change the selection.',
         { type: 'object', properties: { model: { type: 'string', description: 'Omit; kept only for compatibility. The panel selection wins.' } }, additionalProperties: false },
         args => host.dispatch({ action: 'describe', ...(args.model ? { model: args.model } : {}) })],
-      ['runninghub_generate', 'Submit ONE image/video job for the panel-selected workflow. input.prompt = video prompt; for a pipeline input.image_prompt = image prompt. No image### / video### fences. Keep the same request_id on uncertain retries; never automatically regenerate.',
+      ['runninghub_generate', 'Submit ONE image/video job for the panel-selected workflow. input.prompt = video prompt; for a pipeline input.image_prompt = image prompt. No image### / video### fences. Keep the same request_id on uncertain retries; never automatically regenerate. When auto-insert is on, submit every video and then call submit_story in the SAME reply (it must be the last tool call); do not wait for these results before submitting the story.',
         { type: 'object', properties: {
           request_id: { type: 'string' },
           input: { type: 'object', properties: {
