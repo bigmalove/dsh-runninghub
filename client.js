@@ -5,6 +5,7 @@ window.__ModuleLoader__.load({
     const h = React.createElement
     const { useEffect, useRef, useState } = React
     const API = '/api/dsh-runninghub'
+    const LIBRARY = API + '/library'
     const DEFAULT_BASE = 'http://127.0.0.1:6888'
     const MB = 1024 * 1024
     // 仅在内存中保留未确认请求；面板重新挂载时也不生成新的请求 ID。
@@ -31,7 +32,7 @@ window.__ModuleLoader__.load({
 .rh-body{padding:22px 24px 24px;max-width:1440px;margin:auto}.rh-nav{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:20px}.rh-tabs{display:flex;align-items:center;padding:4px;background:var(--rh-surface);border:1px solid var(--rh-line);border-radius:10px;gap:4px}.rh-tab{display:flex;align-items:center;gap:7px;border:0;background:transparent;color:var(--rh-muted);padding:7px 13px;border-radius:7px;font-size:12px;font-weight:600}.rh-tab[aria-selected="true"]{background:var(--rh-brand-soft);color:var(--rh-brand)}.rh-count{font-size:10px;min-width:18px;text-align:center;background:var(--rh-bg);border-radius:5px;padding:0 4px}.rh-context{color:var(--rh-muted);font-size:11px;display:flex;align-items:center;gap:6px}
 .rh-card{background:var(--rh-surface);border:1px solid var(--rh-line);border-radius:14px;box-shadow:var(--rh-shadow);min-width:0}.rh-card-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:17px 20px;border-bottom:1px solid var(--rh-line)}.rh-card-body{padding:20px}.rh-note{color:var(--rh-muted);font-size:11px;line-height:1.7;margin:0}.rh-eyebrow{color:var(--rh-brand);font-size:10px;font-weight:700;letter-spacing:1.7px;margin-bottom:9px}.rh-lead{font-size:12px;color:var(--rh-muted);margin-top:9px!important}.rh-hero{padding:24px 24px 20px}.rh-workflow{display:flex;align-items:center;gap:12px;margin-top:20px;padding:12px 14px;border-radius:10px;background:var(--rh-soft);border:1px solid var(--rh-line)}.rh-workflow-label{color:var(--rh-muted);font-size:11px;flex-shrink:0}.rh-workflow select{flex:1;min-width:0;max-width:420px;background:var(--rh-surface)}.rh-workflow-hint{margin-left:auto;font-size:10px;color:var(--rh-muted);white-space:nowrap}
 .rh-composer{display:grid;grid-template-columns:minmax(0,1fr) 285px;gap:0;border-top:1px solid var(--rh-line)}.rh-prompt-pane{min-width:0;padding:22px 24px}.rh-section-label{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px;font-size:12px;font-weight:650}.rh-prompt{width:100%;resize:vertical;min-height:270px;padding:16px;border:1px solid var(--rh-line);border-radius:10px;background:var(--rh-surface);color:var(--rh-ink);line-height:1.9;outline:none}.rh-prompt:focus{border-color:var(--rh-brand);box-shadow:0 0 0 3px var(--rh-brand-soft)}.rh-prompt::placeholder{color:var(--rh-muted);opacity:.7}.rh-prompt-meta{display:flex;justify-content:space-between;gap:12px;margin-top:10px}.rh-side{padding:22px 20px;background:var(--rh-soft);border-left:1px solid var(--rh-line);min-width:0}.rh-stack{display:flex;flex-direction:column;gap:15px}.rh-field{display:flex;flex-direction:column;gap:7px;min-width:0}.rh-field-label{font-size:11px;font-weight:600;display:flex;align-items:center;gap:6px}.rh-input{box-sizing:border-box;width:100%;min-width:0;padding:9px 11px;color:var(--rh-ink);background:var(--rh-surface);border:1px solid var(--rh-line);border-radius:8px;transition:border-color .15s}.rh-input:focus{outline:none;border-color:var(--rh-brand)}.rh-input::placeholder{color:var(--rh-muted)}.rh-grid2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.rh-rule{height:1px;background:var(--rh-line);margin:2px 0}.rh-check{display:flex;align-items:center;gap:9px;font-size:11px;cursor:pointer}.rh-check input{width:15px;height:15px;accent-color:var(--rh-brand);margin:0;flex-shrink:0}.rh-fold{border-top:1px solid var(--rh-line);padding-top:14px}.rh-fold summary{cursor:pointer;color:var(--rh-ink);font-weight:600;font-size:12px;list-style:none;display:flex;align-items:center;justify-content:space-between;gap:8px}.rh-fold summary:after{content:'+';font-size:16px;color:var(--rh-muted)}.rh-fold[open] summary:after{content:'−'}.rh-fold-content{padding-top:14px;display:flex;flex-direction:column;gap:14px}.rh-meta-list{display:flex;flex-direction:column;gap:6px;color:var(--rh-muted);font-size:11px}
-.rh-references{border-top:1px solid var(--rh-line);padding:19px 24px 22px}.rh-slots{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin-top:14px}.rh-slot{display:flex;flex-direction:column;gap:10px;min-width:0;padding:13px;border:1px solid var(--rh-line);border-radius:11px;background:var(--rh-soft)}.rh-slot-head{display:flex;align-items:center;justify-content:space-between;gap:8px}.rh-slot-title{font-size:12px;font-weight:650}.rh-slot-tag{font-size:9px;color:var(--rh-muted);border:1px solid var(--rh-line);border-radius:4px;padding:1px 5px}.rh-upload{position:relative;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:7px;height:112px;border:1px dashed var(--rh-line);border-radius:8px;background:var(--rh-surface);color:var(--rh-muted);text-align:center;padding:10px;cursor:pointer;overflow:hidden}.rh-upload:hover{border-color:var(--rh-brand);color:var(--rh-brand);background:var(--rh-brand-soft)}.rh-upload:focus-within{outline:3px solid var(--rh-brand-soft);border-color:var(--rh-brand)}.rh-upload input[type="file"]{position:absolute;inset:0;width:100%;height:100%;opacity:0;cursor:pointer}.rh-upload strong{font-size:11px;color:var(--rh-ink);max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.rh-upload small{font-size:10px}.rh-reference-image{width:100%;height:100%;object-fit:contain;position:absolute;inset:0}.rh-upload[data-selected="true"]{border-style:solid;border-color:var(--rh-brand)}.rh-remove{border:0;background:none;color:var(--rh-muted);font-size:10px;padding:0;cursor:pointer}.rh-filename{display:flex;justify-content:space-between;gap:8px;font-size:10px;color:var(--rh-muted)}
+.rh-references{border-top:1px solid var(--rh-line);padding:19px 24px 22px}.rh-slots{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin-top:14px}.rh-slot{display:flex;flex-direction:column;gap:10px;min-width:0;padding:13px;border:1px solid var(--rh-line);border-radius:11px;background:var(--rh-soft)}.rh-slot-head{display:flex;align-items:center;justify-content:space-between;gap:8px}.rh-slot-title{font-size:12px;font-weight:650}.rh-slot-tag{font-size:9px;color:var(--rh-muted);border:1px solid var(--rh-line);border-radius:4px;padding:1px 5px}.rh-upload{position:relative;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:7px;height:112px;border:1px dashed var(--rh-line);border-radius:8px;background:var(--rh-surface);color:var(--rh-muted);text-align:center;padding:10px;cursor:pointer;overflow:hidden}.rh-upload:hover{border-color:var(--rh-brand);color:var(--rh-brand);background:var(--rh-brand-soft)}.rh-upload:focus-within{outline:3px solid var(--rh-brand-soft);border-color:var(--rh-brand)}.rh-upload input[type="file"]{position:absolute;inset:0;width:100%;height:100%;opacity:0;cursor:pointer}.rh-upload strong{font-size:11px;color:var(--rh-ink);max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.rh-upload small{font-size:10px}.rh-reference-image{width:100%;height:100%;object-fit:contain;position:absolute;inset:0}.rh-upload[data-selected="true"]{border-style:solid;border-color:var(--rh-brand)}.rh-remove{border:0;background:none;color:var(--rh-muted);font-size:10px;padding:0;cursor:pointer}.rh-filename{display:flex;justify-content:space-between;align-items:center;gap:8px;font-size:10px;color:var(--rh-muted)}.rh-filename-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--rh-ink)}
 .rh-btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;padding:8px 12px;border:1px solid var(--rh-line);border-radius:8px;background:var(--rh-surface);color:var(--rh-ink);font-size:11px;line-height:1.5;font-weight:550;white-space:nowrap}.rh-btn:hover:not(:disabled){background:var(--rh-soft);border-color:var(--rh-muted)}.rh-btn-primary{background:var(--rh-brand);color:#fff;border-color:var(--rh-brand);padding:12px 26px;font-size:12px;box-shadow:0 3px 7px #175cd322}.rh-studio[data-theme="dark"] .rh-btn-primary{color:#14243e}.rh-btn-primary:hover:not(:disabled){filter:brightness(.95);background:var(--rh-brand);border-color:var(--rh-brand)}.rh-btn-quiet{border-color:transparent;background:transparent;padding:5px 8px;color:var(--rh-muted)}.rh-btn-link{border:0;background:transparent;color:var(--rh-brand);padding:0;font-size:11px;cursor:pointer}.rh-submitbar{position:sticky;bottom:0;z-index:4;display:flex;align-items:center;justify-content:space-between;gap:14px;padding:15px 24px;background:var(--rh-surface);border:1px solid var(--rh-line);border-radius:12px;box-shadow:0 -3px 18px #10182807;margin-top:16px}.rh-submit-summary{font-size:11px;font-weight:600}.rh-submit-sub{color:var(--rh-muted);font-size:10px;margin-top:2px}.rh-notice{margin-top:12px;padding:12px 14px;border-radius:9px;background:var(--rh-brand-soft);font-size:11px;color:var(--rh-brand)}.rh-error{white-space:pre-wrap;color:var(--rh-danger);background:color-mix(in srgb,var(--rh-danger) 7%,var(--rh-surface));border:1px solid color-mix(in srgb,var(--rh-danger) 22%,var(--rh-line));border-radius:8px;padding:10px 12px;font-size:11px;margin:10px 0}.rh-warning{padding:16px;border:1px solid color-mix(in srgb,var(--rh-warning) 35%,var(--rh-line));background:var(--rh-soft);border-radius:10px;margin-top:14px;display:flex;flex-direction:column;gap:10px}
 .rh-studio .rh-btn{flex:0 0 auto;width:auto;max-width:100%}.rh-studio .rh-job-info-compact>.rh-row{justify-content:flex-start}.rh-studio .rh-job-info-compact>.rh-row>.rh-btn{flex:0 0 auto!important;width:auto!important}.rh-results{margin-top:24px}.rh-results-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:13px}.rh-results-title{display:flex;align-items:center;gap:8px}.rh-filters{display:flex;gap:5px;flex-wrap:wrap;margin-bottom:15px}.rh-filter{border:1px solid transparent;background:transparent;color:var(--rh-muted);padding:5px 10px;border-radius:6px;font-size:11px}.rh-filter[aria-pressed="true"]{background:var(--rh-surface);border-color:var(--rh-line);color:var(--rh-ink);box-shadow:0 1px 2px #10182806}.rh-jobs{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:15px}.rh-job{overflow:hidden}.rh-job-preview{position:relative;background:var(--rh-soft);border-bottom:1px solid var(--rh-line);min-height:150px;display:flex;align-items:center;justify-content:center;padding:0}.rh-job-media{display:block;width:100%;max-height:280px;object-fit:contain;background:var(--rh-soft)}.rh-job-audio{padding:24px;width:100%}.rh-job-wait{padding:28px;text-align:center;display:flex;flex-direction:column;align-items:center;gap:9px;color:var(--rh-muted);font-size:11px}.rh-job-wait svg{color:var(--rh-brand)}.rh-job-info{padding:14px 15px}.rh-job-title{font-size:12px;font-weight:650;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.rh-job-meta{display:flex;justify-content:space-between;gap:10px;color:var(--rh-muted);font-size:10px;margin-top:8px}.rh-status{display:inline-flex;align-items:center;gap:5px;color:var(--rh-muted);font-size:10px}.rh-status[data-state="ready"]{color:var(--rh-success)}.rh-status[data-state="running"],.rh-status[data-state="queued"],.rh-status[data-state="downloading"]{color:var(--rh-brand)}.rh-status[data-state="failed"],.rh-status[data-state="download_failed"],.rh-status[data-state="submit_unknown"]{color:var(--rh-danger)}.rh-job-details{margin-top:10px;border-top:1px solid var(--rh-line);padding-top:9px}.rh-job-details summary{font-size:10px;color:var(--rh-muted);cursor:pointer}.rh-job-details code{font-size:9px;display:block;overflow-wrap:anywhere;margin:7px 0;color:var(--rh-muted)}.rh-progress{height:3px;background:var(--rh-line);width:100%;border-radius:4px;overflow:hidden;margin-top:3px}.rh-progress span{display:block;height:100%;background:var(--rh-brand);min-width:6px}.rh-empty{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;padding:45px 20px;border:1px dashed var(--rh-line);border-radius:12px;color:var(--rh-muted);text-align:center;background:var(--rh-surface)}.rh-empty strong{color:var(--rh-ink);font-size:12px}.rh-empty svg{opacity:.6}.rh-empty small{font-size:11px;max-width:280px}
 
@@ -231,8 +232,46 @@ window.__ModuleLoader__.load({
 }
 .rh-pregen{margin-top:24px}.rh-pregen-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:12px}.rh-pregen-entry{overflow:hidden;border:1px solid var(--rh-line);border-radius:11px;background:var(--rh-surface);display:flex;flex-direction:column;min-width:0}.rh-pregen-preview{background:var(--rh-soft);border-bottom:1px solid var(--rh-line);min-height:130px;display:flex;align-items:center;justify-content:center;position:relative}.rh-pregen-video{display:block;width:100%;max-height:240px;object-fit:contain;background:#000}.rh-pregen-info{padding:12px;display:flex;flex-direction:column;gap:8px;min-width:0}.rh-pregen-meta{display:flex;justify-content:space-between;gap:8px;color:var(--rh-muted);font-size:10px}.rh-pregen-desc{margin:0;font-size:12px;line-height:1.55;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}.rh-pregen-actions{display:flex;gap:6px;flex-wrap:wrap;margin-top:auto}.rh-pregen-settings{display:grid;grid-template-columns:repeat(3,minmax(120px,1fr)) auto auto;gap:10px;align-items:end;padding-bottom:14px;border-bottom:1px solid var(--rh-line)}.rh-pregen-empty{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;padding:26px 18px;margin-top:12px;border:1px dashed var(--rh-line);border-radius:10px;color:var(--rh-muted);text-align:center}.rh-pregen-empty strong{color:var(--rh-ink);font-size:12px}.rh-pregen-empty small{font-size:11px;max-width:340px}
 .rh-drawer-layer{position:absolute;inset:0;z-index:20;display:flex;justify-content:flex-end;min-height:0}.rh-backdrop{position:absolute;inset:0;border:0;background:#10182844;cursor:default!important}.rh-drawer{position:sticky;top:0;z-index:1;width:min(410px,100%);background:var(--rh-surface);border-left:1px solid var(--rh-line);box-shadow:-12px 0 40px #10182814;align-self:flex-start;min-width:0;height:100svh;max-height:100svh;overflow-y:auto}.rh-drawer-head{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:20px;border-bottom:1px solid var(--rh-line)}.rh-drawer-content{padding:22px;display:flex;flex-direction:column;gap:24px}.rh-setting-group{display:flex;flex-direction:column;gap:14px}.rh-setting-heading{font-size:12px;font-weight:700;display:flex;align-items:center;gap:8px}.rh-toggle-row{display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:12px;cursor:pointer}.rh-switch{position:relative;display:inline-flex;flex-shrink:0;width:34px;height:20px}.rh-switch input{position:absolute;inset:0;opacity:0;margin:0;width:100%;height:100%;z-index:1;cursor:pointer}.rh-switch-track{width:100%;height:100%;border-radius:20px;background:var(--rh-line);transition:background .15s}.rh-switch-track:after{content:'';position:absolute;width:14px;height:14px;border-radius:50%;top:3px;left:3px;background:#fff;box-shadow:0 1px 3px #0002;transition:transform .15s}.rh-switch input:checked+.rh-switch-track{background:var(--rh-brand)}.rh-switch input:checked+.rh-switch-track:after{transform:translateX(14px)}.rh-switch input:focus-visible+.rh-switch-track{outline:3px solid var(--rh-brand-soft);outline-offset:3px}.rh-switch input:disabled+.rh-switch-track{opacity:.5}.rh-settings-status{padding:10px 12px;border:1px solid var(--rh-line);border-radius:9px;background:var(--rh-soft);font-size:11px;line-height:1.65;color:var(--rh-muted)}.rh-settings-status[data-state="saved"]{color:var(--rh-success);border-color:color-mix(in srgb,var(--rh-success) 28%,var(--rh-line))}.rh-settings-status[data-state="dirty"]{color:var(--rh-warning);border-color:color-mix(in srgb,var(--rh-warning) 30%,var(--rh-line))}.rh-settings-status[data-state="saving"]{color:var(--rh-brand)}.rh-settings-status[data-state="error"],.rh-settings-status[data-state="conflict"]{color:var(--rh-danger);border-color:color-mix(in srgb,var(--rh-danger) 28%,var(--rh-line))}.rh-settings-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.rh-model-field{display:flex;flex-direction:column;gap:8px;padding:10px;border:1px solid var(--rh-line);border-radius:9px;background:var(--rh-soft);min-width:0}.rh-model-field-head{display:flex;align-items:center;justify-content:space-between;gap:8px;min-width:0}.rh-model-field-title{font-size:11px;font-weight:650;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.rh-skeleton{height:13px;border-radius:5px;background:var(--rh-line);opacity:.5;margin:12px 0}
-@container (max-width:780px){.rh-composer{grid-template-columns:1fr}.rh-side{border-left:0;border-top:1px solid var(--rh-line)}.rh-side>.rh-stack{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}.rh-side .rh-fold,.rh-side .rh-rule,.rh-side .rh-section-label{grid-column:1/-1}.rh-prompt{min-height:220px}.rh-workflow-hint{display:none}.rh-jobs{grid-template-columns:repeat(auto-fill,minmax(300px,1fr))}}
-@container (max-width:480px){.rh-topbar{padding:14px}.rh-body{padding:16px 12px}.rh-hero,.rh-prompt-pane{padding:18px 16px}.rh-references{padding:16px}.rh-side{padding:18px 16px}.rh-brand-name{font-size:13px}.rh-brand-sub,.rh-context,.rh-top-actions .rh-pill,.rh-prompt-meta .rh-note:last-child{display:none}.rh-nav{margin-bottom:15px}.rh-workflow{gap:8px;padding:10px;margin-top:16px}.rh-workflow select{padding:8px}.rh-studio h2{font-size:20px}.rh-side>.rh-stack{display:flex}.rh-slots{grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.rh-slot{padding:9px}.rh-upload{height:105px}.rh-slot .rh-note{font-size:10px}.rh-submitbar{padding:12px;gap:10px}.rh-submit-sub{display:none}.rh-btn-primary{padding:11px 17px}.rh-submit-summary{font-size:10px}.rh-jobs{grid-template-columns:1fr}.rh-results-head{gap:6px}.rh-drawer-content{padding:18px}.rh-top-actions{gap:4px}.rh-topbar .rh-btn{padding:7px 9px}}
+.rh-slot-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:-2px}.rh-slot-actions .rh-btn{font-size:10px}
+.rh-library-dialog{position:fixed;inset:0;width:100%;max-width:none;height:100%;max-height:none;margin:0;padding:24px;border:0;background:transparent;display:grid;place-items:center;overflow:auto;box-sizing:border-box}
+.rh-library-dialog:not([open]){display:none}
+.rh-library-dialog::backdrop{background:#03070c66;backdrop-filter:blur(4px)}
+.rh-library{display:flex;flex-direction:column;width:min(760px,100%);max-height:calc(100vh - 48px);overflow:hidden;border:1px solid var(--rh-line);border-radius:16px;background:var(--rh-surface);color:var(--rh-ink);box-shadow:0 30px 90px #10182840,0 2px 8px #10182814;animation:rh-library-in .22s cubic-bezier(.22,1,.36,1)}
+@keyframes rh-library-in{from{opacity:0;transform:translateY(8px) scale(.985)}to{opacity:1;transform:none}}
+.rh-library-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;padding:18px 20px 14px;border-bottom:1px solid var(--rh-line)}
+.rh-library-head-copy{min-width:0}
+.rh-library-kicker{color:var(--rh-brand);font-size:8px;font-weight:700;letter-spacing:1.5px}
+.rh-library .rh-library-title{margin:4px 0 0;font-size:16px;line-height:1.4;letter-spacing:-.2px;font-weight:650}
+.rh-library .rh-library-sub{margin-top:4px;color:var(--rh-muted);font-size:10.5px;line-height:1.6}
+.rh-library-close{flex:none;display:grid;place-items:center;width:30px;height:30px;padding:0;border:1px solid var(--rh-line);border-radius:8px;background:var(--rh-soft);color:var(--rh-muted)}
+.rh-library-close:hover{color:var(--rh-ink);border-color:var(--rh-muted)}
+.rh-library-close .icon{width:13px;height:13px}
+.rh-library-toolbar{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 20px;border-bottom:1px solid var(--rh-line);background:var(--rh-soft);flex-wrap:wrap}
+.rh-library-body{padding:14px 20px 20px;overflow:auto;min-height:120px}
+.rh-library-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(118px,1fr));gap:10px}
+.rh-library-item{position:relative;display:flex;flex-direction:column;align-items:stretch;gap:5px;padding:0 0 7px;border:1px solid var(--rh-line);border-radius:10px;background:var(--rh-surface);text-align:left;overflow:hidden;color:var(--rh-ink);min-width:0}
+.rh-library-item:hover:not(:disabled){border-color:var(--rh-brand);box-shadow:0 0 0 2px var(--rh-brand-soft)}
+.rh-library-item:disabled{cursor:not-allowed;opacity:.65}
+.rh-library-thumb{position:relative;display:grid;place-items:center;aspect-ratio:1;background:var(--rh-soft);overflow:hidden;color:var(--rh-muted)}
+.rh-library-thumb img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;background:var(--rh-soft)}
+.rh-library-name{display:block;padding:0 7px;font-size:10.5px;font-weight:600;line-height:1.5;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.rh-library-size{display:block;padding:0 7px;color:var(--rh-muted);font-size:9px;line-height:1.5}
+.rh-library-list{display:flex;flex-direction:column;gap:7px}
+.rh-library-row{display:flex;align-items:center;gap:10px;padding:9px 11px;border:1px solid var(--rh-line);border-radius:9px;background:var(--rh-surface);text-align:left;color:var(--rh-ink);min-width:0}
+.rh-library-row:hover:not(:disabled){border-color:var(--rh-brand);background:var(--rh-brand-soft)}
+.rh-library-row:disabled{cursor:not-allowed;opacity:.65}
+.rh-library-row-icon{display:grid;place-items:center;flex:none;width:30px;height:30px;border-radius:8px;background:var(--rh-soft);color:var(--rh-brand)}
+.rh-library-row-copy{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}
+.rh-library-row-copy strong{font-size:11px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.rh-library-row-copy small{color:var(--rh-muted);font-size:9.5px}
+.rh-library-row-action{flex:none;color:var(--rh-brand);font-size:10px;font-weight:600}
+.rh-library-empty{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;padding:48px 18px;text-align:center;color:var(--rh-muted);font-size:11px}
+.rh-library-empty strong{color:var(--rh-ink);font-size:12px}
+.rh-library-empty svg{opacity:.55}
+.rh-library-skeleton{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+.rh-library-skeleton .rh-skeleton{height:120px;margin:0}
+@media (max-width:560px){.rh-library-dialog{padding:10px}.rh-library{max-height:calc(100vh - 20px);border-radius:12px}.rh-library-head,.rh-library-toolbar,.rh-library-body{padding-left:14px;padding-right:14px}.rh-library-grid{grid-template-columns:repeat(auto-fill,minmax(96px,1fr))}}
+@container (max-width:780px){.rh-composer{grid-template-columns:1fr}.rh-side{border-left:0;border-top:1px solid var(--rh-line)}.rh-side>.rh-stack{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}.rh-side .rh-fold,.rh-side .rh-rule,.rh-side .rh-section-label{grid-column:1/-1}.rh-prompt{min-height:220px}.rh-workflow-hint{display:none}.rh-jobs{grid-template-columns:repeat(auto-fill,minmax(300px,1fr))}}@container (max-width:480px){.rh-topbar{padding:14px}.rh-body{padding:16px 12px}.rh-hero,.rh-prompt-pane{padding:18px 16px}.rh-references{padding:16px}.rh-side{padding:18px 16px}.rh-brand-name{font-size:13px}.rh-brand-sub,.rh-context,.rh-top-actions .rh-pill,.rh-prompt-meta .rh-note:last-child{display:none}.rh-nav{margin-bottom:15px}.rh-workflow{gap:8px;padding:10px;margin-top:16px}.rh-workflow select{padding:8px}.rh-studio h2{font-size:20px}.rh-side>.rh-stack{display:flex}.rh-slots{grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.rh-slot{padding:9px}.rh-upload{height:105px}.rh-slot .rh-note{font-size:10px}.rh-submitbar{padding:12px;gap:10px}.rh-submit-sub{display:none}.rh-btn-primary{padding:11px 17px}.rh-submit-summary{font-size:10px}.rh-jobs{grid-template-columns:1fr}.rh-results-head{gap:6px}.rh-drawer-content{padding:18px}.rh-top-actions{gap:4px}.rh-topbar .rh-btn{padding:7px 9px}}
 @media(prefers-reduced-motion:reduce){.rh-studio *{transition:none!important;animation:none!important}}
 @container (max-width:780px){.rh-pregen-settings{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @container (max-width:480px){.rh-pregen-grid{grid-template-columns:1fr}.rh-pregen-settings{grid-template-columns:1fr}}
@@ -277,6 +316,12 @@ window.__ModuleLoader__.load({
       if (!Number.isFinite(value) || value < 0) return ''
       const total = Math.round(value)
       return Math.floor(total / 60) + ':' + String(total % 60).padStart(2, '0')
+    }
+    function formatBytes(value) {
+      if (!Number.isFinite(value) || value < 0) return ''
+      if (value < 1024) return Math.round(value) + ' B'
+      if (value < MB) return (value / 1024).toFixed(value < 10 * 1024 ? 1 : 0) + ' KB'
+      return (value / MB).toFixed(value < 10 * MB ? 1 : 0) + ' MB'
     }
     function formatJobTime(job) {
       const time = new Date(job?.createdAt)
@@ -563,6 +608,174 @@ window.__ModuleLoader__.load({
       return h('img', { src, alt: '客户端默认参考图片', loading: 'lazy', style: { width: '100%', height: 112, objectFit: 'contain', borderRadius: 8 }, onError: () => setFailed(true) })
     }
 
+    const LIBRARY_LABEL = { image: '常用图库', audio: '常用音频库' }
+    function libraryFileURL(kind, id) {
+      return LIBRARY + '?kind=' + encodeURIComponent(kind) + '&id=' + encodeURIComponent(id)
+    }
+    function libraryName(name, fallback) {
+      const value = typeof name === 'string' ? name.replace(/[\\/\u0000-\u001f\u007f]/g, '_').trim() : ''
+      return (value || fallback || '素材').slice(0, 120)
+    }
+
+    /**
+     * 客户端素材库选择器。列表只读，选中时由宿主代理取回原文件，再走与本地文件完全相同的
+     * 参考素材校验/上传路径——图库里的图不会因为“从图库选”而绕过 10MB 或 MIME 限制。
+     */
+    function LibraryPicker({ kind, slotLabel, onPick, onClose }) {
+      const dialogRef = useRef(null)
+      const closeRef = useRef(null)
+      const abortRef = useRef(null)
+      const aliveRef = useRef(true)
+      const [items, setItems] = useState([])
+      const [maxBytes, setMaxBytes] = useState(10 * MB)
+      const [loading, setLoading] = useState(true)
+      const [error, setError] = useState('')
+      const [busyId, setBusyId] = useState('')
+      const [reload, setReload] = useState(0)
+      const label = LIBRARY_LABEL[kind] || '素材库'
+
+      useEffect(() => {
+        const dialog = dialogRef.current
+        const previous = document.activeElement
+        if (dialog) {
+          if (typeof dialog.showModal === 'function') {
+            try { if (!dialog.open) dialog.showModal() } catch { dialog.setAttribute('open', '') }
+          } else dialog.setAttribute('open', '')
+          if (!dialog.open) dialog.setAttribute('open', '')
+        }
+        closeRef.current?.focus?.()
+        return () => {
+          aliveRef.current = false
+          abortRef.current?.abort?.()
+          if (dialog) {
+            try {
+              if (typeof dialog.close === 'function' && dialog.open) dialog.close()
+              else dialog.removeAttribute('open')
+            } catch { dialog.removeAttribute('open') }
+            if (dialog.open) dialog.removeAttribute('open')
+          }
+          if (previous && previous.isConnected !== false) previous.focus?.()
+        }
+      }, [])
+
+      useEffect(() => {
+        const controller = new AbortController()
+        let active = true
+        setLoading(true)
+        setError('')
+        fetch(LIBRARY + '?kind=' + encodeURIComponent(kind), {
+          credentials: 'same-origin', cache: 'no-store', signal: controller.signal,
+        }).then(async response => {
+          let data = null
+          try { data = await response.json() } catch { data = null }
+          if (!response.ok) throw new Error(data?.error ? message(data.error) : 'HTTP ' + response.status + '：读取素材库失败')
+          if (!Array.isArray(data?.items)) throw new Error('素材库列表格式无效')
+          if (!active) return
+          const limit = Number(data.maxBytes)
+          setMaxBytes(Number.isFinite(limit) && limit > 0 ? limit : 10 * MB)
+          setItems(data.items.filter(item => item && typeof item.id === 'string'))
+        }).catch(failure => {
+          if (active && failure.name !== 'AbortError') setError(message(failure))
+        }).finally(() => { if (active) setLoading(false) })
+        return () => { active = false; controller.abort() }
+      }, [kind, reload])
+
+      async function choose(item) {
+        if (busyId) return
+        if (Number.isFinite(item.size) && item.size > maxBytes) {
+          setError('「' + item.name + '」' + formatBytes(item.size) + '，超过单文件 ' + formatBytes(maxBytes) + ' 上限；请先在客户端换一张/一段。')
+          return
+        }
+        const controller = new AbortController()
+        abortRef.current = controller
+        setBusyId(item.id)
+        setError('')
+        try {
+          const response = await fetch(libraryFileURL(kind, item.id), { credentials: 'same-origin', signal: controller.signal })
+          if (!response.ok) {
+            let detail = ''
+            try { const data = await response.json(); detail = data?.error ? message(data.error) : '' } catch { detail = '' }
+            throw new Error('读取「' + item.name + '」失败（HTTP ' + response.status + '）' + (detail ? '：' + detail : ''))
+          }
+          const blob = await response.blob()
+          if (!blob.size) throw new Error('「' + item.name + '」内容为空。')
+          if (blob.size > maxBytes) throw new Error('「' + item.name + '」' + formatBytes(blob.size) + '，超过单文件 ' + formatBytes(maxBytes) + ' 上限。')
+          const mimeType = (blob.type || item.mimeType || '').split(';')[0].trim().toLowerCase()
+          if (!mimeType.startsWith(kind + '/')) throw new Error('「' + item.name + '」类型与槽位不匹配。')
+          const file = new File([blob], libraryName(item.name, 'library-' + item.id), { type: mimeType, lastModified: Date.now() })
+          const failure = await onPick(file)
+          if (failure) { setError(failure); return }
+          onClose()
+        } catch (failure) {
+          if (failure.name !== 'AbortError' && aliveRef.current) setError(message(failure))
+        } finally {
+          abortRef.current = null
+          if (aliveRef.current) setBusyId('')
+        }
+      }
+
+      const sizeText = formatBytes(maxBytes) || '10 MB'
+      let body
+      if (loading) {
+        body = h('div', { className: 'rh-library-skeleton' },
+          h('div', { className: 'rh-skeleton' }), h('div', { className: 'rh-skeleton' }), h('div', { className: 'rh-skeleton' }))
+      } else if (!items.length) {
+        body = error ? null : h('div', { className: 'rh-library-empty' },
+          icon(kind === 'audio' ? 'audio' : 'image', 24),
+          h('strong', null, label + '还是空的'),
+          h('span', null, '先在 6888 单镜生成页把' + (kind === 'audio' ? '音频' : '图片') + '存进' + label + '，再回来挑。'))
+      } else if (kind === 'image') {
+        body = h('div', { className: 'rh-library-grid' }, items.map(item => {
+          const tooBig = Number.isFinite(item.size) && item.size > maxBytes
+          const busy = busyId === item.id
+          return h('button', { key: item.id, type: 'button', className: 'rh-library-item', disabled: tooBig || Boolean(busyId),
+            title: tooBig ? '超过单文件 ' + sizeText + ' 上限' : item.name, onClick: () => choose(item) },
+          h('span', { className: 'rh-library-thumb' }, icon('image', 18),
+            tooBig ? null : h('img', { src: libraryFileURL(kind, item.id), alt: item.name, loading: 'lazy',
+              onError: event => { event.currentTarget.style.display = 'none' } })),
+          h('span', { className: 'rh-library-name' }, item.name),
+          h('span', { className: 'rh-library-size' }, busy ? '读取中…'
+            : tooBig ? '超过 ' + sizeText : item.size ? formatBytes(item.size) : '未知大小'))
+        }))
+      } else {
+        body = h('div', { className: 'rh-library-list' }, items.map(item => {
+          const tooBig = Number.isFinite(item.size) && item.size > maxBytes
+          const busy = busyId === item.id
+          return h('button', { key: item.id, type: 'button', className: 'rh-library-row', disabled: tooBig || Boolean(busyId),
+            title: tooBig ? '超过单文件 ' + sizeText + ' 上限' : item.name, onClick: () => choose(item) },
+          h('span', { className: 'rh-library-row-icon' }, icon('audio', 16)),
+          h('span', { className: 'rh-library-row-copy' }, h('strong', null, item.name),
+            h('small', null, busy ? '读取中…' : tooBig ? '超过 ' + sizeText + ' 上限'
+              : item.size ? formatBytes(item.size) : '未知大小')),
+          h('span', { className: 'rh-library-row-action' }, busy ? '…' : tooBig ? '不可用' : '使用'))
+        }))
+      }
+
+      return h('dialog', {
+        ref: dialogRef, className: 'rh-library-dialog', 'aria-modal': 'true', 'aria-labelledby': 'rh-library-title',
+        onCancel: event => { event.preventDefault(); onClose() },
+        onClick: event => { if (event.target === event.currentTarget) onClose() },
+      },
+      h('section', { className: 'rh-library' },
+        h('header', { className: 'rh-library-head' },
+          h('div', { className: 'rh-library-head-copy' },
+            h('div', { className: 'rh-library-kicker' }, kind === 'audio' ? 'AUDIO LIBRARY' : 'CLIENT GALLERY'),
+            h('h2', { id: 'rh-library-title', className: 'rh-library-title' }, '从' + label + '选'),
+            h('p', { className: 'rh-library-sub' }, '选中后放进「' + slotLabel + '」；素材由宿主从客户端库取回，再按普通参考素材保存。')),
+          h('button', { ref: closeRef, type: 'button', className: 'rh-library-close', 'aria-label': '关闭素材库', onClick: onClose },
+            icon('close', 14))),
+        h('div', { className: 'rh-library-toolbar' },
+          h('span', { className: 'rh-note' }, loading ? '正在读取…'
+            : items.length ? '共 ' + items.length + ' 项 · 单文件 ≤ ' + sizeText : '没有可用素材'),
+          h('div', { className: 'rh-row' },
+            h('button', { type: 'button', className: 'rh-btn rh-btn-quiet', disabled: loading,
+              onClick: () => setReload(value => value + 1) }, icon('refresh', 12), '刷新'),
+            h('button', { type: 'button', className: 'rh-btn rh-btn-quiet', onClick: onClose }, '关闭'))),
+        h('div', { className: 'rh-library-body' },
+          error ? h('div', { role: 'alert', className: 'rh-error' }, error) : null,
+          body)))
+    }
+
     function Panel({ gameId, visible }) {
       const contextKey = gameId == null ? '__unbound__' : String(gameId)
       const [view, setView] = useState('create')
@@ -572,6 +785,7 @@ window.__ModuleLoader__.load({
       const rootRef = useRef(null)
       const settingsButtonRef = useRef(null)
       const drawerRef = useRef(null)
+      const libraryPickerRef = useRef(null)
       const [summary, setSummary] = useState(null)
       const [baseURL, setBaseURL] = useState(DEFAULT_BASE)
       const [apiKey, setApiKey] = useState('')
@@ -600,6 +814,8 @@ window.__ModuleLoader__.load({
       const [custom, setCustom] = useState({})
       const [references, setReferences] = useState({})
       const [referenceErrors, setReferenceErrors] = useState({})
+      const [libraryPicker, setLibraryPicker] = useState(null)
+      libraryPickerRef.current = libraryPicker
       const [bindToTurn, setBindToTurn] = useState(true)
       const [alwaysSendPrompt, setAlwaysSendPrompt] = useState(true)
       const [videosPerTurn, setVideosPerTurn] = useState(3)
@@ -692,7 +908,11 @@ window.__ModuleLoader__.load({
         const previous = document.activeElement
         const frame = requestAnimationFrame(() => drawerRef.current?.querySelector('button, input')?.focus())
         function keyboard(event) {
-          if (event.key === 'Escape') { setSettingsOpen(false); return }
+          if (event.key === 'Escape') {
+            // 素材库是叠在设置抽屉上的 <dialog>：Escape 只关它，别把底下的抽屉一起关掉。
+            if (libraryPickerRef.current) return
+            setSettingsOpen(false); return
+          }
           if (event.key !== 'Tab') return
           const nodes = [...(drawerRef.current?.querySelectorAll('button:not(:disabled),input:not(:disabled),a[href],summary') || [])]
           const first = nodes[0], last = nodes[nodes.length - 1]
@@ -1408,8 +1628,8 @@ window.__ModuleLoader__.load({
       function updateReference(nodeId, patch) {
         setReferences(previous => ({ ...previous, [nodeId]: { ...previous[nodeId], ...patch } }))
       }
-      function chooseFile(slot, event, inSettings = false) {
-        const file = event.target.files?.[0]
+      // 本地文件与客户端素材库共用这一段：两条入口必须过同一套大小、MIME 与总大小校验。
+      function applyReferenceFile(slot, file, inSettings = false) {
         let error = ''
         if (file) {
           if (file.size > 10 * MB) error = '单个文件不能超过 10MB。'
@@ -1418,15 +1638,24 @@ window.__ModuleLoader__.load({
             sum + (key === String(slot.nodeId) ? 0 : entry.file?.size || 0), 0)
           if (!error && others + file.size > 25 * MB) error = '参考文件总大小不能超过 25MB。'
         }
-        if (error) event.target.value = ''
         updateReference(slot.nodeId, { file: error ? null : file || null })
         setReferenceErrors(previous => ({ ...previous, [slot.nodeId]: error }))
         if (file && !error) setClearedDefaults(previous => ({ ...previous, [slot.nodeId]: false }))
-        // 设置抽屉里的素材是客户端默认素材；主面板上传只覆盖本次生成，不写回客户端。
+        // 设置抽屉里的素材是客户端默认素材；主面板上传或从图库选的只覆盖本次生成，不写回客户端。
         if (inSettings) {
           perShotReferenceSlots.current.delete(String(slot.nodeId))
           markSettings('references')
         } else perShotReferenceSlots.current.add(String(slot.nodeId))
+        return error
+      }
+      function chooseFile(slot, event, inSettings = false) {
+        const file = event.target.files?.[0]
+        const error = applyReferenceFile(slot, file || null, inSettings)
+        if (error) event.target.value = ''
+      }
+      function openLibrary(slot, inSettings) {
+        setLibraryPicker({ nodeId: String(slot.nodeId), kind: slot.kind,
+          label: slot.label || slot.nodeId, inSettings })
       }
 
       async function makeInput(signal) {
@@ -1699,7 +1928,15 @@ window.__ModuleLoader__.load({
               'aria-label': (inSettings ? '设置里上传' : '上传') + label, disabled: formDisabled,
               onChange: event => chooseFile(slot, event, inSettings) })) : readonly ? note('与客户端共用素材 · 在客户端修改') :
             !gatewayEnabled ? note('先在网关启用这个槽位，才能保存默认素材。') : note('暂不支持此素材类型'),
-          entry.file ? h('div', { className: 'rh-filename' }, h('span', null, (entry.file.size / MB).toFixed(2) + ' MB'),
+          supported ? h('div', { className: 'rh-slot-actions' },
+            h('button', { type: 'button', className: 'rh-btn rh-btn-link', disabled: formDisabled,
+              title: '从客户端' + (slot.kind === 'audio' ? '常用音频库' : '常用图库') + '选择；由宿主代取，不用手动找文件',
+              onClick: () => openLibrary(slot, inSettings) },
+            icon(slot.kind === 'audio' ? 'audio' : 'image', 12),
+            slot.kind === 'audio' ? '从音频库选' : '从图库选')) : null,
+          entry.file ? h('div', { className: 'rh-filename' },
+            h('span', { className: 'rh-filename-name', title: entry.file.name }, entry.file.name),
+            h('span', null, (entry.file.size / MB).toFixed(2) + ' MB'),
             h('button', { type: 'button', className: 'rh-remove', disabled: formDisabled,
               onClick: () => {
                 updateReference(slot.nodeId, { file: null })
@@ -2270,7 +2507,7 @@ window.__ModuleLoader__.load({
                   h('h3', null, group.title + ' · ' + group.alias), h('div', { className: 'rh-slots' }, group.referenceSlots.map(slot => renderReference(slot, group))))) :
                 workflow?.referenceSlots.length ? h('div', { className: 'rh-slots' }, workflow.referenceSlots.map(slot => renderReference(slot))) :
                   h('div', { style: { paddingTop: 13 } }, note(workflow ? '此工作流无需上传参考素材。' : '连接工作流后显示参考素材槽位。')),
-                h('div', { style: { marginTop: 12 } }, note('槽位、默认素材、备注和随机池与客户端同步。主面板上传的素材只覆盖本次生成；要改客户端默认素材，请在右上角「设置」里上传（自动同步）。单文件 ≤ 10MB，请求 ≤ 25MB。')))),
+                h('div', { style: { marginTop: 12 } }, note('槽位、默认素材、备注和随机池与客户端同步。主面板上传或从图库选的素材只覆盖本次生成；要改客户端默认素材，请在右上角「设置」里上传或从图库选（自动同步）。单文件 ≤ 10MB，请求 ≤ 25MB。')))),
             h('div', { className: 'rh-submitbar' },
               h('div', null, h('div', { className: 'rh-submit-summary' }, model + ' · ' + (ratio || '默认画幅') + (duration || durationDefault ? ' · ' + (duration || durationDefault) + 's' : '')),
                 h('div', { className: 'rh-submit-sub' }, activeCount ? activeCount + ' 个任务在后台运行' : '参数确认后提交，按实际工作流计费')),
@@ -2360,6 +2597,17 @@ window.__ModuleLoader__.load({
                 configNotice ? h('div', { className: 'rh-notice', role: 'status' }, configNotice) : null),
               note('写在客户端里的设置（分辨率、片长、自定义参数、模型字段、种子、参考素材）与 6888 管理页「单镜生成」是同一份；这里的改动会立即同步，生成也永远以这份为准。')))) : null,
         videoNotices.length ? h('div', { className: 'rh-video-toasts' + (view === 'create' ? ' rh-video-toasts-raised' : ''), 'aria-live': 'polite', 'aria-label': '视频生成完成' }, videoNotices.map(renderVideoNotice)) : null,
+        libraryPicker ? h(LibraryPicker, {
+          key: libraryPicker.kind + ':' + libraryPicker.nodeId,
+          kind: libraryPicker.kind,
+          slotLabel: libraryPicker.label,
+          onClose: () => setLibraryPicker(null),
+          onPick: file => {
+            const slot = (workflow?.referenceSlots || []).find(item => String(item.nodeId) === libraryPicker.nodeId)
+            if (!slot) return '当前工作流的参考槽已变化，请关闭素材库后重新打开。'
+            return applyReferenceFile(slot, file, libraryPicker.inSettings)
+          },
+        }) : null,
         renderPlayer())
     }
 

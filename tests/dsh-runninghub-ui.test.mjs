@@ -216,6 +216,19 @@ test('RunningHub 重设计界面：jsdom + React DOM 隔离交互', {
     const body = options.body ? JSON.parse(options.body) : undefined
     const target = new URL(url, 'http://localhost')
     calls.push({ url: target.pathname, query: target.search, method, body, credentials: options.credentials, cache: options.cache, headers: options.headers ? { ...options.headers } : undefined })
+    if (target.pathname === '/api/dsh-runninghub/library') {
+      const kind = target.searchParams.get('kind')
+      const id = target.searchParams.get('id')
+      if (method !== 'GET' || !['image', 'audio'].includes(kind)) {
+        unexpectedRequests.push({ url: String(url), method })
+        throw new Error('禁止的素材库请求：' + url)
+      }
+      if (!id) return response({ kind, items: kind === 'image' ? libraryImages : libraryAudioItems, maxBytes: 10 * 1024 * 1024 })
+      const item = (kind === 'image' ? libraryImages : libraryAudioItems).find(entry => entry.id === id)
+      if (!item) return { ok: false, status: 404, json: async () => ({ error: '素材库条目不存在' }) }
+      const bytes = new Uint8Array(kind === 'image' ? imageBytes : audioBytes)
+      return { ok: true, status: 200, blob: async () => new window.Blob([bytes], { type: item.mimeType }) }
+    }
     if (target.pathname !== '/api/dsh-runninghub' || !['GET', 'POST'].includes(method)) {
       unexpectedRequests.push({ url: String(url), method })
       throw new Error('禁止访问真实网络：' + url)
@@ -422,6 +435,16 @@ test('RunningHub 重设计界面：jsdom + React DOM 隔离交互', {
   const jobStatuses = () => [...container.querySelectorAll('.rh-job .rh-status')].map(node => node.dataset.state)
   const imageBytes = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=', 'base64')
   const audioBytes = Buffer.from([0xff, 0xfb, 0x10, 0, 1, 2])
+  const libraryImages = [
+    { id: '00000000-0000-4000-8000-000000000201', name: '图库人物设定.png', mimeType: 'image/png',
+      size: imageBytes.length, createdAt: '2026-10-16T09:00:00.000Z' },
+    { id: '00000000-0000-4000-8000-000000000202', name: '图库超限大图.png', mimeType: 'image/png',
+      size: 10 * 1024 * 1024 + 1, createdAt: '2026-10-16T09:01:00.000Z' },
+  ]
+  const libraryAudioItems = [
+    { id: '00000000-0000-4000-8000-000000000203', name: '图库音频.mp3', mimeType: 'audio/mpeg',
+      size: audioBytes.length, createdAt: '2026-10-16T09:02:00.000Z' },
+  ]
   const imageFile = () => new window.File([imageBytes], 'fixture.png', { type: 'image/png' })
   const audioFile = () => new window.File([audioBytes], 'fixture.mp3', { type: 'audio/mpeg' })
 
@@ -712,7 +735,7 @@ test('RunningHub 重设计界面：jsdom + React DOM 隔离交互', {
     assert.equal(button('开始生成').disabled, false)
     assert.equal(query('#rh-prompt').disabled, false)
     assert.deepEqual(jobStatuses(), ['queued', 'ready', 'running'])
-    for (const call of calls) {
+    for (const call of calls.filter(call => call.url === '/api/dsh-runninghub')) {
       assert.equal(call.url, '/api/dsh-runninghub')
       assert.equal(call.credentials, 'same-origin')
       assert.equal(call.cache, 'no-store')
@@ -789,6 +812,55 @@ test('RunningHub 重设计界面：jsdom + React DOM 隔离交互', {
     assert.equal(/key/i.test(img.getAttribute('src')), false, 'src 不得携带网关 Key')
     assert.equal(img.getAttribute('src').includes('fileName'), false, 'src 不得携带上传文件名')
     assert.equal(img.getAttribute('src').includes('name='), false, 'src 不得携带素材名称参数')
+  })
+
+  await t.test('主面板：从客户端常用图库/常用音频库选素材，作为本次生成覆盖', async () => {
+    await mountVariant()
+    const imageSlot = [...container.querySelectorAll('.rh-slot')].find(node => node.textContent.includes('参考图片'))
+    await click(button('从图库选', imageSlot))
+    const dialog = query('.rh-library-dialog')
+    await until(() => dialog.querySelectorAll('.rh-library-item').length === 2, '图库列表')
+    assert.match(dialog.textContent, /图库人物设定\.png/)
+    const oversized = [...dialog.querySelectorAll('.rh-library-item')].find(node => node.textContent.includes('图库超限大图'))
+    assert.equal(oversized.disabled, true, '超过 10MB 的图库项应禁用')
+    assert.match(dialog.textContent, /超过 10 MB/)
+    await click([...dialog.querySelectorAll('.rh-library-item')].find(node => node.textContent.includes('图库人物设定')))
+    await until(() => !container.querySelector('.rh-library-dialog'), '选图后关闭图库')
+    assert.ok(query('img[alt="已选参考图片"]').getAttribute('src').startsWith('blob:ui-fixture-'))
+    assert.match(query('.rh-slot').textContent, /图库人物设定\.png/)
+
+    const audioSlot = [...container.querySelectorAll('.rh-slot')].find(node => node.textContent.includes('参考音频'))
+    await click(button('从音频库选', audioSlot))
+    const audioDialog = query('.rh-library-dialog')
+    await until(() => audioDialog.querySelectorAll('.rh-library-row').length === 1, '音频库列表')
+    assert.match(audioDialog.textContent, /图库音频\.mp3/)
+    await click(audioDialog.querySelector('.rh-library-row'))
+    await until(() => !container.querySelector('.rh-library-dialog'), '选音频后关闭音频库')
+    assert.match([...container.querySelectorAll('.rh-slot')].find(node => node.textContent.includes('参考音频')).textContent, /图库音频\.mp3/)
+    assert.ok(calls.some(call => call.url === '/api/dsh-runninghub/library' && call.query === '?kind=image'))
+    assert.ok(calls.some(call => call.url === '/api/dsh-runninghub/library' && call.query === '?kind=audio'))
+  })
+
+  await t.test('设置：默认参考素材从常用图库选并自动写回客户端', async () => {
+    await mountVariant()
+    await click(button('设置'))
+    const drawer = query('.rh-drawer')
+    const imageSlot = [...drawer.querySelectorAll('.rh-slot')].find(node => node.textContent.includes('参考图片'))
+    await click(button('从图库选', imageSlot))
+    const dialog = query('.rh-library-dialog')
+    await until(() => dialog.querySelectorAll('.rh-library-item').length === 2, '设置里的图库列表')
+    // 素材库是叠在抽屉上的对话框：Escape 只应关它，不能把底下的设置抽屉一起关掉。
+    await change(() => document.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true })))
+    assert.ok(container.querySelector('.rh-drawer'), '素材库打开时 Escape 不应关闭设置抽屉')
+    await click([...dialog.querySelectorAll('.rh-library-item')].find(node => node.textContent.includes('图库人物设定')))
+    await until(() => saves.some(entry => entry.defaults?.references?.some(ref => ref.name === '图库人物设定.png')), '图库素材写回默认值')
+    const saved = [...saves].reverse().find(entry => entry.defaults?.references?.some(ref => ref.name === '图库人物设定.png'))
+    const ref = saved.defaults.references.find(item => item.nodeId === 'image-ref')
+    assert.equal(ref.kind, 'image')
+    assert.equal(ref.mimeType, 'image/png')
+    assert.equal(ref.data, imageBytes.toString('base64'))
+    await until(() => query('.rh-settings-status').textContent.includes('已自动写入客户端'), '自动同步状态')
+    await click(query('.rh-drawer-head button[aria-label="关闭设置"]'))
   })
 
   await t.test('面板选择写回宿主，同步后以宿主 summary.model 为准', async () => {

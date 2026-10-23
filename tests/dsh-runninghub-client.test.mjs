@@ -53,6 +53,12 @@ function createGateway({
   referenceContentLength,
   optionGroups,
   onCall,
+  gallery,
+  audioLibrary,
+  libraryStatus = 200,
+  libraryContentType,
+  libraryBytes,
+  libraryContentLength,
 } = {}) {
   const calls = []
   const writes = []
@@ -65,6 +71,17 @@ function createGateway({
     if (u.pathname === '/api/workflows') return makeResponse({ text: JSON.stringify(workflows) })
     if (u.pathname === '/api/settings') return makeResponse({ text: JSON.stringify(settings ?? { defaultModel: '' }) })
     if (u.pathname === '/api/option-groups') return makeResponse({ text: JSON.stringify({ groups: optionGroups ?? [] }) })
+    if (u.pathname === '/api/gallery') return makeResponse({ text: JSON.stringify(gallery ?? []), status: libraryStatus })
+    if (u.pathname === '/api/audio-library') return makeResponse({ text: JSON.stringify(audioLibrary ?? []), status: libraryStatus })
+    if (/^\/api\/(?:gallery|audio-library)\/[^/]+\/file$/.test(u.pathname)) {
+      const audio = u.pathname.startsWith('/api/audio-library/')
+      return makeResponse({
+        bytes: libraryBytes ?? (audio ? new Uint8Array([0xff, 0xfb, 0x10, 0, 1, 2]) : pngBytes()),
+        contentType: libraryContentType ?? (audio ? 'audio/mpeg' : 'image/png'),
+        status: libraryStatus,
+        contentLength: libraryContentLength,
+      })
+    }
     if (/^\/api\/workflows\/[^/]+\/nodes$/.test(u.pathname)) return makeResponse({ text: JSON.stringify(nodes ?? []) })
     if (u.pathname === '/api/lora-library') return makeResponse({ text: JSON.stringify(loraLibrary ?? { loras: [], maxConcurrent: 1, enabled: true }) })
     if (method === 'PUT' && /^\/api\/workflows\/[^/]+\/(defaults|duration|seed|model-field)$/.test(u.pathname)) {
@@ -647,6 +664,92 @@ test('readReference：伪装图片 MIME 的 HTML 和 SVG 被拒', async () => {
     const { client } = createGateway({ workflows: [workflowWithReference('9')], referenceContentType, referenceBytes })
     await assert.rejects(() => client.readReference('h3参考', '9'), error => error.code === 'INVALID_MEDIA')
   }
+})
+
+// ===========================================================================
+// 客户端常用图库 / 常用音频库：只回白名单字段，取文件走固定 ID 端点
+// ===========================================================================
+const LIB_IMAGE_ID = '11111111-1111-4111-8111-111111111111'
+const LIB_AUDIO_ID = '22222222-2222-4222-8222-222222222222'
+const LIB_OTHER_ID = '33333333-3333-4333-8333-333333333333'
+
+test('listLibrary：图片列表过滤坏条目、去掉 fileName/contentUrl，超限项保留 size 供界面标出', async () => {
+  const { client, calls } = createGateway({
+    apiKey: 'k',
+    gallery: [
+      { id: LIB_IMAGE_ID, name: '女主设定.png', fileName: 'secret-file.png', mimeType: 'image/png', size: 1234, createdAt: '2026-10-01T00:00:00.000Z', contentUrl: '/api/gallery/1/file' },
+      { id: 'not-a-uuid', name: '坏 ID.png', mimeType: 'image/png', size: 3 },
+      { id: LIB_OTHER_ID, name: '矢量.svg', mimeType: 'image/svg+xml', size: 4 },
+      { id: '44444444-4444-4444-8444-444444444444', name: '../穿越.png', mimeType: 'image/png', size: 11 * 1024 * 1024 },
+    ],
+  })
+  const items = await client.listLibrary('image')
+  assert.deepEqual(items, [
+    { id: LIB_IMAGE_ID, name: '女主设定.png', mimeType: 'image/png', size: 1234, createdAt: '2026-10-01T00:00:00.000Z' },
+    { id: '44444444-4444-4444-8444-444444444444', name: '44444444-4444-4444-8444-444444444444', mimeType: 'image/png', size: 11 * 1024 * 1024 },
+  ])
+  assert.equal(calls[0].path, '/api/gallery')
+  assert.equal(calls[0].headers.authorization, 'Bearer k')
+  assert.equal(JSON.stringify(items).includes('secret-file.png'), false)
+  assert.equal(JSON.stringify(items).includes('contentUrl'), false)
+})
+
+test('listLibrary：音频库只收音频 MIME，图片条目被跳过', async () => {
+  const { client, calls } = createGateway({
+    audioLibrary: [
+      { id: LIB_AUDIO_ID, name: '女主声音.mp3', fileName: 'secret.mp3', mimeType: 'audio/mpeg', size: 10, createdAt: '2026-10-02T00:00:00.000Z' },
+      { id: LIB_OTHER_ID, name: '其实是图.png', mimeType: 'image/png', size: 8 },
+    ],
+  })
+  const items = await client.listLibrary('audio')
+  assert.deepEqual(items, [{ id: LIB_AUDIO_ID, name: '女主声音.mp3', mimeType: 'audio/mpeg', size: 10, createdAt: '2026-10-02T00:00:00.000Z' }])
+  assert.equal(calls[0].path, '/api/audio-library')
+})
+
+test('listLibrary：非法 kind 被拒，不发出请求', async () => {
+  const { client, calls } = createGateway()
+  await assert.rejects(() => client.listLibrary('video'), (e) => e.code === 'VALIDATION_ERROR')
+  assert.equal(calls.length, 0)
+})
+
+test('listLibrary：网关 401 原样报错', async () => {
+  const { client } = createGateway({ gallery: [], libraryStatus: 401 })
+  await assert.rejects(() => client.listLibrary('image'), (e) => e.status === 401)
+})
+
+test('readLibrary：图片走固定 ID 端点，返回字节与 MIME，且验证魔数', async () => {
+  const { client, calls } = createGateway({ libraryBytes: pngBytes(), libraryContentType: 'image/png' })
+  const item = await client.readLibrary('image', LIB_IMAGE_ID)
+  assert.ok(item.data instanceof Uint8Array)
+  assert.equal(item.mediaType, 'image/png')
+  assert.ok(calls.some((c) => c.path === '/api/gallery/' + LIB_IMAGE_ID + '/file'))
+})
+
+test('readLibrary：伪装成图片的 HTML / MIME 与内容不一致被拒', async () => {
+  const html = createGateway({ libraryBytes: Buffer.from('  <!doctype html><script>alert(1)</script>'), libraryContentType: 'image/png' })
+  await assert.rejects(() => html.client.readLibrary('image', LIB_IMAGE_ID), (e) => e.code === 'INVALID_MEDIA')
+  const mismatch = createGateway({ libraryBytes: pngBytes(), libraryContentType: 'image/jpeg' })
+  await assert.rejects(() => mismatch.client.readLibrary('image', LIB_IMAGE_ID), (e) => e.code === 'INVALID_MEDIA')
+})
+
+test('readLibrary：音频取回字节，固定端点与类型正确', async () => {
+  const bytes = new Uint8Array([0xff, 0xfb, 0x10, 0, 1, 2])
+  const { client, calls } = createGateway({ libraryBytes: bytes, libraryContentType: 'audio/mpeg' })
+  const item = await client.readLibrary('audio', LIB_AUDIO_ID)
+  assert.equal(item.mediaType, 'audio/mpeg')
+  assert.deepEqual([...item.data], [...bytes])
+  assert.ok(calls.some((c) => c.path === '/api/audio-library/' + LIB_AUDIO_ID + '/file'))
+})
+
+test('readLibrary：非法 ID、非法 kind、超 10MB 与 401 都被拒', async () => {
+  const { client, calls } = createGateway({ libraryBytes: pngBytes(), libraryContentType: 'image/png' })
+  await assert.rejects(() => client.readLibrary('image', '../../etc/passwd'), (e) => e.code === 'VALIDATION_ERROR')
+  await assert.rejects(() => client.readLibrary('video', LIB_IMAGE_ID), (e) => e.code === 'VALIDATION_ERROR')
+  assert.equal(calls.length, 0)
+  const oversized = createGateway({ libraryBytes: pngBytes(), libraryContentType: 'image/png', libraryContentLength: 11 * 1024 * 1024 })
+  await assert.rejects(() => oversized.client.readLibrary('image', LIB_IMAGE_ID), (e) => e.code === 'RESPONSE_TOO_LARGE')
+  const unauthorized = createGateway({ libraryStatus: 401 })
+  await assert.rejects(() => unauthorized.client.readLibrary('image', LIB_IMAGE_ID), (e) => e.status === 401)
 })
 
 test('revision 随参数与槽位变化，管线分辨率和素材源遵循客户端', async () => {

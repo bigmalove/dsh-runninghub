@@ -4,7 +4,7 @@ import { constants, createReadStream } from 'node:fs'
 import { pipeline } from 'node:stream/promises'
 import { homedir } from 'node:os'
 import path from 'node:path'
-import { GatewayClient, GatewayError, sanitizeMessage, splitPortPrompt, validateBaseURL, validateInput, validateRequestId } from './lib/client.mjs'
+import { GatewayClient, GatewayError, REFERENCE_LIMIT, sanitizeMessage, splitPortPrompt, validateBaseURL, validateInput, validateRequestId } from './lib/client.mjs'
 import { TaskStore, TaskEngine, validateJobId } from './lib/tasks.mjs'
 import { ReplayStore } from './lib/replay.mjs'
 import {
@@ -38,6 +38,8 @@ export const inject = ['tavern', 'attachments', 'credentials', 'webServer']
 export const API = '/api/dsh-runninghub'
 export const MEDIA = API + '/media'
 export const REFERENCE = API + '/reference'
+// 客户端常用图库 / 常用音频库的同源代理：列表与按 ID 取原图/原音频。
+export const LIBRARY = API + '/library'
 const DEFAULT_BASE = 'http://127.0.0.1:6888'
 const ACTIVE = new Set(['preparing', 'submitting', 'submit_unknown', 'queued', 'running', 'downloading'])
 const fail = (message, code = 'VALIDATION_ERROR') => new GatewayError(message, { code, rejected: true })
@@ -1728,12 +1730,50 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     res.writeHead(200, headers)
     res.end(Buffer.from(media.data))
   }
+  async function libraryRoute(req, res) {
+    if (!['GET', 'HEAD'].includes(req.method)) throw fail('仅支持 GET 或 HEAD', 'METHOD_NOT_ALLOWED')
+    const query = new URL(req.url, 'http://localhost').searchParams
+    const kind = query.get('kind')
+    if (kind !== 'image' && kind !== 'audio') throw fail('kind 必须是 image 或 audio')
+    const id = query.get('id')
+    const active = await connect()
+    const controller = new AbortController()
+    const abort = () => controller.abort()
+    res.on?.('close', abort)
+    try {
+      if (!id) {
+        const items = await active.client.listLibrary(kind, controller.signal)
+        const body = Buffer.from(JSON.stringify({ kind, items, maxBytes: REFERENCE_LIMIT }))
+        const headers = {
+          'content-type': 'application/json; charset=utf-8',
+          'content-length': String(body.byteLength),
+          'cache-control': 'no-store',
+          'x-content-type-options': 'nosniff',
+        }
+        res.writeHead(200, headers)
+        if (req.method === 'HEAD') return res.end()
+        return res.end(body)
+      }
+      const media = await active.client.readLibrary(kind, id, controller.signal)
+      const headers = {
+        'content-type': media.mediaType,
+        'content-length': String(media.data.byteLength),
+        // 素材 ID 对应不可变文件；只允许浏览器私有缓存，避免中间层留存客户端素材。
+        'cache-control': 'private, max-age=300',
+        'x-content-type-options': 'nosniff',
+      }
+      if (req.method === 'HEAD') { res.writeHead(200, headers); return res.end() }
+      res.writeHead(200, headers)
+      res.end(Buffer.from(media.data))
+    } finally { res.off?.('close', abort) }
+  }
   async function route(req, res) {
     try {
       if (!sameOrigin(req)) return json(res, 403, { error: '拒绝跨站请求' })
       const pathname = new URL(req.url, 'http://localhost').pathname
       if (pathname === MEDIA) return await readMedia(req, res)
       if (pathname === REFERENCE) return await readReferenceRoute(req, res)
+      if (pathname === LIBRARY) return await libraryRoute(req, res)
       if (pathname !== API) return json(res, 404, { error: '接口不存在' })
       if (req.method === 'GET') {
         const gameId = new URL(req.url, 'http://localhost').searchParams.get('gameId') || undefined
@@ -1815,7 +1855,7 @@ export async function apply(ctx, config = {}) {
   const runtime = { llm: null }
   const host = await createRunningHubHost(ctx, config, { getLLM: () => runtime.llm })
   ctx.effect(() => () => host.dispose())
-  for (const route of [API, MEDIA, REFERENCE]) ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: route, handler: host.route }))
+  for (const route of [API, MEDIA, REFERENCE, LIBRARY]) ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: route, handler: host.route }))
   ctx.tavern.handle('dsh-runninghub/list', () => host.dispatch({ action: 'list' }))
   ctx.tavern.handle('dsh-runninghub/describe', ({ model }) => host.dispatch({ action: 'describe', model }))
   if (ctx.tavern.onTurnSettled) ctx.tavern.onTurnSettled(async turn => {

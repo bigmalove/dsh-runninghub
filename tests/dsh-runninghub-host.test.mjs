@@ -10,7 +10,7 @@ import { join } from 'node:path'
 import { createServer } from 'node:http'
 import { test, describe, afterEach } from 'node:test'
 
-import { createRunningHubHost, apply, API, MEDIA, REFERENCE } from '../index.mjs'
+import { createRunningHubHost, apply, API, LIBRARY, MEDIA, REFERENCE } from '../index.mjs'
 
 const BASE = 'http://127.0.0.1:6888'
 const NEW_BASE = 'http://127.0.0.1:6889'
@@ -24,6 +24,7 @@ function credentialName(baseURL) {
 // Minimal valid PNG / MP4 magic bytes so the gateway content sniffer accepts them.
 const PNG_BYTES = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 0, 1, 2, 3, 4])
 const MP4_BYTES = Buffer.from([0, 0, 0, 0x18, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6f, 0x6d, 5, 6, 7, 8])
+const AUDIO_BYTES = Buffer.from([0xff, 0xfb, 0x10, 0, 1, 2])
 
 // ---- fake HTTP surface used to invoke host.route ----
 function fakeRes() {
@@ -78,6 +79,11 @@ function makeGatewayFetch({
   portDirectiveRejectModes,
   optionGroups,
   defaultsConflict = false,
+  galleryItems = [],
+  audioLibraryItems = [],
+  libraryBytes,
+  libraryType,
+  libraryStatus = 200,
 } = {}) {
   const ext = kind === 'video' ? 'mp4' : 'png'
   const fileBytes = kind === 'video' ? MP4_BYTES : PNG_BYTES
@@ -142,6 +148,19 @@ function makeGatewayFetch({
     if (/^\/api\/workflows\/[^/]+\/defaults\/references\/[^/]+$/.test(u.pathname)) {
       const bytes = referenceBytes ?? fileBytes
       return new Response(bytes, { status: referenceStatus, headers: { 'content-type': referenceType ?? fileType } })
+    }
+    if (u.pathname === '/api/gallery') {
+      return new Response(JSON.stringify(galleryItems), { status: libraryStatus, headers: { 'content-type': 'application/json' } })
+    }
+    if (u.pathname === '/api/audio-library') {
+      return new Response(JSON.stringify(audioLibraryItems), { status: libraryStatus, headers: { 'content-type': 'application/json' } })
+    }
+    if (/^\/api\/(?:gallery|audio-library)\/[^/]+\/file$/.test(u.pathname)) {
+      const audio = u.pathname.startsWith('/api/audio-library/')
+      return new Response(libraryBytes ?? (audio ? AUDIO_BYTES : PNG_BYTES), {
+        status: libraryStatus,
+        headers: { 'content-type': libraryType ?? (audio ? 'audio/mpeg' : 'image/png') },
+      })
     }
     if (u.pathname === '/v1/images/generations' && (opts.method ?? 'GET') === 'POST') {
       generations += 1
@@ -1252,8 +1271,123 @@ describe('reference route: same-origin binary, no key/address leak', () => {
 })
 
 // =====================================================================
+describe('library route: 客户端常用图库 / 常用音频库的同源代理', () => {
+  const IMAGE_ID = '11111111-1111-4111-8111-111111111111'
+  const AUDIO_ID = '22222222-2222-4222-8222-222222222222'
+  function galleryItems() {
+    return [
+      { id: IMAGE_ID, name: '女主设定.png', fileName: 'SECRET-FILE.png', mimeType: 'image/png', size: PNG_BYTES.length, createdAt: '2026-10-01T00:00:00.000Z', contentUrl: '/api/gallery/1/file' },
+      { id: 'not-a-uuid', name: '坏 ID.png', mimeType: 'image/png', size: 4 },
+      { id: '33333333-3333-4333-8333-333333333333', name: '矢量.svg', mimeType: 'image/svg+xml', size: 9 },
+      { id: '44444444-4444-4444-8444-444444444444', name: '../路径穿越.png', mimeType: 'image/png', size: null },
+    ]
+  }
+  function audioItems() {
+    return [
+      { id: AUDIO_ID, name: '女主声音.mp3', fileName: 'SECRET-AUDIO.mp3', mimeType: 'audio/mpeg', size: AUDIO_BYTES.length, createdAt: '2026-10-02T00:00:00.000Z' },
+      { id: '55555555-5555-4555-8555-555555555555', name: '不是音频.png', mimeType: 'image/png', size: 8 },
+    ]
+  }
+  async function serve(host) {
+    const server = createServer((req, res) => { host.route(req, res) })
+    await new Promise((r) => server.listen(0, r))
+    const port = server.address().port
+    return { base: `http://127.0.0.1:${port}`, close: () => new Promise((r) => server.close(r)) }
+  }
+  function gateway(extra = {}) {
+    return makeGatewayFetch({ galleryItems: galleryItems(), audioLibraryItems: audioItems(), ...extra })
+  }
+
+  test('图片列表只回白名单字段，坏条目被过滤，且不泄露文件名/地址/Key', async () => {
+    const { host } = await makeHost({ configured: true, gateway: gateway() })
+    const srv = await serve(host)
+    try {
+      const res = await fetch(`${srv.base}${LIBRARY}?kind=image`)
+      assert.equal(res.status, 200)
+      assert.equal(res.headers.get('cache-control'), 'no-store')
+      assert.equal(res.headers.get('x-content-type-options'), 'nosniff')
+      const body = await res.json()
+      assert.equal(body.kind, 'image')
+      assert.equal(body.maxBytes, 10 * 1024 * 1024)
+      assert.deepEqual(body.items, [
+        { id: IMAGE_ID, name: '女主设定.png', mimeType: 'image/png', size: PNG_BYTES.length, createdAt: '2026-10-01T00:00:00.000Z' },
+        { id: '44444444-4444-4444-8444-444444444444', name: '44444444-4444-4444-8444-444444444444', mimeType: 'image/png', size: null },
+      ])
+      const text = JSON.stringify(body)
+      assert.equal(text.includes('SECRET-FILE'), false, '不得下发服务端文件名')
+      assert.equal(text.includes('contentUrl'), false, '不得下发网关内部地址')
+      assert.equal(text.includes(DEFAULT_API_KEY), false, '不得泄露网关密钥')
+      assert.equal(text.includes('127.0.0.1:6888'), false, '不得泄露网关地址')
+    } finally { await srv.close() }
+  })
+
+  test('音频列表与图片分开：只回音频库条目', async () => {
+    const { host } = await makeHost({ configured: true, gateway: gateway() })
+    const srv = await serve(host)
+    try {
+      const body = await (await fetch(`${srv.base}${LIBRARY}?kind=audio`)).json()
+      assert.equal(body.kind, 'audio')
+      assert.deepEqual(body.items, [
+        { id: AUDIO_ID, name: '女主声音.mp3', mimeType: 'audio/mpeg', size: AUDIO_BYTES.length, createdAt: '2026-10-02T00:00:00.000Z' },
+      ])
+      assert.equal(JSON.stringify(body).includes('SECRET-AUDIO'), false)
+    } finally { await srv.close() }
+  })
+
+  test('按 ID 取图片：同源二进制、私有缓存、nosniff，HEAD 不回主体', async () => {
+    const { host } = await makeHost({ configured: true, gateway: gateway() })
+    const srv = await serve(host)
+    try {
+      const res = await fetch(`${srv.base}${LIBRARY}?kind=image&id=${IMAGE_ID}`)
+      assert.equal(res.status, 200)
+      assert.equal(res.headers.get('content-type'), 'image/png')
+      assert.equal(res.headers.get('cache-control'), 'private, max-age=300')
+      assert.equal(res.headers.get('x-content-type-options'), 'nosniff')
+      assert.ok(Buffer.from(await res.arrayBuffer()).equals(PNG_BYTES))
+      const head = await fetch(`${srv.base}${LIBRARY}?kind=image&id=${IMAGE_ID}`, { method: 'HEAD' })
+      assert.equal(head.status, 200)
+      assert.equal(Number(head.headers.get('content-length')), PNG_BYTES.length)
+      assert.equal((await head.arrayBuffer()).byteLength, 0)
+    } finally { await srv.close() }
+  })
+
+  test('按 ID 取音频：沿用音频库 MIME', async () => {
+    const { host } = await makeHost({ configured: true, gateway: gateway() })
+    const srv = await serve(host)
+    try {
+      const res = await fetch(`${srv.base}${LIBRARY}?kind=audio&id=${AUDIO_ID}`)
+      assert.equal(res.status, 200)
+      assert.equal(res.headers.get('content-type'), 'audio/mpeg')
+      assert.ok(Buffer.from(await res.arrayBuffer()).equals(AUDIO_BYTES))
+    } finally { await srv.close() }
+  })
+
+  test('kind 缺失/非法、id 不是 UUID、跨站请求都被拒', async () => {
+    const { host } = await makeHost({ configured: true, gateway: gateway() })
+    const srv = await serve(host)
+    try {
+      assert.equal((await fetch(`${srv.base}${LIBRARY}`)).status, 400)
+      assert.equal((await fetch(`${srv.base}${LIBRARY}?kind=video`)).status, 400)
+      assert.equal((await fetch(`${srv.base}${LIBRARY}?kind=image&id=../../etc/passwd`)).status, 400)
+      const cross = await fetch(`${srv.base}${LIBRARY}?kind=image`, { headers: { 'sec-fetch-site': 'cross-site' } })
+      assert.equal(cross.status, 403)
+    } finally { await srv.close() }
+  })
+
+  test('网关 401 时列表返回错误 JSON（沿用既有错误处理）', async () => {
+    const { host } = await makeHost({ configured: true, gateway: gateway({ libraryStatus: 401 }) })
+    const srv = await serve(host)
+    try {
+      const res = await fetch(`${srv.base}${LIBRARY}?kind=image`)
+      assert.equal(res.status, 502)
+      assert.ok((await res.json()).error)
+    } finally { await srv.close() }
+  })
+})
+
+// =====================================================================
 describe('apply: registration and cleanup (apply 不再返回 host)', () => {
-  test('apply 注册 2 HTTP 路由、3 callHost handler、4 工具，且不返回 host', async () => {
+  test('apply 注册 4 HTTP 路由、3 callHost handler、4 工具，且不返回 host', async () => {
     const dataDirectory = await mkdtemp(join(tmpRoot, 'rh-test-'))
     liveHosts.push({ host: { dispose() {} }, dataDirectory })
     const effects = []
@@ -1284,8 +1418,8 @@ describe('apply: registration and cleanup (apply 不再返回 host)', () => {
     const result = await apply(ctx, { dataDirectory, baseURL: BASE })
     assert.equal(result, undefined, 'apply 不再返回 host（交由真实 loader 处理 effect）')
 
-    assert.equal(registered.length, 3, 'three HTTP routes must be registered (API, MEDIA, REFERENCE)')
-    assert.deepEqual(registered.map(r => r.path).sort(), [API, MEDIA, REFERENCE].sort())
+    assert.equal(registered.length, 4, 'four HTTP routes must be registered (API, MEDIA, REFERENCE, LIBRARY)')
+    assert.deepEqual(registered.map(r => r.path).sort(), [API, LIBRARY, MEDIA, REFERENCE].sort())
     for (const spec of registered) {
       assert.equal(spec.kind, 'exact')
       assert.equal(typeof spec.handler, 'function', 'route handler 须为函数（即 host.route）')
@@ -1314,7 +1448,7 @@ describe('apply: registration and cleanup (apply 不再返回 host)', () => {
     assert.equal(turnSectionSpec.text({ gameId: 'fixture-game' }), '', '自动插入关闭时不注入每轮提醒')
     assert.equal(typeof settledHandler, 'function')
     assert.equal(typeof removedHandler, 'function')
-    assert.equal(effects.length, 4, 'dispose + 3 route effects expected')
+    assert.equal(effects.length, 5, 'dispose + 4 route effects expected')
   })
 
   test('callHost handlers delegate to dispatch', async () => {
@@ -1350,8 +1484,8 @@ describe('apply: registration and cleanup (apply 不再返回 host)', () => {
       inject: (names, fn) => { if (names[0] === 'tools') fn({ tools: { register: (spec) => tools.push(spec) } }) },
     }
     await apply(ctx, { dataDirectory, baseURL: BASE })
-    assert.equal(effects.length, 4, 'dispose + 3 route effects expected')
-    // The dispose effect is registered first; the three route effects return their own disposers.
+    assert.equal(effects.length, 5, 'dispose + 4 route effects expected')
+    // The dispose effect is registered first; the four route effects return their own disposers.
     const disposeFn = effects[0]
     assert.equal(typeof disposeFn, 'function', 'apply must register a dispose effect (no Invalid return)')
     // host 由 apply 内部创建，经由已注册的 tool.execute 验证其已被拆除。
