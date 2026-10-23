@@ -470,6 +470,34 @@ describe('submit: concurrent requestId submits once; retry does not rebind turn'
     assert.equal(retry.id, first.id)
     assert.equal(retry.binding?.turn, 5, 'returned job must keep the original bound turn')
   })
+
+  test('慢提交不占全局锁：另一条 jobs 查询不用等它', async () => {
+    const gateway = makeGatewayFetch()
+    // 让 describe 的节点请求卡住，提交就会停在锁外；此时 jobs 必须立刻返回。
+    // 旧实现把整个 submit 包在全局串行锁里，jobs 会被一起卡住。
+    let release
+    const blocked = new Promise(resolve => { release = resolve })
+    let entered
+    const enteredPromise = new Promise(resolve => { entered = resolve })
+    const fetchImpl = async (url, opts = {}) => {
+      if (/^\/api\/workflows\/[^/]+\/nodes$/.test(new URL(url).pathname)) {
+        entered()
+        await blocked
+      }
+      return gateway.fetchImpl(url, opts)
+    }
+    const { host } = await makeHost({ configured: true, gateway: { ...gateway, fetchImpl } })
+    const pending = host.dispatch({ action: 'submit', requestId: 'slow-1', input: { model: 'demo', prompt: 'x' }, bindToTurn: false })
+    await enteredPromise
+    const result = await Promise.race([
+      host.dispatch({ action: 'jobs' }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('jobs 被提交挡住了：submit 仍占着全局锁')), 300)),
+    ])
+    assert.deepEqual(result.jobs, [], '还没有任务时 jobs 应返回空')
+    release()
+    const job = await pending
+    assert.ok(job.id, '放开 describe 后提交应正常建任务')
+  })
 })
 
 // =====================================================================
@@ -478,8 +506,11 @@ describe('jobs: lightweight status feed for the composer dock', () => {
     const gateway = makeGatewayFetch({ taskStatus: 'running' })
     const { host } = await makeHost({ configured: true, gateway })
     const bound = await host.dispatch({ action: 'submit', requestId: 'dock-bound', input: { model: 'demo', prompt: 'x' }, bindToTurn: true, gameId: 'game-dock' })
-    await host.dispatch({ action: 'submit', requestId: 'dock-free', input: { model: 'demo', prompt: 'x' }, bindToTurn: false })
+    const free = await host.dispatch({ action: 'submit', requestId: 'dock-free', input: { model: 'demo', prompt: 'x' }, bindToTurn: false })
+    // Both submissions are accepted in the background; wait for both before counting,
+    // so a still-in-flight acceptance cannot be mistaken for the `jobs` call connecting.
     await waitForJob(host, bound.id, job => Boolean(job.remoteTaskId))
+    await waitForJob(host, free.id, job => Boolean(job.remoteTaskId))
     const generations = gateway.generations()
     const result = await host.dispatch({ action: 'jobs', gameId: 'game-dock' })
     assert.deepEqual(result.jobs.map(job => job.id), [bound.id], 'other games / unbound jobs must not leak into the dock')
@@ -1265,6 +1296,12 @@ describe('apply: registration and cleanup (apply 不再返回 host)', () => {
     assert.deepEqual(tools.map(t => t.name).sort(), ['runninghub_describe', 'runninghub_generate', 'runninghub_send_pregenerated', 'runninghub_status'].sort())
     const generate = tools.find(t => t.name === 'runninghub_generate')
     assert.equal(/explicit player request|auto-insert off/i.test(generate.description), false, '关闭态保护应由宿主拒绝，不写进工具说明')
+    // 提交/查询类工具只写本地任务库，慢在网关往返；声明并发安全后同一轮多段可以一起发。
+    for (const name of ['runninghub_generate', 'runninghub_describe', 'runninghub_status']) {
+      assert.equal(tools.find(t => t.name === name).isConcurrencySafe(), true, `${name} 须声明并发安全`)
+    }
+    assert.equal(tools.find(t => t.name === 'runninghub_send_pregenerated').isConcurrencySafe(), false,
+      '发送预生成视频要认领池子条目，保持独占')
     assert.equal(promptSections.length, 8, '模板按 8 段注册，避开 Tavern 单段 8000 字上限')
     assert.deepEqual(promptSections.map(spec => spec.name),
       ['auto-insert', ...Array.from({ length: 7 }, (_, index) => 'auto-insert-' + String(index + 1).padStart(2, '0'))])

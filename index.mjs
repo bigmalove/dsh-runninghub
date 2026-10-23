@@ -525,8 +525,18 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     }
     return promptDirective
   }
+  // 同一轮并行提交时只拉一次工作流列表：三段视频不该各打一次网关，
+  // 也不能让后到的调用看到半空的 workflows 再拉一遍。
+  let workflowsLoading = null
   async function ensureModel(active) {
-    if (!workflows.length) workflows = await active.client.listWorkflows()
+    if (!workflows.length) {
+      if (!workflowsLoading) {
+        workflowsLoading = active.client.listWorkflows()
+          .then(list => { workflows = list; return list })
+          .finally(() => { workflowsLoading = null })
+      }
+      await workflowsLoading
+    }
     const usable = workflows.filter((w) => !w.broken)
     let next = ''
     if (selectedModel && usable.some((w) => w.alias === selectedModel)) next = selectedModel
@@ -1383,9 +1393,12 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     return { gameId, pending: true, afterTurn, anchor }
   }
   async function dispatch(input = { action: 'list' }, exec) {
+    if (!object(input)) throw fail('请求格式无效')
+    if (disposed) throw fail('插件已停止', 'DISPOSED')
+    // 提交不进全局串行锁：校验、describe 往返和绑定都要等网关或宿主，
+    // 同一轮的三段视频不该一段一段排队，面板轮询也不该追在它们后面。
+    if (input.action === 'submit') return submitJob(input, exec)
     return serial(async () => {
-      if (!object(input)) throw fail('请求格式无效')
-      if (disposed) throw fail('插件已停止', 'DISPOSED')
       if (input.action === 'preferences') {
         keys(input, ['action', 'autoInsert', 'alwaysSendPrompt', 'videosPerTurn', 'applyDefaults', 'bindToTurn'])
         if (input.autoInsert === undefined && input.alwaysSendPrompt === undefined
@@ -1573,74 +1586,86 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
         keys(input, ['action', 'id'])
         return active.engine.retryDownload(input.id)
       }
-      if (input.action === 'submit') {
-        keys(input, ['action', 'input', 'gameId', 'bindToTurn', 'requestId', 'anchor'])
-        validateRequestId(input.requestId)
-        // Deduplicate before looking at the now-current turn or schema: an uncertain browser retry
-        // must return the original job even if the game moved on since it was accepted.
-        const existing = (await store.list()).find(job => job.requestId === input.requestId)
-        if (existing) return { ...existing, ...(replays.has(existing.id) ? { replayable: true } : {}) }
-        if (exec && !alwaysSendPrompt) {
-          throw fail('插件设置里「总是发送提示词模板」已关闭，模型生成拿不到当前工作流模板。请在面板设置里开启，或用面板手动生成。')
-        }
-        // 自动插入关闭时，模型不能自行提交；由宿主直接拒绝，不把判断交给模型。
-        if (exec && !autoInsert) {
-          throw fail('自动插入已关闭，模型不能提交 RunningHub 视频；请玩家在面板手动生成，或在设置里开启自动插入。')
-        }
-        if (!object(input.input)) throw fail('input 必须是对象')
-        const alias = await ensureModel(active)
-        // 工作流是宿主状态：模型即使还传了旧字段也不能改选，避免把面板选择绕过去。
-        if (input.input.model !== undefined && input.input.model !== alias) throw fail('工作流由面板选择，不能在工具参数里指定')
-        if (input.input.custom !== undefined && !object(input.input.custom)) throw fail('custom 必须是对象')
-        const description = await active.client.describe(alias)
-        const pipelineKind = description.pipeline?.kind || ''
-        if (input.input.image_prompt !== undefined && typeof input.input.image_prompt !== 'string') throw fail('image_prompt 必须是文本')
-        const structuredImage = typeof input.input.image_prompt === 'string' ? input.input.image_prompt.trim() : ''
-        let prompt = input.input.prompt
-        let imagePrompt = ''
-        if (pipelineKind) {
-          // 原生工具优先用 input.image_prompt + input.prompt；旧模板的 image### / video### 只作兼容回退。
-          try {
-            const split = splitPortPrompt(input.input.prompt, pipelineKind)
-            prompt = split.prompt
-            imagePrompt = split.imagePrompt
-          } catch (error) {
-            if (!structuredImage) throw error
-            const videoOnly = /(?:^|\r?\n)[ \t]*video###[ \t]*(?:\r?\n)?([\s\S]*?)[ \t]*(?:\r?\n)?[ \t]*###/.exec(input.input.prompt || '')
-            prompt = videoOnly ? videoOnly[1].trim() : input.input.prompt
-          }
-          if (structuredImage) imagePrompt = structuredImage
-          if (!imagePrompt) throw fail('管线工作流需要两段提示词：input.image_prompt + input.prompt（或 image### / video### 标记）')
-        } else if (structuredImage) {
-          throw fail('当前工作流不是管线，不需要 input.image_prompt')
-        }
-        prompt = restoreTags(prompt)
-        imagePrompt = restoreTags(imagePrompt)
-        // 面板手动提交允许自由散文（玩家可能只想快速试参数）；模型走工具提交时
-        // 必须按全参考模板写，缺段在花钱之前拦住。工具调用一定带 exec，面板走 route 不带。
-        if (exec) assertReferencePrompt(prompt, referencePromptMode(description), attachedReferences(description))
-        const prepared = { ...input.input, model: alias, prompt }
-        delete prepared.image_prompt
-        if (pipelineKind && imagePrompt) {
-          const imagePromptKey = pipelineKind === 'grid-storyboard' ? 'grid_prompt' : 'image_prompt'
-          prepared.custom = { ...(object(input.input.custom) ? input.input.custom : {}), [imagePromptKey]: imagePrompt }
-        }
-        const clean = validateInput(prepared, description)
-        if (input.anchor !== undefined && (typeof input.anchor !== 'string' || input.anchor.length > 500)) throw fail('anchor 必须是最多 500 字的正文原句')
-        let binding
-        const sessionId = exec?.agent?.session?.id
-        if (autoInsert && sessionId) {
-          exec.signal?.throwIfAborted()
-          if (input.gameId && input.gameId !== sessionId) throw fail('game_id 与当前工具调用会话不一致')
-          binding = await autoInsertBinding(sessionId, input.anchor || '')
-          exec.signal?.throwIfAborted()
-        } else binding = await bindingOf(input)
-        const job = await active.engine.submit(clean, { binding, requestId: input.requestId })
-        try { await replays.save(job.id, clean); job.replayable = true } catch { /* 任务已提交，快照失败只影响下次重放 */ }
-        return job
-      }
       throw fail('未知 RunningHub 操作')
     })
+  }
+  /**
+   * 提交一段视频。慢的部分都在锁外：网关的 describe 往返和宿主绑定可以并行，
+   * 同一轮的多段视频才能真正一起发出去。只有「查重 + 建任务」这一小段进
+   * 全局串行锁，保证同一个 requestId 只落一条任务、只收一次费。
+   */
+  async function submitJob(input, exec) {
+    keys(input, ['action', 'input', 'gameId', 'bindToTurn', 'requestId', 'anchor'])
+    validateRequestId(input.requestId)
+    // Deduplicate before looking at the now-current turn or schema: an uncertain browser retry
+    // must return the original job even if the game moved on since it was accepted.
+    const existing = (await store.list()).find(job => job.requestId === input.requestId)
+    if (existing) return { ...existing, ...(replays.has(existing.id) ? { replayable: true } : {}) }
+    if (exec && !alwaysSendPrompt) {
+      throw fail('插件设置里「总是发送提示词模板」已关闭，模型生成拿不到当前工作流模板。请在面板设置里开启，或用面板手动生成。')
+    }
+    // 自动插入关闭时，模型不能自行提交；由宿主直接拒绝，不把判断交给模型。
+    if (exec && !autoInsert) {
+      throw fail('自动插入已关闭，模型不能提交 RunningHub 视频；请玩家在面板手动生成，或在设置里开启自动插入。')
+    }
+    if (!object(input.input)) throw fail('input 必须是对象')
+    const active = await connect()
+    const alias = await ensureModel(active)
+    // 工作流是宿主状态：模型即使还传了旧字段也不能改选，避免把面板选择绕过去。
+    if (input.input.model !== undefined && input.input.model !== alias) throw fail('工作流由面板选择，不能在工具参数里指定')
+    if (input.input.custom !== undefined && !object(input.input.custom)) throw fail('custom 必须是对象')
+    const description = await active.client.describe(alias)
+    const pipelineKind = description.pipeline?.kind || ''
+    if (input.input.image_prompt !== undefined && typeof input.input.image_prompt !== 'string') throw fail('image_prompt 必须是文本')
+    const structuredImage = typeof input.input.image_prompt === 'string' ? input.input.image_prompt.trim() : ''
+    let prompt = input.input.prompt
+    let imagePrompt = ''
+    if (pipelineKind) {
+      // 原生工具优先用 input.image_prompt + input.prompt；旧模板的 image### / video### 只作兼容回退。
+      try {
+        const split = splitPortPrompt(input.input.prompt, pipelineKind)
+        prompt = split.prompt
+        imagePrompt = split.imagePrompt
+      } catch (error) {
+        if (!structuredImage) throw error
+        const videoOnly = /(?:^|\r?\n)[ \t]*video###[ \t]*(?:\r?\n)?([\s\S]*?)[ \t]*(?:\r?\n)?[ \t]*###/.exec(input.input.prompt || '')
+        prompt = videoOnly ? videoOnly[1].trim() : input.input.prompt
+      }
+      if (structuredImage) imagePrompt = structuredImage
+      if (!imagePrompt) throw fail('管线工作流需要两段提示词：input.image_prompt + input.prompt（或 image### / video### 标记）')
+    } else if (structuredImage) {
+      throw fail('当前工作流不是管线，不需要 input.image_prompt')
+    }
+    prompt = restoreTags(prompt)
+    imagePrompt = restoreTags(imagePrompt)
+    // 面板手动提交允许自由散文（玩家可能只想快速试参数）；模型走工具提交时
+    // 必须按全参考模板写，缺段在花钱之前拦住。工具调用一定带 exec，面板走 route 不带。
+    if (exec) assertReferencePrompt(prompt, referencePromptMode(description), attachedReferences(description))
+    const prepared = { ...input.input, model: alias, prompt }
+    delete prepared.image_prompt
+    if (pipelineKind && imagePrompt) {
+      const imagePromptKey = pipelineKind === 'grid-storyboard' ? 'grid_prompt' : 'image_prompt'
+      prepared.custom = { ...(object(input.input.custom) ? input.input.custom : {}), [imagePromptKey]: imagePrompt }
+    }
+    const clean = validateInput(prepared, description)
+    if (input.anchor !== undefined && (typeof input.anchor !== 'string' || input.anchor.length > 500)) throw fail('anchor 必须是最多 500 字的正文原句')
+    let binding
+    const sessionId = exec?.agent?.session?.id
+    if (autoInsert && sessionId) {
+      exec.signal?.throwIfAborted()
+      if (input.gameId && input.gameId !== sessionId) throw fail('game_id 与当前工具调用会话不一致')
+      binding = await autoInsertBinding(sessionId, input.anchor || '')
+      exec.signal?.throwIfAborted()
+    } else binding = await bindingOf(input)
+    // 短临界区：并发提交时 describe 已经并行做完，这里只串行「再查一次重 + 建任务」，
+    // 同一个 requestId 的第二次提交拿回第一条任务，不会变成第二个收费任务。
+    const job = await serial(async () => {
+      const raced = (await store.list()).find(item => item.requestId === input.requestId)
+      if (raced) return { ...raced, ...(replays.has(raced.id) ? { replayable: true } : {}) }
+      return active.engine.submit(clean, { binding, requestId: input.requestId })
+    })
+    try { await replays.save(job.id, clean); job.replayable = true } catch { /* 任务已提交，快照失败只影响下次重放 */ }
+    return job
   }
   async function readMedia(req, res) {
     if (!['GET', 'HEAD'].includes(req.method)) throw fail('仅支持 GET 或 HEAD', 'METHOD_NOT_ALLOWED')
@@ -1845,8 +1870,13 @@ export async function apply(ctx, config = {}) {
         (args, exec) => host.dispatch({ action: 'pregen-send', gameId: exec?.agent?.session?.id, id: args.pool_id,
           anchor: args.anchor, caption: args.caption, allowStale: false }, exec).then(({ pregen: _pregen, ...result }) => result)],
     ]
+    // 这几个工具都只把任务写进本地库就返回，慢的是网关往返而不是生成本身。
+    // 声明并发安全后，宿主会把同一轮的多段提交一起发出去，正文提交不用等它们
+    // 一段一段跑完。发送预生成视频仍然独占：它要把池子里的条目认领给这一次生成。
+    const concurrencySafe = new Set(['runninghub_describe', 'runninghub_generate', 'runninghub_status'])
     for (const [toolName, description, parameters, execute] of specs) toolsCtx.tools.register({
       name: toolName, description, parameters, execute,
+      isConcurrencySafe: () => concurrencySafe.has(toolName),
       output: { schema: {}, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
     })
   })

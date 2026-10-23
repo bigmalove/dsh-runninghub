@@ -1,6 +1,6 @@
 {
   "name": "dsh-runninghub",
-  "version": "0.1.12",
+  "version": "0.1.13",
   "private": true,
   "type": "module",
   "scripts": {
@@ -9,7 +9,11 @@
     "test:all": "node bin/test.mjs --all",
     "test:ui": "node --test tests/dsh-runninghub-ui.test.mjs"
   },
-  "files": ["index.mjs", "client.js", "lib/"],
+  "files": [
+    "index.mjs",
+    "client.js",
+    "lib/"
+  ],
   "description": "RunningHub 本地网关工作室：在 DSH Tavern 里异步提交图片/视频任务，预览参考素材与 LoRA",
   "license": "AGPL-3.0-only",
   "repository": {
@@ -30,7 +34,9 @@
   "dsh": {
     "client": {
       "platform": "web",
-      "inject": ["dsh-tavern-plugin"]
+      "inject": [
+        "dsh-tavern-plugin"
+      ]
     }
   }
 }
