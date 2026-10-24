@@ -7,6 +7,7 @@ import path from 'node:path'
 import { GatewayClient, GatewayError, REFERENCE_LIMIT, sanitizeMessage, splitPortPrompt, validateBaseURL, validateInput, validateRequestId } from './lib/client.mjs'
 import { TaskStore, TaskEngine, validateJobId } from './lib/tasks.mjs'
 import { ReplayStore } from './lib/replay.mjs'
+import { hasMarkerBlock, markerPromptSpec, markerRequestId, parseMarkerShots } from './lib/markers.mjs'
 import {
   PREGEN_FAILURE_COOLDOWN_MS,
   PREGEN_MAX_AGE,
@@ -140,6 +141,9 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
   catch (error) { if (error.code !== 'ENOENT') selection = undefined }
   let baseURL = validateBaseURL(settings?.baseURL ?? config.baseURL ?? DEFAULT_BASE).href.replace(/\/$/, '')
   let autoInsert = settings?.autoInsert === true
+  // 生成方式：tool = 模型调用 runninghub_generate；marker = 正文标记，宿主解析后提交。
+  // 非工具调用模式不向模型开放生成工具，提示词从正文标记块里取。
+  let generationMode = settings?.generationMode === 'marker' ? 'marker' : 'tool'
   // 默认开启：选中工作流后，插件每轮直接把完整模板发进正文提示词，不再让模型读 Skill。
   let alwaysSendPrompt = settings?.alwaysSendPrompt !== false
   // 自动插入时一回合提交几段视频；提示词按这个数量要求模型拆分镜。
@@ -169,7 +173,25 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
   // 面板里的生成行为偏好：和连接配置一起放在 connection.json，刷新/重启后仍生效。
   let applyDefaultsPref = settings?.applyDefaults !== false
   let bindToTurnPref = settings?.bindToTurn !== false
-  const promptDirective = { model: '', mode: '', text: '', error: '' }
+  // text = 工具调用用的模板（结构化字段）；markerText = 正文标记用的模板；两者同源。
+  const promptDirective = { key: '', model: '', mode: '', text: '', markerText: '', pipeline: false, error: '' }
+  function resetDirective() {
+    promptDirective.key = ''
+    promptDirective.model = ''
+    promptDirective.mode = ''
+    promptDirective.text = ''
+    promptDirective.markerText = ''
+    promptDirective.pipeline = false
+    promptDirective.error = ''
+  }
+  function directiveFor(channel = generationMode) {
+    return channel === 'marker' ? promptDirective.markerText : promptDirective.text
+  }
+  // apply() 注册工具后把同步函数交回来：正文标记模式下要把生成工具从游玩请求里拿掉。
+  let toolSync = () => {}
+  const markerRuns = new Map()
+  let lastMarkerError = ''
+  let lastMarkerWarning = ''
   let queue = Promise.resolve()
   const serial = operation => { const result = queue.then(operation); queue = result.catch(() => {}); return result }
   const clientFactory = options.clientFactory ?? (value => new GatewayClient(value))
@@ -237,7 +259,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     const attachment = media?.attachment ? await attachmentWithBytes(media.attachment) : undefined
     const changes = { kind: media?.kind || 'video', status: media ? 'ready' : failed ? 'failed' : 'pending',
       ...(attachment ? { attachment } : {}), error: media ? '' : failed ? job.error || '生成未完成' : '',
-      anchor: binding.anchor || '', caption: `RunningHub · ${job.model}` }
+      anchor: binding.anchor || '', caption: binding.caption || `RunningHub · ${job.model}` }
     if (existing) {
       const previous = existing.attachment
       const sizeChanged = Boolean(attachment && previous?.attachmentId === attachment.attachmentId
@@ -387,39 +409,77 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     return lines.join('\n')
   }
   // 端口指令末尾的「用法说明」是给人看的，模板正文只保留上面给模型的部分。
-  function nativeDirectiveText(text, description, mode) {
-    const pipeline = Boolean(description?.pipeline)
-    // 网关模板是给「只能回文本」的外部 LLM 写的，末尾要求 image### / video### 包裹。
-    // 插件是原生工具调用，直接给结构化字段；把这段标记说明从 Skill 里摘掉，避免模型多包一层。
-    let body = text
+  function directiveBody(text) {
+    const marker = text.search(/（用法说明[^）]*不用发给\s*LLM/)
+    let body = (marker >= 0 ? text.slice(0, marker) : text).trim()
     const section = body.search(/^[ \t]*【输出包裹格式[^】]*】[ \t]*$/m)
     if (section >= 0) body = body.slice(0, section).trim()
+    return body
+  }
+  // 两种通道共用的语义修正：去掉「需要出视频时」这种会被读成「没要求就不做」的条件句。
+  function commonDirectiveRewrite(body) {
+    let next = body
+    next = next.replace(/需要出视频时[，,]?\s*/g, '')
+    next = next.replace(/如果需要(?:生成|出)视频[，,]?\s*/g, '')
+    next = next.replace(/下面是给「[^」]+」这条工作流写提示词的完整规则。\s*/g, '')
+    next = next.replace(/规则里说的「用户的需求」[^。]*。\s*/g, '')
+    // 「只引用用户真的提到过的素材」会被模型读成「没提到就不用写」：默认素材明明附上了，
+    // 提示词里却一条 <Picture N> 都没有，10/22 20:19 的三单就是这样丢的参考图。
+    next = next.replace(/[^\n]*只引用用户真的提到过的素材[^\n]*(?:\n|$)/g,
+      '- 这条工作流接的是参考素材，官方上限为 9 张参考图、3 段参考音频。默认素材清单里的标签要按用途写进提示词，清单外的编号不要编——多写不存在的标签会被 H3 节点拒绝。\n')
+    return next
+  }
+  // 工具调用模式：网关模板是给「只能回文本」的外部 LLM 写的，末尾要求 image### / video### 包裹。
+  // 插件是原生工具调用，直接给结构化字段；把这段标记说明摘掉，避免模型多包一层。
+  function nativeDirectiveText(text, description, mode) {
+    const pipeline = Boolean(description?.pipeline)
+    let body = commonDirectiveRewrite(directiveBody(text))
     body = body.replace(/再照末尾【输出包裹格式】包上标记/g, '再分别放进工具参数')
     body = body.replace(/两段各自用末尾那节【输出包裹格式】给的标记包起来：[^\n]*/g,
       '把两段提示词分别放进工具参数：生图段 input.image_prompt、视频段 input.prompt，不要包标记。')
     body = body.replace(/[^\n]*【输出包裹格式】[^\n]*(?:\n|$)/g,
       pipeline ? '把两段提示词分别放进 input.image_prompt 与 input.prompt，不要包标记。' : '把提示词直接放进 input.prompt，不要包标记。')
-    // 网关模板里「需要出视频时」这类条件会被模型理解成“没要求就不做”，统一改成直接写法。
-    body = body.replace(/需要出视频时[，,]?\s*/g, '')
-    body = body.replace(/如果需要(?:生成|出)视频[，,]?\s*/g, '')
-    body = body.replace(/下面是给「[^」]+」这条工作流写提示词的完整规则。\s*/g, '')
     body = body.replace(/按这些规则写好提示词[，,]\s*再分别放进工具参数。\s*/g, '')
-    body = body.replace(/规则里说的「用户的需求」[^。]*。\s*/g, '')
-    // 「只引用用户真的提到过的素材」会被模型读成「没提到就不用写」：默认素材明明附上了，
-    // 提示词里却一条 <Picture N> 都没有，10/22 20:19 的三单就是这样丢的参考图。
-    body = body.replace(/[^\n]*只引用用户真的提到过的素材[^\n]*(?:\n|$)/g,
-      '- 这条工作流接的是参考素材，官方上限为 9 张参考图、3 段参考音频。默认素材清单里的标签要按用途写进提示词，清单外的编号不要编——多写不存在的标签会被 H3 节点拒绝。\n')
     const override = pipeline
       ? '生图段放进 input.image_prompt，视频段放进 input.prompt；不要包文本标记。'
       : '提示词直接放进 input.prompt；不要包文本标记。'
     const referenceRule = description ? referencePromptRule(description, mode) : ''
     return [override, referenceRule ? `【参考素材 · 优先级最高】\n${referenceRule}` : '', body.trim()].filter(Boolean).join('\n\n')
   }
-  function directiveText(text, description, mode) {
+  // 正文标记模式：模板里的工具参数 / image### 说法全部改写成 @image / @video。
+  // 格式说明由 markerPromptSpec() 另放在模板前面，这里只保留工作流自己的写作规则。
+  function markerDirectiveText(text, description, mode) {
+    const pipeline = Boolean(description?.pipeline)
+    let body = commonDirectiveRewrite(directiveBody(text))
+    body = body.replace(/再照末尾【输出包裹格式】包上标记/g, '再按正文标记格式写')
+    body = body.replace(/两段各自用末尾那节【输出包裹格式】给的标记包起来：[^\n]*/g,
+      '把生图段写在 @image 之后，视频段写在 @video 之后。')
+    body = body.replace(/[^\n]*【输出包裹格式】[^\n]*(?:\n|$)/g,
+      pipeline ? '把生图段写在 @image 之后，视频段写在 @video 之后。' : '把提示词写在 @prompt 之后。')
+    body = body.replace(/按这些规则写好提示词[，,]\s*再分别放进工具参数。\s*/g, '按这些规则写好提示词，再按正文标记格式写进标记块。')
+    body = body.replace(/把两段提示词分别放进工具参数[^\n]*/g, '把两段提示词分别写在 @image 与 @video 之后。')
+    body = body.replace(/把提示词直接放进 input\.prompt[^\n]*/g, '把提示词写在 @prompt 之后。')
+    body = body.replace(/再分别放进工具参数/g, '再按正文标记格式写')
+    body = body.replace(/\binput\.image_prompt\b/g, '@image')
+    body = body.replace(/\binput\.prompt\b/g, pipeline ? '@video' : '@prompt')
+    body = body.replace(/\bimage###/g, '@image')
+    body = body.replace(/\bvideo###/g, '@video')
+    // 网关模板用单独一行 ### 收尾；正文标记不需要这层围栏，留着会让模型困惑。
+    body = body.replace(/^[ \t]*###[ \t]*$/gm, '')
+    body = body.replaceAll('工具参数', '正文标记字段')
+    const override = pipeline
+      ? '生图段写在 @image 之后，视频段写在 @video 之后；不要写进工具参数，也不要调用 RunningHub 工具。'
+      : '提示词写在 @prompt 之后；不要写进工具参数，也不要调用 RunningHub 工具。'
+    const referenceRule = description ? referencePromptRule(description, mode) : ''
+    return [override, referenceRule ? `【参考素材 · 优先级最高】\n${referenceRule}` : '', body.trim()].filter(Boolean).join('\n\n')
+  }
+  function directiveText(text, description, mode, channel = 'tool') {
     if (typeof text !== 'string') return ''
-    const marker = text.search(/（用法说明[^）]*不用发给\s*LLM/)
-    const body = (marker >= 0 ? text.slice(0, marker) : text).trim()
-    return description ? nativeDirectiveText(body, description, mode) : body
+    const body = directiveBody(text)
+    if (!description) return body
+    return channel === 'marker'
+      ? markerDirectiveText(body, description, mode)
+      : nativeDirectiveText(body, description, mode)
   }
   /**
    * 端口指令里的素材清单：管线要把生图侧、视频侧的默认素材一起给网关，
@@ -494,21 +554,24 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
   }
   async function refreshDirective(active, description) {
     if (!description) {
-      promptDirective.model = ''; promptDirective.mode = ''; promptDirective.text = ''; promptDirective.error = ''
+      resetDirective()
       return promptDirective
     }
     const mode = templateMode(description)
     const key = [description.alias, description.revision || '', mode].join('|')
     if (promptDirective.key === key) return promptDirective
+    promptDirective.pipeline = Boolean(description.pipeline)
     const extras = portDirectiveExtras(description)
     let lastError
     for (const candidate of [mode, ...templateFallbacks(mode)]) {
       try {
         const result = await active.client.portDirective(description.alias, candidate, undefined, extras)
+        const resolvedMode = result.mode || candidate
         promptDirective.key = key
         promptDirective.model = description.alias
-        promptDirective.mode = result.mode || candidate
-        promptDirective.text = directiveText(result.text, description, result.mode || candidate)
+        promptDirective.mode = resolvedMode
+        promptDirective.text = directiveText(result.text, description, resolvedMode, 'tool')
+        promptDirective.markerText = directiveText(result.text, description, resolvedMode, 'marker')
         promptDirective.error = ''
         lastError = undefined
         break
@@ -523,6 +586,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
       promptDirective.model = description.alias
       promptDirective.mode = mode
       promptDirective.text = ''
+      promptDirective.markerText = ''
       promptDirective.error = sanitizeMessage(lastError.message)
     }
     return promptDirective
@@ -1231,8 +1295,126 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     return changed
   }
 
+  /**
+   * 正文标记（非工具调用模式）：模型把镜头提示词写进正文块，宿主在结算时
+   * 1) 解析；2) 从正文里移除；3) 按 @after 把插件媒体占位挂到新版本上。
+   * 选片失败时不回滚正文：提示词已经清掉了，失败原因挂成一条失败占位，玩家能看到。
+   */
+  async function attachMarkerFailure({ gameId, turn, textVersion, anchor, error }) {
+    if (typeof ctx.tavern.attach !== 'function') return
+    await ctx.tavern.attach({
+      gameId, turn, textVersion,
+      item: {
+        kind: 'video', status: 'failed',
+        error: sanitizeMessage(error?.message || error || '正文标记生成失败'),
+        anchor: typeof anchor === 'string' ? anchor : '',
+        caption: `RunningHub · ${model || '当前工作流'}`,
+        data: { runninghubMarkerFailure: true },
+      },
+    })
+  }
+
+  async function processMarkerTurn(value = {}) {
+    if (generationMode !== 'marker' || !autoInsert || !alwaysSendPrompt) return null
+    if (typeof ctx.tavern.editTurn !== 'function' || typeof ctx.tavern.attach !== 'function') return null
+    if (!value || typeof value.rawText !== 'string' || !hasMarkerBlock(value.rawText)) return null
+    if (typeof value.gameId !== 'string' || !value.gameId) return null
+    if (!Number.isInteger(value.turn) || value.turn < 1) return null
+    if (typeof value.textVersion !== 'string' || !value.textVersion) return null
+    const key = value.gameId + '\u0000' + value.turn + '\u0000' + value.textVersion
+    if (markerRuns.has(key)) return markerRuns.get(key)
+    const run = (async () => {
+      // 模板不可用时仍要清正文：否则提示词会留在历史里污染后续回合。
+      // 模板没加载时按块里是否同时出现 @image / @video 猜管线，交给网关描述再最终校验。
+      const directiveReady = promptDirective.model === model && Boolean(directiveFor('marker'))
+      const pipeline = promptDirective.pipeline === true
+        || (!directiveReady && /^[ \t]*@image\b/im.test(value.rawText) && /^[ \t]*@video\b/im.test(value.rawText))
+      const parsed = parseMarkerShots(value.rawText, { pipeline, limit: videosPerTurn })
+      if (!parsed.found) return null
+      if (!parsed.text.trim()) throw fail('正文标记块之外没有正文，未清理这一轮')
+      let edited = null
+      let retained = ''
+      try {
+        edited = await ctx.tavern.editTurn({
+          gameId: value.gameId, turn: value.turn, textVersion: value.textVersion, text: parsed.text,
+        })
+        if (!edited || typeof edited.textVersion !== 'string' || !edited.textVersion) throw fail('正文清理失败，宿主未返回新的正文版本')
+      } catch (error) {
+        const message = sanitizeMessage(error?.message || error || '正文清理失败')
+        // Tavern 的正文编辑器要求 HTML 块保持原样。提示词一旦跨进 HTML 块
+        // （典型情况：模型把 <Picture 1> 写在独立行，Tavern 把后面整段当成 HTML），
+        // editTurn 会拒绝清理。这里不能把整轮任务一起丢掉：保留正文、按当前
+        // 版本提交，并在面板上明确说明提示词只在界面隐藏。下一轮按新的格式
+        // 说明写（标记块放在 HTML 之后，尖括号写成 &lt;…&gt;）就能正常清理。
+        if (!/HTML\s*块|HTML block/i.test(message)) throw error
+        retained = message
+        edited = null
+      }
+      const bindingBase = { gameId: value.gameId, turn: value.turn, textVersion: edited?.textVersion || value.textVersion }
+      // 模板和网关都不可用也要把失败原因落下来，不能悄悄吞掉这几个镜头。
+      let active = null
+      let prepareError = ''
+      try {
+        active = await connect()
+        await ensureModel(active)
+      } catch (error) {
+        prepareError = sanitizeMessage(error?.message || error || '网关不可用')
+      }
+      const jobs = []
+      for (const shot of parsed.shots) {
+        const anchor = shot.anchor || ''
+        if (shot.error) {
+          await attachMarkerFailure({ ...bindingBase, anchor, error: shot.error }).catch(() => {})
+          continue
+        }
+        if (!active) {
+          await attachMarkerFailure({ ...bindingBase, anchor, error: prepareError || '网关不可用，未提交' }).catch(() => {})
+          continue
+        }
+        try {
+          const requestId = markerRequestId({ gameId: value.gameId, turn: value.turn, textVersion: value.textVersion, index: shot.index })
+          const input = shot.image && shot.video
+            ? { prompt: shot.video, image_prompt: shot.image }
+            : { prompt: shot.prompt }
+          const job = await submitJob({
+            action: 'submit', requestId, input, bindToTurn: false,
+          }, undefined, { marker: true, binding: { ...bindingBase, anchor, caption: shot.caption || '' } })
+          jobs.push(job)
+          // 立刻挂 pending 占位，不等下一次 5s 对账；视频完成后 update 同一个媒体项。
+          await reconcileJob(job).catch(error => { insertionErrors.set(job.id, sanitizeMessage(error.message)) })
+        } catch (error) {
+          await attachMarkerFailure({ ...bindingBase, anchor, error }).catch(() => {})
+        }
+      }
+      lastMarkerError = ''
+      lastMarkerWarning = retained
+        ? (jobs.length
+          ? '本轮正文含 HTML，提示词没能从存档里移除（只在界面隐藏）；镜头已照常提交。'
+          : '本轮正文含 HTML，提示词没能从存档里移除；本轮没有可提交的镜头。')
+        : ''
+      if (retained) console.warn('[dsh-runninghub] 正文标记清理被 HTML 块拦下，已继续提交：' + retained)
+      return { edited: Boolean(edited), jobs, textVersion: bindingBase.textVersion,
+        ...(retained ? { warning: lastMarkerWarning } : {}) }
+    })()
+    markerRuns.set(key, run)
+    try {
+      return await run
+    } catch (error) {
+      lastMarkerError = sanitizeMessage(error?.message || error || '正文标记处理失败')
+      return null
+    } finally {
+      markerRuns.delete(key)
+    }
+  }
+
   async function handleTurn(value = {}) {
     if (disposed) return
+    if (generationMode === 'marker') {
+      const markerTurn = await processMarkerTurn(value)
+      // editTurn 换了一个正文版本；后面的待结算绑定与池子发送必须落在新版本上，
+      // 否则媒体会挂到已经不在显示的旧版本，玩家看不到。
+      if (markerTurn?.textVersion) value = { ...value, textVersion: markerTurn.textVersion }
+    }
     if (await resolvePendingBindings(value)) await reconcile()
     const gameId = pregenGameId(value.gameId)
     // 不依赖 onChange 一定送达：每轮先把任务状态对一遍，再补过期与发送落位。
@@ -1246,7 +1428,8 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
       await persistPregen(gameId).catch(() => {})
     }
     await flushPregenSends(gameId, state, value).catch(() => {})
-    if (state.settings.count > 0) await planPregen(gameId, 'turn', { turn, text: value.text })
+    // 正文标记模式不把预生成池注入提示词，也就不再自动花积分补池；手动补池仍可用。
+    if (generationMode !== 'marker' && state.settings.count > 0) await planPregen(gameId, 'turn', { turn, text: value.text })
   }
 
   function pregenPromptText(gameId) {
@@ -1281,7 +1464,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     let configured = Boolean((await ctx.credentials.resolve(credentialName(baseURL)))?.value)
     let settingsError = ''
     if (!configured) {
-      model = ''; workflows = []; promptDirective.model = ''; promptDirective.text = ''; promptDirective.error = ''
+      model = ''; workflows = []; resetDirective()
     }
     if (configured) {
       try {
@@ -1319,11 +1502,13 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
         pregen = { ...publicPregenState(normalizePregenState(undefined, gameId)), lastError: sanitizeMessage(error.message) }
       }
     }
-    return { configured, baseURL, autoInsert, alwaysSendPrompt, videosPerTurn,
+    return { configured, baseURL, generationMode, autoInsert, alwaysSendPrompt, videosPerTurn,
       applyDefaults: applyDefaultsPref, bindToTurn: bindToTurnPref,
       workflowSettings: true,
       adapter: 'gateway', model, defaultModel, jobs: clientJobs(await store.list()), workflows,
       ...(pregen ? { pregen } : {}),
+      ...(lastMarkerError ? { markerError: lastMarkerError } : {}),
+      ...(lastMarkerWarning ? { markerWarning: lastMarkerWarning } : {}),
       ...(directive ? { templateMode: directive.mode, ...(directive.error ? { templateError: directive.error } : {}) } : {}),
       ...(workflowError ? { gatewayError: workflowError } : {}), ...(settingsError ? { settingsError } : {}) }
   }
@@ -1340,11 +1525,11 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
       if (previous?.source === 'env' || info?.source === 'env' || info?.writable === false) throw fail('网关 Key 来自只读凭据，请修改凭据来源')
       await ctx.credentials.set(ref, supplied)
     }
-    await atomicJSON(settingsFile, { baseURL: nextBase, autoInsert, alwaysSendPrompt, videosPerTurn, applyDefaults: applyDefaultsPref, bindToTurn: bindToTurnPref })
+    await atomicJSON(settingsFile, { baseURL: nextBase, autoInsert, alwaysSendPrompt, videosPerTurn, applyDefaults: applyDefaultsPref, bindToTurn: bindToTurnPref, generationMode })
     engine?.dispose(); engine = undefined; client = undefined; clientIdentity = undefined
     baseURL = nextBase; workflows = []; workflowError = ''
     selectedModel = ''; model = ''; defaultModel = ''
-    promptDirective.key = ''; promptDirective.model = ''; promptDirective.mode = ''; promptDirective.text = ''; promptDirective.error = ''
+    resetDirective()
     await saveSelection('')
     return { configured: true, baseURL, adapter: 'gateway' }
   }
@@ -1402,9 +1587,9 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     if (input.action === 'submit') return submitJob(input, exec)
     return serial(async () => {
       if (input.action === 'preferences') {
-        keys(input, ['action', 'autoInsert', 'alwaysSendPrompt', 'videosPerTurn', 'applyDefaults', 'bindToTurn'])
+        keys(input, ['action', 'autoInsert', 'alwaysSendPrompt', 'videosPerTurn', 'applyDefaults', 'bindToTurn', 'generationMode'])
         if (input.autoInsert === undefined && input.alwaysSendPrompt === undefined
-          && input.videosPerTurn === undefined
+          && input.videosPerTurn === undefined && input.generationMode === undefined
           && input.applyDefaults === undefined && input.bindToTurn === undefined) throw fail('没有要保存的偏好')
         for (const key of ['autoInsert', 'alwaysSendPrompt', 'applyDefaults', 'bindToTurn']) {
           if (input[key] !== undefined && typeof input[key] !== 'boolean') throw fail(key + ' 必须是布尔值')
@@ -1413,7 +1598,15 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
           && (!Number.isInteger(input.videosPerTurn) || input.videosPerTurn < 1 || input.videosPerTurn > VIDEOS_PER_TURN_MAX)) {
           throw fail(`每回合视频段数必须是 1–${VIDEOS_PER_TURN_MAX} 的整数`)
         }
+        if (input.generationMode !== undefined && input.generationMode !== 'tool' && input.generationMode !== 'marker') {
+          throw fail('生成方式只能是 tool 或 marker')
+        }
+        if (input.generationMode === 'marker'
+          && (typeof ctx.tavern.editTurn !== 'function' || typeof ctx.tavern.attach !== 'function' || typeof ctx.tavern.onTurnSettled !== 'function')) {
+          throw fail('当前 Tavern 宿主不支持正文编辑/媒体插入，无法使用正文标记模式')
+        }
         const next = {
+          generationMode: input.generationMode === undefined ? generationMode : input.generationMode,
           autoInsert: input.autoInsert === undefined ? autoInsert : input.autoInsert,
           alwaysSendPrompt: input.alwaysSendPrompt === undefined ? alwaysSendPrompt : input.alwaysSendPrompt,
           videosPerTurn: input.videosPerTurn === undefined ? videosPerTurn : input.videosPerTurn,
@@ -1421,11 +1614,16 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
           bindToTurn: input.bindToTurn === undefined ? bindToTurnPref : input.bindToTurn,
         }
         await atomicJSON(settingsFile, { baseURL, ...next })
+        generationMode = next.generationMode
         autoInsert = next.autoInsert
         alwaysSendPrompt = next.alwaysSendPrompt
         videosPerTurn = next.videosPerTurn
         applyDefaultsPref = next.applyDefaults
         bindToTurnPref = next.bindToTurn
+        // 正文标记模式不向模型开放生成工具；切回工具调用时再注册回来。
+        lastMarkerError = ''
+        lastMarkerWarning = ''
+        try { toolSync() } catch { /* 工具注册失败不阻断设置保存 */ }
         return next
       }
       if (input.action === 'configure') return configure(input)
@@ -1498,8 +1696,9 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
         const alias = await ensureModel(active)
         if (input.model !== undefined && input.model !== alias) throw fail('工作流由面板选择，不能在此指定其他工作流')
         const description = await active.client.describe(alias)
-        const templateReady = promptDirective.model === alias && Boolean(promptDirective.text)
+        const templateReady = promptDirective.model === alias && Boolean(directiveFor(generationMode))
         return { ...description,
+          generationMode,
           promptTemplateReady: templateReady,
           promptTemplateEnabled: alwaysSendPrompt,
           promptTemplateSent: alwaysSendPrompt && templateReady,
@@ -1596,14 +1795,21 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
    * 同一轮的多段视频才能真正一起发出去。只有「查重 + 建任务」这一小段进
    * 全局串行锁，保证同一个 requestId 只落一条任务、只收一次费。
    */
-  async function submitJob(input, exec) {
+  async function submitJob(input, exec, internal = {}) {
+    const marker = internal?.marker === true
     keys(input, ['action', 'input', 'gameId', 'bindToTurn', 'requestId', 'anchor'])
     validateRequestId(input.requestId)
     // Deduplicate before looking at the now-current turn or schema: an uncertain browser retry
     // must return the original job even if the game moved on since it was accepted.
     const existing = (await store.list()).find(job => job.requestId === input.requestId)
     if (existing) return { ...existing, ...(replays.has(existing.id) ? { replayable: true } : {}) }
-    if (exec && !alwaysSendPrompt) {
+    // 正文标记模式下模型不该再走生成工具；即使旧请求还带着工具也由宿主拒绝。
+    if (exec && generationMode === 'marker') {
+      throw fail('当前是正文标记（非工具调用）模式，模型不能调用 runninghub_generate；请按正文标记格式把提示词写在正文里。')
+    }
+    if (marker && generationMode !== 'marker') throw fail('当前不是正文标记模式')
+    if (marker && !object(internal.binding)) throw fail('正文标记提交缺少插入位置')
+    if ((exec || marker) && !alwaysSendPrompt) {
       throw fail('插件设置里「总是发送提示词模板」已关闭，模型生成拿不到当前工作流模板。请在面板设置里开启，或用面板手动生成。')
     }
     // 自动插入关闭时，模型不能自行提交；由宿主直接拒绝，不把判断交给模型。
@@ -1640,9 +1846,9 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     }
     prompt = restoreTags(prompt)
     imagePrompt = restoreTags(imagePrompt)
-    // 面板手动提交允许自由散文（玩家可能只想快速试参数）；模型走工具提交时
-    // 必须按全参考模板写，缺段在花钱之前拦住。工具调用一定带 exec，面板走 route 不带。
-    if (exec) assertReferencePrompt(prompt, referencePromptMode(description), attachedReferences(description))
+    // 面板手动提交允许自由散文（玩家可能只想快速试参数）；模型走工具提交或
+    // 正文标记提交时必须按全参考模板写，缺段在花钱之前拦住。
+    if (exec || marker) assertReferencePrompt(prompt, referencePromptMode(description), attachedReferences(description))
     const prepared = { ...input.input, model: alias, prompt }
     delete prepared.image_prompt
     if (pipelineKind && imagePrompt) {
@@ -1653,7 +1859,9 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     if (input.anchor !== undefined && (typeof input.anchor !== 'string' || input.anchor.length > 500)) throw fail('anchor 必须是最多 500 字的正文原句')
     let binding
     const sessionId = exec?.agent?.session?.id
-    if (autoInsert && sessionId) {
+    if (marker) {
+      binding = internal.binding
+    } else if (autoInsert && sessionId) {
       exec.signal?.throwIfAborted()
       if (input.gameId && input.gameId !== sessionId) throw fail('game_id 与当前工具调用会话不一致')
       binding = await autoInsertBinding(sessionId, input.anchor || '')
@@ -1801,15 +2009,35 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
   function promptText(gameId) {
     if (!alwaysSendPrompt) return ''
     const parts = []
+    const channel = generationMode
+    const directive = directiveFor(channel)
     if (!model) {
-      if (autoInsert) parts.push('本回合还没有选择 RunningHub 工作流，不要调用 runninghub_generate；正文照常写。')
-    } else if (promptDirective.model !== model || !promptDirective.text) {
-      parts.push(`当前工作流的提示词模板不可用${promptDirective.error ? '（' + promptDirective.error + '）' : ''}，本回合不要调用 runninghub_generate；正文照常写。`)
+      if (autoInsert) parts.push(channel === 'marker'
+        ? '本回合还没有选择 RunningHub 工作流，不要写 [[RH:SHOT]] 标记块；正文照常写。'
+        : '本回合还没有选择 RunningHub 工作流，不要调用 runninghub_generate；正文照常写。')
+    } else if (promptDirective.model !== model || !directive) {
+      parts.push(`当前工作流的提示词模板不可用${promptDirective.error ? '（' + promptDirective.error + '）' : ''}，本回合${channel === 'marker' ? '不要写 [[RH:SHOT]] 标记块' : '不要调用 runninghub_generate'}；正文照常写。`)
+    } else if (channel === 'marker') {
+      if (autoInsert) {
+        parts.push(`本回合生成 ${videosPerTurn} 个镜头。先在思考里定稿完整的本轮正文，从上一轮结束后的下一个动作开始，不要重播上一轮已经写过的画面；然后在本轮正文最后写 ${videosPerTurn} 个标记块（不要多也不要少），上一轮和历史正文不能作为本轮视频内容。标记块会被宿主移除，正文才是玩家看到的剧情。`)
+        parts.push(markerPromptSpec({ pipeline: promptDirective.pipeline, count: videosPerTurn }))
+      }
+      parts.push(directive)
+      if (promptDirective.mode === 'h3-ref2va' || promptDirective.mode === 'h3-hybrid') {
+        parts.push('提示词按顺序带六段：subject_definitions、summary、retention_analysis、detailed_description、overall_soundscape、non_diegetic_music；人物用 <Subject 1> 定义、正文用 <Subject 1> 指代，<Picture 1> 要写进主体定义，不能单独成条也不能漏。')
+      }
+      parts.push([
+        autoInsert
+          ? '严格按上面的标记格式：块开始 [[RH:SHOT]]、块结束 [[/RH:SHOT]]，字段单独占一行；@after 逐字引用本轮正文原句，省略则附在正文末尾。'
+          : '本回合不要生成镜头，也不要写 [[RH:SHOT]] 标记块；正文照常写。',
+        '不要调用 runninghub_generate、runninghub_send_pregenerated 或其它 RunningHub 工具；Tavern 要求用 submit_story 时，把正文和标记块一起放进 content。',
+        ...(autoInsert ? ['标记块必须放在正文最后，块外不要写提示词说明、摘要或收尾语。'] : []),
+      ].join('\n\n'))
     } else {
       if (autoInsert) {
         parts.push(`本回合生成 ${videosPerTurn} 段视频。严格按顺序：1) 先在思考里定稿完整的本轮正文，从上一轮结束后的下一个动作开始，不要重播上一轮已经写过的画面；2) 只从这份本轮正文里挑 ${videosPerTurn} 个最精彩的瞬间写视频提示词，上一轮和历史正文不能作为本轮视频内容；3) 每条视频的 anchor 必须逐字引用本轮正文里的原句；4) 在同一条回复里先调用 runninghub_generate 提交 ${videosPerTurn} 段（不要多也不要少），紧接着在同一条回复里调用 submit_story，把同一份完整正文放进 content；submit_story 必须是这条回复的最后一个工具调用。不要只提交视频、等工具结果再补正文——那样正文会丢，视频也白生成；anchor 只是定位句，不能代替正文。`)
       }
-      parts.push(promptDirective.text)
+      parts.push(directive)
       if (promptDirective.mode === 'h3-ref2va' || promptDirective.mode === 'h3-hybrid') {
         parts.push('提示词按顺序带六段：subject_definitions、summary、retention_analysis、detailed_description、overall_soundscape、non_diegetic_music；人物用 <Subject 1> 定义、正文用 <Subject 1> 指代，<Picture 1> 要写进主体定义，不能单独成条也不能漏。')
       }
@@ -1821,7 +2049,8 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
         ].join('\n\n'))
       }
     }
-    const pool = pregenPromptText(gameId)
+    // 预生成池只有在模型能用 runninghub_send_pregenerated 时才有意义。
+    const pool = channel === 'tool' ? pregenPromptText(gameId) : ''
     if (pool) parts.push(pool)
     return parts.join('\n\n')
   }
@@ -1832,8 +2061,11 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
   // 每回合一条短提醒，放在本轮上下文里，避免长系统提示词里的自动插入要求被忽略。
   function turnReminder(input = '') {
     if (!alwaysSendPrompt || !autoInsert || !model) return ''
-    if (promptDirective.model !== model || !promptDirective.text) return ''
+    if (promptDirective.model !== model || !directiveFor(generationMode)) return ''
     const lead = typeof input === 'string' && input.trim() ? `本轮玩家指引：${input.trim().slice(0, 500)}。` : ''
+    if (generationMode === 'marker') {
+      return `【RunningHub】${lead}先按这条指引定稿本轮正文；在正文最后按格式写 ${videosPerTurn} 个 [[RH:SHOT]] 标记块（@after 用正文原句），不要调用 RunningHub 生成工具。宿主会移除标记块，并把成片插在 @after 那句之后。不要用上一轮画面，块外不要重复提示词。`
+    }
     return `【RunningHub】${lead}先按这条指引定稿本轮正文，再从正文里挑 ${videosPerTurn} 个瞬间写视频提示词（anchor 用正文原句）；然后在同一条回复里调用 runninghub_generate 提交 ${videosPerTurn} 段，并紧接着调用 submit_story 提交完整正文（最后一个工具调用）。不要等工具结果再补正文，也不要用上一轮画面。`
   }
   function dispose() {
@@ -1841,14 +2073,17 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     clearInterval(reconcileTimer)
     for (const handle of pregenPlanners.values()) handle.controller.abort()
     pregenPlanners.clear()
+    markerRuns.clear()
     engine?.dispose()
   }
   reconcileTimer = setInterval(() => { void reconcile().catch(() => {}) }, options.reconcileMs ?? 5000)
   reconcileTimer.unref?.()
   await initPregen()
   return { dispatch, route, store, replays, resume, dispose, reconcile, promptText, promptSections, turnReminder, handleTurn,
-    removeGame: removePregenGame, get autoInsert() { return autoInsert }, get alwaysSendPrompt() { return alwaysSendPrompt },
-    get videosPerTurn() { return videosPerTurn } }
+    removeGame: removePregenGame,
+    setToolSync(fn) { toolSync = typeof fn === 'function' ? fn : () => {}; toolSync() },
+    get generationMode() { return generationMode }, get autoInsert() { return autoInsert },
+    get alwaysSendPrompt() { return alwaysSendPrompt }, get videosPerTurn() { return videosPerTurn } }
 }
 
 export async function apply(ctx, config = {}) {
@@ -1874,51 +2109,83 @@ export async function apply(ctx, config = {}) {
   if (ctx.tavern.turnSection) {
     ctx.tavern.turnSection({ name: 'auto-insert-reminder', text: context => host.turnReminder(context?.input) })
   }
+  // 正文标记块在 editTurn 之前还会被这一轮的结算 / 候选 / 压缩看到：
+  // 明确告诉后台这截是生成提示词，不是剧情，避免写进变量或摘要。
+  const markerIgnore = '正文末尾 [[RH:SHOT]] 到 [[/RH:SHOT]] 之间是给视频生成用的提示词，不属于剧情；不要据此更新变量、人物状态、摘要或候选。'
+  const markerIgnoreText = () => host.generationMode === 'marker' ? markerIgnore : ''
+  for (const name of ['settlementSection', 'candidateSection', 'compactionSection']) {
+    if (typeof ctx.tavern[name] !== 'function') continue
+    try { ctx.tavern[name]({ name: 'marker-ignore', text: markerIgnoreText }) }
+    catch { /* 旧宿主或同名冲突不阻断正文 */ }
+  }
   // 预生成规划用 DSH 的 llm 服务 + 这局的后台模型；拿不到时池子会显示明确错误，不影响其它功能。
   ctx.inject(['llm'], scoped => { runtime.llm = scoped.llm })
   // Large base64 inputs use the bounded same-origin HTTP route, not the 256KB callHost RPC.
-  ctx.inject(['tools'], toolsCtx => {
-    const specs = [
-      ['runninghub_describe', 'Read the panel-selected workflow parameters and reference slots. Does not submit or change the selection.',
-        { type: 'object', properties: { model: { type: 'string', description: 'Omit; kept only for compatibility. The panel selection wins.' } }, additionalProperties: false },
-        args => host.dispatch({ action: 'describe', ...(args.model ? { model: args.model } : {}) })],
-      ['runninghub_generate', 'Submit ONE image/video job for the panel-selected workflow. input.prompt = video prompt; for a pipeline input.image_prompt = image prompt. No image### / video### fences. Keep the same request_id on uncertain retries; never automatically regenerate. When auto-insert is on, submit every video and then call submit_story in the SAME reply (it must be the last tool call); do not wait for these results before submitting the story.',
-        { type: 'object', properties: {
-          request_id: { type: 'string' },
-          input: { type: 'object', properties: {
-            prompt: { type: 'string', description: 'Video/main prompt. Plain text, no video### fence. For a single-stage workflow this is the only prompt.' },
-            image_prompt: { type: 'string', description: 'Image-side prompt for a pipeline (first-frame or grid). Plain text, no image### fence. Omit for single-stage workflows.' },
-            custom: { type: 'object', additionalProperties: true },
-            resolution: { type: 'object', additionalProperties: true },
-            references: { type: 'array', items: { type: 'object', additionalProperties: true } },
-            duration_seconds: { type: 'number' },
-            apply_defaults: { type: 'boolean' },
-          }, required: ['prompt'], additionalProperties: true },
-          game_id: { type: 'string' }, bind_to_turn: { type: 'boolean' },
-          anchor: { type: 'string', description: 'Exact sentence in the forthcoming story; insert video after it. Omit to append below the story.', maxLength: 500 },
-        }, required: ['request_id', 'input'], additionalProperties: false },
-        (args, exec) => host.dispatch({ action: 'submit', requestId: args.request_id, input: args.input, gameId: args.game_id,
-          bindToTurn: args.bind_to_turn ?? false, anchor: args.anchor }, exec)],
-      ['runninghub_status', 'Read local RunningHub job history for the selected workflow; only queries state, never submits or regenerates.',
-        { type: 'object', properties: {}, additionalProperties: false }, () => host.dispatch({ action: 'status' })],
-      ['runninghub_send_pregenerated', 'Send one ready video from the RunningHub pre-generation pool into the current story reply. Use it only when a pool entry matches the current scene, characters, clothing and location; it costs no credits and is available immediately. If the pool has no match, use runninghub_generate instead. Each pool entry can be sent only once; generating entries cannot be sent yet.',
-        { type: 'object', properties: {
-          pool_id: { type: 'string', description: 'pool_id listed under the RunningHub pre-generation pool (pg-xxxxxxxx).' },
-          anchor: { type: 'string', description: 'Exact sentence in the forthcoming story; insert the video after it. Omit to append below the story.', maxLength: 500 },
-          caption: { type: 'string', description: 'Optional caption shown with the video.', maxLength: 500 },
-        }, required: ['pool_id'], additionalProperties: false },
-        (args, exec) => host.dispatch({ action: 'pregen-send', gameId: exec?.agent?.session?.id, id: args.pool_id,
-          anchor: args.anchor, caption: args.caption, allowStale: false }, exec).then(({ pregen: _pregen, ...result }) => result)],
-    ]
-    // 这几个工具都只把任务写进本地库就返回，慢的是网关往返而不是生成本身。
-    // 声明并发安全后，宿主会把同一轮的多段提交一起发出去，正文提交不用等它们
-    // 一段一段跑完。发送预生成视频仍然独占：它要把池子里的条目认领给这一次生成。
-    const concurrencySafe = new Set(['runninghub_describe', 'runninghub_generate', 'runninghub_status'])
-    for (const [toolName, description, parameters, execute] of specs) toolsCtx.tools.register({
-      name: toolName, description, parameters, execute,
-      isConcurrencySafe: () => concurrencySafe.has(toolName),
-      output: { schema: {}, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
-    })
+  let toolsCtx = null
+  const toolDisposers = new Map()
+  const toolDefinition = ([toolName, description, parameters, execute], concurrencySafe) => ({
+    name: toolName, description, parameters, execute,
+    isConcurrencySafe: () => concurrencySafe.has(toolName),
+    output: { schema: {}, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+  })
+  const describeSpec = ['runninghub_describe', 'Read the panel-selected workflow parameters and reference slots. Does not submit or change the selection.',
+    { type: 'object', properties: { model: { type: 'string', description: 'Omit; kept only for compatibility. The panel selection wins.' } }, additionalProperties: false },
+    args => host.dispatch({ action: 'describe', ...(args.model ? { model: args.model } : {}) })]
+  const statusSpec = ['runninghub_status', 'Read local RunningHub job history for the selected workflow; only queries state, never submits or regenerates.',
+    { type: 'object', properties: {}, additionalProperties: false }, () => host.dispatch({ action: 'status' })]
+  const generationSpecs = [
+    ['runninghub_generate', 'Submit ONE image/video job for the panel-selected workflow. input.prompt = video prompt; for a pipeline input.image_prompt = image prompt. No image### / video### fences. Keep the same request_id on uncertain retries; never automatically regenerate. When auto-insert is on, submit every video and then call submit_story in the SAME reply (it must be the last tool call); do not wait for these results before submitting the story.',
+      { type: 'object', properties: {
+        request_id: { type: 'string' },
+        input: { type: 'object', properties: {
+          prompt: { type: 'string', description: 'Video/main prompt. Plain text, no video### fence. For a single-stage workflow this is the only prompt.' },
+          image_prompt: { type: 'string', description: 'Image-side prompt for a pipeline (first-frame or grid). Plain text, no image### fence. Omit for single-stage workflows.' },
+          custom: { type: 'object', additionalProperties: true },
+          resolution: { type: 'object', additionalProperties: true },
+          references: { type: 'array', items: { type: 'object', additionalProperties: true } },
+          duration_seconds: { type: 'number' },
+          apply_defaults: { type: 'boolean' },
+        }, required: ['prompt'], additionalProperties: true },
+        game_id: { type: 'string' }, bind_to_turn: { type: 'boolean' },
+        anchor: { type: 'string', description: 'Exact sentence in the forthcoming story; insert video after it. Omit to append below the story.', maxLength: 500 },
+      }, required: ['request_id', 'input'], additionalProperties: false },
+      (args, exec) => host.dispatch({ action: 'submit', requestId: args.request_id, input: args.input, gameId: args.game_id,
+        bindToTurn: args.bind_to_turn ?? false, anchor: args.anchor }, exec)],
+    ['runninghub_send_pregenerated', 'Send one ready video from the RunningHub pre-generation pool into the current story reply. Use it only when a pool entry matches the current scene, characters, clothing and location; it costs no credits and is available immediately. If the pool has no match, use runninghub_generate instead. Each pool entry can be sent only once; generating entries cannot be sent yet.',
+      { type: 'object', properties: {
+        pool_id: { type: 'string', description: 'pool_id listed under the RunningHub pre-generation pool (pg-xxxxxxxx).' },
+        anchor: { type: 'string', description: 'Exact sentence in the forthcoming story; insert the video after it. Omit to append below the story.', maxLength: 500 },
+        caption: { type: 'string', description: 'Optional caption shown with the video.', maxLength: 500 },
+      }, required: ['pool_id'], additionalProperties: false },
+      (args, exec) => host.dispatch({ action: 'pregen-send', gameId: exec?.agent?.session?.id, id: args.pool_id,
+        anchor: args.anchor, caption: args.caption, allowStale: false }, exec).then(({ pregen: _pregen, ...result }) => result)],
+  ]
+  // 这几个工具都只把任务写进本地库就返回，慢的是网关往返而不是生成本身。
+  // 声明并发安全后，宿主会把同一轮的多段提交一起发出去，正文提交不用等它们
+  // 一段一段跑完。发送预生成视频仍然独占：它要把池子里的条目认领给这一次生成。
+  const concurrencySafe = new Set(['runninghub_describe', 'runninghub_generate', 'runninghub_status'])
+  const toolSpecs = [describeSpec, statusSpec, ...generationSpecs]
+  function registerRunningHubTools() {
+    if (!toolsCtx || toolDisposers.size) return
+    for (const spec of toolSpecs) {
+      toolDisposers.set(spec[0], toolsCtx.tools.register(toolDefinition(spec, concurrencySafe)))
+    }
+  }
+  function unregisterRunningHubTools() {
+    for (const dispose of toolDisposers.values()) {
+      try { dispose() } catch { /* 已随插件作用域卸载 */ }
+    }
+    toolDisposers.clear()
+  }
+  function syncRunningHubTools() {
+    // 正文标记模式是「非工具调用」：运行时的工具列表里一个 RunningHub 工具都不留，
+    // 不只是生成工具。只读的 describe/status 也不该在游玩请求里出现。
+    if (host.generationMode === 'marker') unregisterRunningHubTools()
+    else registerRunningHubTools()
+  }
+  ctx.inject(['tools'], scoped => {
+    toolsCtx = scoped
+    host.setToolSync(syncRunningHubTools)
   })
   await host.resume()
 }

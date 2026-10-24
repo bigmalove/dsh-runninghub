@@ -123,6 +123,7 @@ test('RunningHub 重设计界面：jsdom + React DOM 隔离交互', {
   const baseURL = 'http://127.0.0.1:6888'
   const state = {
     configured: true,
+    generationMode: 'tool',
     autoInsert: false,
     alwaysSendPrompt: true,
     videosPerTurn: 3,
@@ -235,7 +236,7 @@ test('RunningHub 重设计界面：jsdom + React DOM 隔离交互', {
     }
     if (options.signal?.aborted) throw new window.DOMException('夹具请求已取消', 'AbortError')
     if (method === 'GET') {
-      return response({ configured: state.configured, autoInsert: state.autoInsert,
+      return response({ configured: state.configured, generationMode: state.generationMode, autoInsert: state.autoInsert,
         alwaysSendPrompt: state.alwaysSendPrompt !== false, videosPerTurn: state.videosPerTurn,
         applyDefaults: state.applyDefaults !== false, bindToTurn: state.bindToTurn !== false, workflowSettings: true, baseURL: state.baseURL,
         model: state.model, defaultModel: 'h3参考', templateMode: 'h3-ref2va', adapter: 'ui-fixture', jobs: state.jobs,
@@ -256,7 +257,8 @@ test('RunningHub 重设计界面：jsdom + React DOM 隔离交互', {
       case 'preferences': {
         const keys = ['autoInsert', 'alwaysSendPrompt', 'applyDefaults', 'bindToTurn'].filter(key => body[key] !== undefined)
         const hasVideos = body.videosPerTurn !== undefined
-        assert.ok(keys.length || hasVideos, 'preferences 至少带一个设置')
+        const hasMode = body.generationMode !== undefined
+        assert.ok(keys.length || hasVideos || hasMode, 'preferences 至少带一个设置')
         for (const key of keys) {
           assert.equal(typeof body[key], 'boolean')
           state[key] = body[key]
@@ -265,7 +267,11 @@ test('RunningHub 重设计界面：jsdom + React DOM 隔离交互', {
           assert.ok(Number.isInteger(body.videosPerTurn) && body.videosPerTurn >= 1 && body.videosPerTurn <= 10)
           state.videosPerTurn = body.videosPerTurn
         }
-        return response({ autoInsert: state.autoInsert, alwaysSendPrompt: state.alwaysSendPrompt,
+        if (hasMode) {
+          assert.ok(['tool', 'marker'].includes(body.generationMode))
+          state.generationMode = body.generationMode
+        }
+        return response({ generationMode: state.generationMode, autoInsert: state.autoInsert, alwaysSendPrompt: state.alwaysSendPrompt,
           videosPerTurn: state.videosPerTurn, applyDefaults: state.applyDefaults, bindToTurn: state.bindToTurn })
       }
       case 'pregen-settings': {
@@ -538,6 +544,22 @@ test('RunningHub 重设计界面：jsdom + React DOM 隔离交互', {
     await until(() => state.videosPerTurn === 5, '每回合视频段数保存')
     assert.deepEqual(actionCalls('preferences').at(-1).body, { action: 'preferences', videosPerTurn: 5 })
     assert.equal(node.value, '5')
+    await click(query('button[aria-label="关闭设置"]', drawer))
+  })
+
+  await t.test('生成方式切到正文标记并保存', async () => {
+    await click(button('设置'))
+    const drawer = query('[role="dialog"]')
+    const node = field('生成方式', drawer)
+    assert.equal(node.value, 'tool')
+    await change(() => {
+      node.value = 'marker'
+      node.dispatchEvent(new window.Event('change', { bubbles: true }))
+    })
+    await until(() => state.generationMode === 'marker', '正文标记模式保存')
+    assert.deepEqual(actionCalls('preferences').at(-1).body, { action: 'preferences', generationMode: 'marker' })
+    assert.match(drawer.textContent, /正文标记模式/)
+    assert.match(drawer.textContent, /\[\[RH:SHOT\]\]/)
     await click(query('button[aria-label="关闭设置"]', drawer))
   })
 

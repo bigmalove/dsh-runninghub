@@ -787,7 +787,8 @@ describe('workflow selection: panel state drives tools and prompt template', () 
       alias: 'qwen-pipe', revision: 'r-qwen-pipe', defaultEnhanceMode: 'qwen-multi-h3',
       videoDuration: { seconds: 5 },
       pipeline: { kind: 'first-frame', imageWorkflowAlias: 'QwenImage21-多图生图', videoWorkflowAlias: 'H3-图生视频' },
-      customFields: [], referenceSlots: [], capabilities: {}, defaults: {},
+      customFields: [{ key: 'image_prompt', label: '生图提示词', type: 'text' }],
+      referenceSlots: [], capabilities: {}, defaults: {},
     }
     const qwenImage = {
       alias: 'QwenImage21-多图生图', revision: 'r-qwen-img',
@@ -1166,7 +1167,7 @@ describe('preferences: alwaysSendPrompt, videosPerTurn, applyDefaults and bindTo
     const gateway = makeGatewayFetch({ workflows: [{ alias: 'demo', customFields: [], referenceSlots: [], capabilities: {} }] })
     const { host, dataDirectory, ctx } = await makeHost({ configured: true, gateway })
     assert.deepEqual(await host.dispatch({ action: 'preferences', alwaysSendPrompt: false, videosPerTurn: 6, applyDefaults: false, bindToTurn: false }),
-      { autoInsert: false, alwaysSendPrompt: false, videosPerTurn: 6, applyDefaults: false, bindToTurn: false })
+      { generationMode: 'tool', autoInsert: false, alwaysSendPrompt: false, videosPerTurn: 6, applyDefaults: false, bindToTurn: false })
     await assert.rejects(host.dispatch({ action: 'preferences', applyDefaults: 'false' }), /布尔/)
     await assert.rejects(host.dispatch({ action: 'preferences', alwaysSendPrompt: 'false' }), /布尔/)
     await assert.rejects(host.dispatch({ action: 'preferences', videosPerTurn: 0 }), /1–10 的整数/)
@@ -1451,6 +1452,49 @@ describe('apply: registration and cleanup (apply 不再返回 host)', () => {
     assert.equal(effects.length, 5, 'dispose + 4 route effects expected')
   })
 
+  test('正文标记模式撤掉全部 RunningHub 工具，切回工具调用时重新注册', async () => {
+    const dataDirectory = await mkdtemp(join(tmpRoot, 'rh-test-'))
+    liveHosts.push({ host: { dispose() {} }, dataDirectory })
+    const effects = []
+    const tools = []
+    const routes = []
+    const markerSections = []
+    const ctx = {
+      attachments: makeAttachments({ saveImage: [], saveFile: [], getTurnState: [], getTurn: [], credentialsSet: [] }),
+      credentials: { resolve: async () => undefined, set: async () => {}, describe: async () => undefined },
+      tavern: {
+        handle: () => {}, onTurnSettled: () => () => {}, editTurn: async () => ({}), attach: async () => {},
+        settlementSection: spec => markerSections.push(spec), candidateSection: spec => markerSections.push(spec), compactionSection: spec => markerSections.push(spec),
+      },
+      webServer: { register: spec => { routes.push(spec); return () => {} } },
+      effect: (fn) => { const d = fn(); effects.push(d); return d },
+      inject: (names, fn) => {
+        if (names[0] === 'tools') fn({ tools: { register: spec => {
+          tools.push(spec)
+          return () => { const index = tools.indexOf(spec); if (index >= 0) tools.splice(index, 1) }
+        } } })
+      },
+    }
+    await apply(ctx, { dataDirectory, baseURL: BASE })
+    assert.equal(tools.length, 4)
+    assert.deepEqual(markerSections.map(spec => spec.name), ['marker-ignore', 'marker-ignore', 'marker-ignore'])
+    assert.equal(markerSections[0].text(), '', '工具调用模式不注入标记忽略说明')
+    const route = routes.find(spec => spec.path === API)
+    const call = async body => {
+      const res = fakeRes()
+      await route.handler(fakeReq({ url: API, headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }), res)
+      assert.equal(res.statusCode, 200, Buffer.concat(res.chunks).toString('utf8'))
+      return resBody(res)
+    }
+    const saved = await call({ action: 'preferences', generationMode: 'marker' })
+    assert.equal(saved.generationMode, 'marker')
+    assert.deepEqual(tools.map(t => t.name), [], '正文标记模式不保留任何 RunningHub 工具')
+    assert.match(markerSections[0].text(), /\[\[RH:SHOT\]\]/)
+    const back = await call({ action: 'preferences', generationMode: 'tool' })
+    assert.equal(back.generationMode, 'tool')
+    assert.deepEqual(tools.map(t => t.name).sort(), ['runninghub_describe', 'runninghub_generate', 'runninghub_send_pregenerated', 'runninghub_status'])
+  })
+
   test('callHost handlers delegate to dispatch', async () => {
     const dataDirectory = await mkdtemp(join(tmpRoot, 'rh-test-'))
     liveHosts.push({ host: { dispose() {} }, dataDirectory })
@@ -1639,5 +1683,228 @@ describe('regenerate: task history replays the saved prompt, params and referenc
     assert.equal(calls.getTurnState.at(-1), 'game-replay', '绑定开关开启时重新绑定当前轮次')
     assert.equal(regenerated.binding.gameId, 'game-replay')
     await waitForJob(host, regenerated.id, job => Boolean(job.remoteTaskId))
+  })
+})
+
+// =====================================================================
+describe('正文标记（非工具调用模式）', () => {
+  function markerTavern(initial = {}) {
+    const state = {
+      gameId: 'game-marker', turn: 5, textVersion: 'v1',
+      rawText: initial.rawText ?? '', text: initial.rawText ?? '',
+    }
+    const calls = { edits: [], attaches: [], updates: [], listed: 0, updatesById: [] }
+    const turns = []
+    const tavern = {
+      getTurnState: async ({ gameId }) => ({ settled: true, busy: false, turn: state.turn, textVersion: state.textVersion }),
+      getTurn: async ({ gameId, turn }) => ({ gameId, turn, textVersion: state.textVersion, rawText: state.rawText, text: state.text, variables: null }),
+      captureGeneration: async ({ gameId }) => ({ gameId, generationId: 'g'.repeat(64) }),
+      resolveGeneration: async () => null,
+      onTurnSettled: () => () => {},
+      editTurn: async ({ gameId, turn, textVersion, text }) => {
+        calls.edits.push({ gameId, turn, textVersion, text })
+        state.rawText = text
+        state.text = text
+        state.textVersion = 'v2'
+        return { gameId, turn, textVersion: state.textVersion, rawText: text, text, variables: null }
+      },
+      list: async ({ gameId, turn }) => {
+        calls.listed += 1
+        return turns.filter(item => item.gameId === gameId && item.turn === turn)
+      },
+      attach: async ({ gameId, turn, textVersion, item }) => {
+        const record = { id: 'm' + (calls.attaches.length + 1), gameId, turn, textVersion, item }
+        calls.attaches.push(record)
+        turns.push(record)
+      },
+      update: async (id, changes) => {
+        calls.updates.push({ id, changes })
+        calls.updatesById.push(id)
+        const record = turns.find(item => item.id === id)
+        if (record) record.item = { ...record.item, ...changes }
+      },
+    }
+    return { tavern, calls, state }
+  }
+
+  test('正文标记模式：注入格式说明、不要求调用生成工具，忽略工具提交', async () => {
+    const gateway = makeGatewayFetch({ workflows: [{ alias: 'demo', customFields: [], referenceSlots: [], capabilities: {} }],
+      settings: { defaultModel: 'demo' },
+      portDirectiveText: '【模板】\n需要出视频时，按这些规则写好提示词，再分别放进工具参数。\n两段各自用末尾那节【输出包裹格式】给的标记包起来：image### 包住生图段，video### 包住视频段。\n【输出包裹格式】\nimage###\n……\n###\n' })
+    const fake = markerTavern({ rawText: '' })
+    const { host, ctx } = await makeHost({ configured: true, gateway, tavernImpl: fake.tavern })
+    await host.dispatch({ action: 'preferences', generationMode: 'marker', autoInsert: true, videosPerTurn: 2 })
+    await host.dispatch({ action: 'select-model', model: 'demo' })
+    const text = host.promptText()
+    assert.match(text, /\[\[RH:SHOT\]\]/)
+    assert.match(text, /@prompt/)
+    assert.match(text, /本回合生成 2 个镜头/)
+    assert.match(text, /不要调用 RunningHub 的任何工具|不要调用 runninghub_generate/)
+    assert.equal(text.includes('先调用 runninghub_generate 提交'), false)
+    assert.equal(text.includes('image###'), false, '正文标记模板不应再教 image###')
+    assert.equal(text.includes('input.prompt'), false, '正文标记模板不应再教工具参数')
+    assert.equal(text.includes('需要出视频时'), false)
+    assert.match(host.turnReminder('下雨'), /\[\[RH:SHOT\]\]/)
+    assert.equal(host.generationMode, 'marker')
+    const toolExec = { agent: { session: { id: 'game-marker' } } }
+    await assert.rejects(host.dispatch({ action: 'submit', requestId: 'req-marker-tool',
+      input: { prompt: 'x' }, bindToTurn: false }, toolExec), /正文标记/)
+    assert.equal(typeof ctx.tavern.editTurn, 'function')
+  })
+
+  test('结算时解析单段标记、清理正文、按 @after 绑定新版本并提交', async () => {
+    const rawText = [
+      '林岚推开门，雨水顺着伞沿落下。',
+      '',
+      '[[RH:SHOT]]',
+      '@after',
+      '林岚推开门，雨水顺着伞沿落下。',
+      '@caption',
+      '雨夜入门',
+      '@prompt',
+      '电影感写实照片，林岚站在雨夜的门口。',
+      '[[/RH:SHOT]]',
+    ].join('\n')
+    let submitted = null
+    const gateway = makeGatewayFetch({ kind: 'video', workflows: [{ alias: 'demo', customFields: [], referenceSlots: [], capabilities: {} }],
+      settings: { defaultModel: 'demo' }, portDirectiveText: '【模板】\n写一个写实镜头。',
+      onGenerations: (_url, opts) => { submitted = JSON.parse(opts.body) } })
+    const fake = markerTavern({ rawText })
+    const { host } = await makeHost({ configured: true, gateway, tavernImpl: fake.tavern })
+    await host.dispatch({ action: 'preferences', generationMode: 'marker', autoInsert: true, videosPerTurn: 1 })
+    await host.dispatch({ action: 'select-model', model: 'demo' })
+    await host.handleTurn({ gameId: 'game-marker', turn: 5, textVersion: 'v1', rawText, text: rawText })
+    const start = Date.now()
+    while (Date.now() - start < 3000) {
+      if ((await host.store.list()).length) break
+      await new Promise(r => setTimeout(r, 10))
+    }
+    const job = (await host.store.list())[0]
+    assert.ok(job, '应提交一个任务')
+    assert.equal(fake.calls.edits.length, 1, '应清理一次正文')
+    assert.equal(fake.calls.edits[0].text, '林岚推开门，雨水顺着伞沿落下。')
+    assert.equal(fake.calls.edits[0].textVersion, 'v1')
+    assert.equal(job.binding.textVersion, 'v2')
+    assert.equal(job.binding.anchor, '林岚推开门，雨水顺着伞沿落下。')
+    await waitForJob(host, job.id, value => Boolean(value.remoteTaskId))
+    assert.equal(submitted.prompt, '电影感写实照片，林岚站在雨夜的门口。')
+    const pending = fake.calls.attaches.find(item => item.textVersion === 'v2')
+    assert.ok(pending, '应在清理后的正文版本上挂占位')
+    assert.equal(pending.item.anchor, '林岚推开门，雨水顺着伞沿落下。')
+    assert.equal(pending.item.caption, '雨夜入门')
+  })
+
+  test('editTurn 被 HTML 块拦下时仍提交任务，并把保留提示暴露给面板', async () => {
+    const rawText = [
+      '林岚推开门，雨水顺着伞沿落下。',
+      '',
+      '[[RH:SHOT]]',
+      '@after',
+      '林岚推开门，雨水顺着伞沿落下。',
+      '@prompt',
+      '雨夜门口的电影感镜头。',
+      '[[/RH:SHOT]]',
+    ].join('\n')
+    let submitted = null
+    const gateway = makeGatewayFetch({ kind: 'video', workflows: [{ alias: 'demo', customFields: [], referenceSlots: [], capabilities: {} }],
+      settings: { defaultModel: 'demo' }, portDirectiveText: '【模板】\n写一个写实镜头。',
+      onGenerations: (_url, opts) => { submitted = JSON.parse(opts.body) } })
+    const fake = markerTavern({ rawText })
+    fake.tavern.editTurn = async () => { throw new Error('正文里的 HTML 块要保持原样，只能改文字') }
+    const { host } = await makeHost({ configured: true, gateway, tavernImpl: fake.tavern })
+    await host.dispatch({ action: 'preferences', generationMode: 'marker', autoInsert: true, videosPerTurn: 1 })
+    await host.dispatch({ action: 'select-model', model: 'demo' })
+    await host.handleTurn({ gameId: 'game-marker', turn: 5, textVersion: 'v1', rawText, text: rawText })
+    const start = Date.now()
+    while (Date.now() - start < 3000) {
+      if ((await host.store.list()).length) break
+      await new Promise(r => setTimeout(r, 10))
+    }
+    const job = (await host.store.list())[0]
+    assert.ok(job, 'HTML 清理失败也不能把任务一起丢掉')
+    assert.equal(fake.calls.edits.length, 0, 'editTurn 被拒后不应再尝试覆盖 HTML')
+    assert.equal(job.binding.textVersion, 'v1', '没有新正文版本时按当前版本绑定')
+    await waitForJob(host, job.id, value => Boolean(value.remoteTaskId))
+    assert.equal(submitted.prompt, '雨夜门口的电影感镜头。')
+    const pending = fake.calls.attaches.find(item => item.textVersion === 'v1')
+    assert.ok(pending, '应在当前正文版本上挂占位')
+    const summary = await host.dispatch({ action: 'list' })
+    assert.match(summary.markerWarning, /HTML/)
+    assert.equal(summary.markerError, undefined, '已提交成功时不应再报处理失败')
+  })
+
+  test('两段式管线：@image + @video 分别落到 custom.image_prompt 与 prompt', async () => {
+    const rawText = [
+      '她走进门。',
+      '',
+      '[[RH:SHOT]]',
+      '@after',
+      '她走进门。',
+      '@image',
+      'Qwen 多图生图：<image1> 中的女子站在门口。',
+      '@video',
+      'The woman steps through the door, camera pushes in.',
+      '[[/RH:SHOT]]',
+    ].join('\n')
+    let submitted = null
+    const workflows = [{
+      alias: 'pipe', revision: 'r-pipe', defaultEnhanceMode: 'qwen-multi-h3',
+      videoDuration: { seconds: 5 },
+      pipeline: { kind: 'first-frame', imageWorkflowAlias: 'QwenImage21-多图生图', videoWorkflowAlias: 'H3-图生视频' },
+      customFields: [{ key: 'image_prompt', label: '生图提示词', type: 'text' }],
+      referenceSlots: [], capabilities: {}, defaults: {},
+    }]
+    const gateway = makeGatewayFetch({ kind: 'video', workflows, settings: { defaultModel: 'pipe' },
+      portDirectiveText: '【模板】\n@image 和 @video 都要写。',
+      onGenerations: (_url, opts) => { submitted = JSON.parse(opts.body) } })
+    const fake = markerTavern({ rawText })
+    const { host } = await makeHost({ configured: true, gateway, tavernImpl: fake.tavern })
+    await host.dispatch({ action: 'preferences', generationMode: 'marker', autoInsert: true, videosPerTurn: 1 })
+    await host.dispatch({ action: 'select-model', model: 'pipe' })
+    assert.match(host.promptText(), /@image/)
+    assert.match(host.promptText(), /@video/)
+    await host.handleTurn({ gameId: 'game-marker', turn: 5, textVersion: 'v1', rawText, text: rawText })
+    const start = Date.now()
+    while (Date.now() - start < 3000) {
+      if ((await host.store.list()).length) break
+      await new Promise(r => setTimeout(r, 10))
+    }
+    const job = (await host.store.list())[0]
+    assert.ok(job, '应提交管线任务')
+    await waitForJob(host, job.id, value => Boolean(value.remoteTaskId))
+    assert.equal(submitted.prompt, 'The woman steps through the door, camera pushes in.')
+    assert.equal(submitted.custom.image_prompt, 'Qwen 多图生图：<image1> 中的女子站在门口。')
+  })
+
+  test('格式错误的块不提交，但会清理正文并挂一条失败占位', async () => {
+    const rawText = '正文。\n\n[[RH:SHOT]]\n@after\n正文。\n[[/RH:SHOT]]'
+    const gateway = makeGatewayFetch({ workflows: [{ alias: 'demo', customFields: [], referenceSlots: [], capabilities: {} }],
+      settings: { defaultModel: 'demo' }, portDirectiveText: '【模板】\n写一个写实镜头。' })
+    const fake = markerTavern({ rawText })
+    const { host } = await makeHost({ configured: true, gateway, tavernImpl: fake.tavern })
+    await host.dispatch({ action: 'preferences', generationMode: 'marker', autoInsert: true })
+    await host.dispatch({ action: 'select-model', model: 'demo' })
+    await host.handleTurn({ gameId: 'game-marker', turn: 5, textVersion: 'v1', rawText, text: rawText })
+    assert.equal(fake.calls.edits[0].text, '正文。')
+    assert.equal((await host.store.list()).length, 0, '格式错误不应提交')
+    const failed = fake.calls.attaches.find(item => item.item.status === 'failed')
+    assert.ok(failed, '应挂失败占位')
+    assert.match(failed.item.error, /缺少 @prompt/)
+  })
+
+  test('重复的结算通知只处理一次（同一个 textVersion）', async () => {
+    const rawText = '正文。\n\n[[RH:SHOT]]\n@prompt\n一段提示词\n[[/RH:SHOT]]'
+    const gateway = makeGatewayFetch({ kind: 'video', workflows: [{ alias: 'demo', customFields: [], referenceSlots: [], capabilities: {} }],
+      settings: { defaultModel: 'demo' }, portDirectiveText: '【模板】' })
+    const fake = markerTavern({ rawText })
+    const { host } = await makeHost({ configured: true, gateway, tavernImpl: fake.tavern })
+    await host.dispatch({ action: 'preferences', generationMode: 'marker', autoInsert: true })
+    await host.dispatch({ action: 'select-model', model: 'demo' })
+    await Promise.all([
+      host.handleTurn({ gameId: 'game-marker', turn: 5, textVersion: 'v1', rawText, text: rawText }),
+      host.handleTurn({ gameId: 'game-marker', turn: 5, textVersion: 'v1', rawText, text: rawText }),
+    ])
+    assert.equal(fake.calls.edits.length, 1)
+    assert.equal((await host.store.list()).length, 1)
   })
 })

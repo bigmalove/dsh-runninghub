@@ -817,6 +817,7 @@ window.__ModuleLoader__.load({
       const [libraryPicker, setLibraryPicker] = useState(null)
       libraryPickerRef.current = libraryPicker
       const [bindToTurn, setBindToTurn] = useState(true)
+      const [generationMode, setGenerationMode] = useState('tool')
       const [alwaysSendPrompt, setAlwaysSendPrompt] = useState(true)
       const [videosPerTurn, setVideosPerTurn] = useState(3)
       const [videosPerTurnDraft, setVideosPerTurnDraft] = useState('3')
@@ -960,6 +961,7 @@ window.__ModuleLoader__.load({
               throw new Error('宿主状态格式无效：缺少 jobs 或 workflows')
             }
             setSummary({ configured: data.configured, baseURL: data.baseURL,
+              generationMode: data.generationMode === 'marker' ? 'marker' : 'tool',
               autoInsert: data.autoInsert === true, alwaysSendPrompt: data.alwaysSendPrompt !== false,
               videosPerTurn: Number.isInteger(data.videosPerTurn) ? data.videosPerTurn : 3,
               applyDefaults: data.applyDefaults !== false,
@@ -968,10 +970,12 @@ window.__ModuleLoader__.load({
               templateMode: data.templateMode || '', templateError: data.templateError || '',
               jobs: data.jobs, workflows: data.workflows,
               pregen: data.pregen || null,
+              markerError: data.markerError || '', markerWarning: data.markerWarning || '',
               gatewayError: data.gatewayError || '', settingsError: data.settingsError || '' })
             if (!prefsLoaded.current) {
               prefsLoaded.current = true
               setBindToTurn(data.bindToTurn !== false)
+              setGenerationMode(data.generationMode === 'marker' ? 'marker' : 'tool')
               setAlwaysSendPrompt(data.alwaysSendPrompt !== false)
               const videos = Number.isInteger(data.videosPerTurn) ? data.videosPerTurn : 3
               setVideosPerTurn(videos)
@@ -1159,6 +1163,7 @@ window.__ModuleLoader__.load({
           const data = await request({ action: 'preferences', ...patch }, current.signal)
           if (!alive.current) return data
           setSummary(previous => ({ ...(previous || {}),
+            ...(data?.generationMode === 'marker' || data?.generationMode === 'tool' ? { generationMode: data.generationMode } : {}),
             ...(typeof data?.autoInsert === 'boolean' ? { autoInsert: data.autoInsert } : {}),
             ...(typeof data?.alwaysSendPrompt === 'boolean' ? { alwaysSendPrompt: data.alwaysSendPrompt } : {}),
             ...(Number.isInteger(data?.videosPerTurn) ? { videosPerTurn: data.videosPerTurn } : {}),
@@ -1188,6 +1193,16 @@ window.__ModuleLoader__.load({
         try { await savePreference({ alwaysSendPrompt: value }) }
         catch {
           if (alive.current) setAlwaysSendPrompt(previous)
+        }
+      }
+
+      async function changeGenerationMode(value) {
+        const previous = generationMode
+        setGenerationMode(value)
+        setPreferenceError('')
+        try { await savePreference({ generationMode: value }) }
+        catch {
+          if (alive.current) setGenerationMode(previous)
         }
       }
 
@@ -2438,6 +2453,12 @@ window.__ModuleLoader__.load({
           alert(refreshError), alert(summary?.gatewayError), alert(summary?.settingsError ? '客户端默认模型读取失败：' + summary.settingsError : ''),
           alert(summary?.autoInsert === true && summary?.alwaysSendPrompt === false
             ? '自动插入已开启，但「总是发送提示词模板」关闭：模型不会收到生成说明，工具生成会被拒绝。' : ''),
+          alert(summary?.generationMode === 'marker' && summary?.alwaysSendPrompt === false
+            ? '正文标记模式已开启，但「总是发送提示词模板」关闭：模型看不到标记格式，不会输出镜头。' : ''),
+          alert(summary?.generationMode === 'marker' && summary?.autoInsert !== true
+            ? '正文标记模式已开启，但自动插入关闭：标记块会被保留，不会提交生成。' : ''),
+          alert(summary?.markerError ? '正文标记处理失败：' + summary.markerError : ''),
+          alert(summary?.markerWarning ? '正文标记：' + summary.markerWarning : ''),
           summary && !summary.configured ? h('div', { className: 'rh-notice' }, '连接本地网关后，即可读取工作流并开始创作。 ',
             button('配置连接', () => setSettingsOpen(true), false, null, 'link')) : null,
           h('div', { id: 'rh-create-view', role: 'tabpanel', 'aria-labelledby': 'rh-create-tab', hidden: view !== 'create' },
@@ -2567,6 +2588,25 @@ window.__ModuleLoader__.load({
               renderReferenceSettings(),
               h('div', { className: 'rh-rule' }),
               h('section', { className: 'rh-setting-group' }, h('div', { className: 'rh-setting-heading' }, icon('video'), '正文视频'),
+                field('生成方式', h('select', { className: 'rh-input', 'aria-label': '正文视频生成方式', value: generationMode,
+                  disabled: locked || preferenceBusy, onChange: event => changeGenerationMode(event.target.value) },
+                h('option', { value: 'tool' }, '工具调用（runninghub_generate）'),
+                h('option', { value: 'marker' }, '正文标记（非工具调用）'))),
+                note(generationMode === 'marker'
+                  ? '正文标记模式：不注册任何 RunningHub 工具（含 describe / status），模型把镜头提示词写在正文末尾的 [[RH:SHOT]] 块里，宿主在结算时移除提示词，并把成片插回 @after 指定的句子之后。'
+                  : '工具调用模式：模型在同一条回复里调用 runninghub_generate 提交；需要模型支持工具调用。'),
+                generationMode === 'marker' ? h('details', { className: 'rh-fold' },
+                  h('summary', null, '正文标记格式'),
+                  h('div', { className: 'rh-fold-content' },
+                    h('pre', { style: { margin: 0, padding: '10px 12px', borderRadius: 8, background: 'var(--rh-soft)', color: 'var(--rh-ink)', fontSize: 11, lineHeight: 1.65, whiteSpace: 'pre-wrap', overflowX: 'auto' } },
+                      '[[RH:SHOT]]\n@after\n正文里紧挨插入位置的一句原句\n@caption\n可选，短镜头名\n@prompt\n单段工作流的提示词\n[[/RH:SHOT]]'),
+                    note('两段式管线（Qwen 多图生图 → 图生视频）把 @prompt 换成 @image 与 @video，两段都写。多个镜头就重复多个块，块统一放在正文最后。'),
+                    note('标记块要放在整段 HTML 之后；块内引用 <Picture N> / <Subject N> 时写成 &lt;Picture N&gt; / &lt;Subject N&gt;，否则 Tavern 会把提示词当成 HTML 块，宿主无法从正文移除。'),
+                    note('@after 必须逐字引用本轮正文原句；省略则附在正文末尾。标记块会从正文中移除，不进入后续上下文。'))) : null,
+                generationMode === 'marker' && summary?.alwaysSendPrompt === false
+                  ? alert('正文标记模式需要「总是发送当前工作流的提示词模板」：模型看不到标记格式就不会输出镜头。') : null,
+                generationMode === 'marker' && summary?.autoInsert !== true
+                  ? alert('自动插入未开启：正文标记会被保留，不会提交生成。') : null,
                 h('label', { className: 'rh-toggle-row' }, h('span', null, '视频完成后自动插入对应正文'),
                   h('span', { className: 'rh-switch' }, h('input', { type: 'checkbox', checked: summary?.autoInsert === true,
                     disabled: autoInsertBusy || !summary, onChange: event => saveAutoInsert(event.target.checked) }), h('span', { className: 'rh-switch-track', 'aria-hidden': true }))),
@@ -2583,7 +2623,9 @@ window.__ModuleLoader__.load({
               h('div', { className: 'rh-rule' }),
               h('section', { className: 'rh-setting-group' }, h('div', { className: 'rh-setting-heading' }, icon('grid'), '预生成视频池'),
                 note('按局配置与查看：在「预生成」页里设置目标数量、每轮上限、自动退出轮数与复审。'),
-                note('开启后每轮结束会用 Tavern 后台模型按剧情规划并自动花积分；没有配置后台模型或当前工作流没有提示词模板时会明确失败，不会提交。')),
+                note(generationMode === 'marker'
+                  ? '正文标记模式下不会自动补池：池子里的视频不会进入正文提示词，仍可在「预生成」页手动补池并发送到本轮。'
+                  : '开启后每轮结束会用 Tavern 后台模型按剧情规划并自动花积分；没有配置后台模型或当前工作流没有提示词模板时会明确失败，不会提交。')),
               h('div', { className: 'rh-rule' }),
               renderGenerationBehavior(),
               h('div', { className: 'rh-rule' }),
@@ -2615,6 +2657,34 @@ window.__ModuleLoader__.load({
       name: 'dsh-runninghub',
       inject: ['tavernUi'],
       apply(ctx) {
+        // 正文标记（非工具调用模式）：生成过程中先把整块提示词藏成一个镜头占位，
+        // 避免提示词在正文里闪一下；宿主结算时会 editTurn 把块真正移除。
+        if (typeof ctx.tavernUi.registerTextMarker === 'function') {
+          try {
+            ctx.tavernUi.registerTextMarker({
+              pattern: /[\[［]{2}\s*RH\s*[:：]\s*SHOT\s*[\]］]{2}[\s\S]*?(?:[\[［]{2}\s*\/\s*RH\s*(?:[:：]\s*SHOT\s*)?[\]］]{2}|$)/gi,
+              render: ({ match, streaming }) => {
+                const caption = /@caption[ \t]*[:：]?[ \t]*([^\r\n]+)/i.exec(String(match || ''))?.[1]?.trim()
+                const label = caption ? '镜头 · ' + caption : (streaming ? '正在整理镜头…' : '镜头提示词已捕获')
+                return h('span', {
+                  'data-rh-marker': 'shot',
+                  title: 'RunningHub 正文标记：宿主结算后会移除提示词，并把成片插到 @after 指定的句子后面。',
+                  style: { display: 'inline-flex', alignItems: 'center', gap: 6, padding: '2px 10px', border: '1px dashed currentColor', borderRadius: 999, fontSize: '0.85em', lineHeight: 1.6, opacity: 0.75, verticalAlign: 'baseline' },
+                }, '🎬 ', label)
+              },
+            })
+          } catch (error) { console.warn('[dsh-runninghub] 正文标记注册失败', error) }
+          try {
+            ctx.tavernUi.registerTextMarker({
+              // Tavern 会把以 <Picture N> / <Subject N> 开头的独立行当成 HTML 块。
+              // 标记块被切开时，上面的 pattern 只能盖住前半截，后半截会留在 HTML
+              // 里；这里把「从标签到闭合」的尾巴一并隐藏。完整的标记块仍由上面的
+              // pattern 优先匹配，不会被这段抢走。
+              pattern: /<\s*(?:Picture|Subject)\s+\d+\s*>[\s\S]*?[\[［]{2}\s*\/\s*RH\s*(?:[:：]\s*SHOT\s*)?[\]］]{2}/gi,
+              render: () => h('span', { 'data-rh-marker': 'shot-tail', hidden: true, 'aria-hidden': true }),
+            })
+          } catch (error) { console.warn('[dsh-runninghub] 正文标记尾部注册失败', error) }
+        }
         ctx.tavernUi.registerPanel({
           id: 'studio', title: 'RunningHub',
           render: ({ gameId, visible }) => h(Panel, { key: gameId ?? '__unbound__', gameId, visible }),

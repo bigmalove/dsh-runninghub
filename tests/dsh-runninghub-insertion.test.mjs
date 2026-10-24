@@ -83,7 +83,7 @@ test('自动插入：默认关闭、严格布尔校验、持久化且不写Key',
   await assert.rejects(f.host.dispatch({ action: 'preferences', autoInsert: 'true' }), /布尔/)
   await f.host.dispatch({ action: 'preferences', autoInsert: true })
   const settings = JSON.parse(await readFile(path.join(f.directory, 'connection.json'), 'utf8'))
-  assert.deepEqual(Object.keys(settings).sort(), ['alwaysSendPrompt', 'applyDefaults', 'autoInsert', 'baseURL', 'bindToTurn', 'videosPerTurn'])
+  assert.deepEqual(Object.keys(settings).sort(), ['alwaysSendPrompt', 'applyDefaults', 'autoInsert', 'baseURL', 'bindToTurn', 'generationMode', 'videosPerTurn'])
   f.host.dispose()
   const restored = await f.boot()
   assert.equal((await restored.dispatch({ action: 'list' })).autoInsert, true)
