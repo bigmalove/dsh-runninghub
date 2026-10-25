@@ -238,9 +238,10 @@ async function makeHost({ baseURL = BASE, configured = true, gateway = null, tav
   const options = { pollMs }
   if (gateway) options.fetchImpl = gateway.fetchImpl
   if (clientFactory) options.clientFactory = clientFactory
-  const host = await createRunningHubHost(ctx, { dataDirectory, baseURL }, options)
+  const regexLibraryFile = join(dataDirectory, 'tavern-extension-settings.json')
+  const host = await createRunningHubHost(ctx, { dataDirectory, baseURL, regexLibraryFile }, options)
   liveHosts.push({ host, dataDirectory, calls, credentialStore })
-  return { host, calls, credentialStore, ctx, dataDirectory }
+  return { host, calls, credentialStore, ctx, dataDirectory, regexLibraryFile }
 }
 
 afterEach(async () => {
@@ -1693,7 +1694,7 @@ describe('正文标记（非工具调用模式）', () => {
       gameId: 'game-marker', turn: 5, textVersion: 'v1',
       rawText: initial.rawText ?? '', text: initial.rawText ?? '',
     }
-    const calls = { edits: [], attaches: [], updates: [], listed: 0, updatesById: [] }
+    const calls = { attaches: [], updates: [], listed: 0, updatesById: [] }
     const turns = []
     const tavern = {
       getTurnState: async ({ gameId }) => ({ settled: true, busy: false, turn: state.turn, textVersion: state.textVersion }),
@@ -1701,13 +1702,7 @@ describe('正文标记（非工具调用模式）', () => {
       captureGeneration: async ({ gameId }) => ({ gameId, generationId: 'g'.repeat(64) }),
       resolveGeneration: async () => null,
       onTurnSettled: () => () => {},
-      editTurn: async ({ gameId, turn, textVersion, text }) => {
-        calls.edits.push({ gameId, turn, textVersion, text })
-        state.rawText = text
-        state.text = text
-        state.textVersion = 'v2'
-        return { gameId, turn, textVersion: state.textVersion, rawText: text, text, variables: null }
-      },
+      // 故意不提供 editTurn：宿主再调它就会直接 TypeError。
       list: async ({ gameId, turn }) => {
         calls.listed += 1
         return turns.filter(item => item.gameId === gameId && item.turn === turn)
@@ -1725,6 +1720,18 @@ describe('正文标记（非工具调用模式）', () => {
       },
     }
     return { tavern, calls, state }
+  }
+
+  // 和 Tavern 的 regexFromString 一样解析 /pattern/flags，用来验证写进正则库的规则真能吃块。
+  function applyScript(text, script) {
+    const match = String(script.findRegex).match(/(\/?)(.+)\1([a-z]*)/i)
+    assert.ok(match, 'findRegex 必须是 /pattern/flags 形式')
+    return text.replace(new RegExp(match[2], match[3]), script.replaceString)
+  }
+
+  async function readManagedScripts(file) {
+    const document = JSON.parse(await readFile(file, 'utf8'))
+    return (document.regex || []).filter(item => String(item.id).startsWith('dsh-runninghub-marker-strip'))
   }
 
   test('正文标记模式：注入格式说明、不要求调用生成工具，忽略工具提交', async () => {
@@ -1749,10 +1756,9 @@ describe('正文标记（非工具调用模式）', () => {
     const toolExec = { agent: { session: { id: 'game-marker' } } }
     await assert.rejects(host.dispatch({ action: 'submit', requestId: 'req-marker-tool',
       input: { prompt: 'x' }, bindToTurn: false }, toolExec), /正文标记/)
-    assert.equal(typeof ctx.tavern.editTurn, 'function')
   })
 
-  test('结算时解析单段标记、清理正文、按 @after 绑定新版本并提交', async () => {
+  test('结算时解析单段标记、按 @after 挂占位并提交，标记交给正则库清理', async () => {
     const rawText = [
       '林岚推开门，雨水顺着伞沿落下。',
       '',
@@ -1770,9 +1776,21 @@ describe('正文标记（非工具调用模式）', () => {
       settings: { defaultModel: 'demo' }, portDirectiveText: '【模板】\n写一个写实镜头。',
       onGenerations: (_url, opts) => { submitted = JSON.parse(opts.body) } })
     const fake = markerTavern({ rawText })
-    const { host } = await makeHost({ configured: true, gateway, tavernImpl: fake.tavern })
+    const { host, regexLibraryFile } = await makeHost({ configured: true, gateway, tavernImpl: fake.tavern })
     await host.dispatch({ action: 'preferences', generationMode: 'marker', autoInsert: true, videosPerTurn: 1 })
     await host.dispatch({ action: 'select-model', model: 'demo' })
+    const scripts = await readManagedScripts(regexLibraryFile)
+    assert.equal(scripts.length, 2, '应写入闭合块与兜底两条规则')
+    assert.equal(scripts[0].id, 'dsh-runninghub-marker-strip')
+    assert.equal(scripts[1].id, 'dsh-runninghub-marker-strip-open')
+    for (const script of scripts) {
+      assert.deepEqual(script.placement, [2], '只作用于 AI 输出')
+      assert.equal(script.disabled, false)
+      assert.equal(script.markdownOnly, false)
+      assert.equal(script.promptOnly, false)
+    }
+    const stripped = scripts.reduce((text, script) => applyScript(text, script), rawText)
+    assert.equal(stripped.trimEnd(), '林岚推开门，雨水顺着伞沿落下。', '正则应整段吃掉标记块')
     await host.handleTurn({ gameId: 'game-marker', turn: 5, textVersion: 'v1', rawText, text: rawText })
     const start = Date.now()
     while (Date.now() - start < 3000) {
@@ -1781,28 +1799,29 @@ describe('正文标记（非工具调用模式）', () => {
     }
     const job = (await host.store.list())[0]
     assert.ok(job, '应提交一个任务')
-    assert.equal(fake.calls.edits.length, 1, '应清理一次正文')
-    assert.equal(fake.calls.edits[0].text, '林岚推开门，雨水顺着伞沿落下。')
-    assert.equal(fake.calls.edits[0].textVersion, 'v1')
-    assert.equal(job.binding.textVersion, 'v2')
+    assert.equal(job.binding.textVersion, 'v1', '绑定当前正文版本，不换版本')
     assert.equal(job.binding.anchor, '林岚推开门，雨水顺着伞沿落下。')
     await waitForJob(host, job.id, value => Boolean(value.remoteTaskId))
     assert.equal(submitted.prompt, '电影感写实照片，林岚站在雨夜的门口。')
-    const pending = fake.calls.attaches.find(item => item.textVersion === 'v2')
-    assert.ok(pending, '应在清理后的正文版本上挂占位')
+    const pending = fake.calls.attaches.find(item => item.textVersion === 'v1')
+    assert.ok(pending, '应在当前正文版本上挂占位')
     assert.equal(pending.item.anchor, '林岚推开门，雨水顺着伞沿落下。')
     assert.equal(pending.item.caption, '雨夜入门')
   })
 
-  test('editTurn 被 HTML 块拦下时仍提交任务，并把保留提示暴露给面板', async () => {
+  test('标记块跨进 HTML 块也照常提交，正则整段覆盖且不再报保留提示', async () => {
     const rawText = [
       '林岚推开门，雨水顺着伞沿落下。',
+      '',
+      '<div class="card">',
+      '<p>雨夜</p>',
+      '</div>',
       '',
       '[[RH:SHOT]]',
       '@after',
       '林岚推开门，雨水顺着伞沿落下。',
       '@prompt',
-      '雨夜门口的电影感镜头。',
+      '<Picture 1> 雨夜门口的电影感镜头。',
       '[[/RH:SHOT]]',
     ].join('\n')
     let submitted = null
@@ -1810,10 +1829,14 @@ describe('正文标记（非工具调用模式）', () => {
       settings: { defaultModel: 'demo' }, portDirectiveText: '【模板】\n写一个写实镜头。',
       onGenerations: (_url, opts) => { submitted = JSON.parse(opts.body) } })
     const fake = markerTavern({ rawText })
-    fake.tavern.editTurn = async () => { throw new Error('正文里的 HTML 块要保持原样，只能改文字') }
-    const { host } = await makeHost({ configured: true, gateway, tavernImpl: fake.tavern })
+    const { host, regexLibraryFile } = await makeHost({ configured: true, gateway, tavernImpl: fake.tavern })
     await host.dispatch({ action: 'preferences', generationMode: 'marker', autoInsert: true, videosPerTurn: 1 })
     await host.dispatch({ action: 'select-model', model: 'demo' })
+    const stripped = (await readManagedScripts(regexLibraryFile))
+      .reduce((text, script) => applyScript(text, script), rawText)
+    assert.equal(stripped.includes('RH:SHOT'), false, '含 HTML 的块也要被正则整段移除')
+    assert.equal(stripped.includes('<Picture 1>'), false, '块内尖括号标签不能留在正文')
+    assert.match(stripped, /<div class="card">/, '正文里的 HTML 本身保留')
     await host.handleTurn({ gameId: 'game-marker', turn: 5, textVersion: 'v1', rawText, text: rawText })
     const start = Date.now()
     while (Date.now() - start < 3000) {
@@ -1821,15 +1844,15 @@ describe('正文标记（非工具调用模式）', () => {
       await new Promise(r => setTimeout(r, 10))
     }
     const job = (await host.store.list())[0]
-    assert.ok(job, 'HTML 清理失败也不能把任务一起丢掉')
-    assert.equal(fake.calls.edits.length, 0, 'editTurn 被拒后不应再尝试覆盖 HTML')
-    assert.equal(job.binding.textVersion, 'v1', '没有新正文版本时按当前版本绑定')
+    assert.ok(job, 'HTML 不会再把任务丢掉')
+    assert.equal(job.binding.textVersion, 'v1', '按当前版本绑定')
     await waitForJob(host, job.id, value => Boolean(value.remoteTaskId))
-    assert.equal(submitted.prompt, '雨夜门口的电影感镜头。')
+    assert.equal(submitted.prompt, '<Picture 1> 雨夜门口的电影感镜头。')
     const pending = fake.calls.attaches.find(item => item.textVersion === 'v1')
     assert.ok(pending, '应在当前正文版本上挂占位')
     const summary = await host.dispatch({ action: 'list' })
-    assert.match(summary.markerWarning, /HTML/)
+    assert.equal(summary.markerWarning, undefined, '正则写入成功时不再报「只在界面隐藏」')
+    assert.equal(summary.markerRegexError, undefined)
     assert.equal(summary.markerError, undefined, '已提交成功时不应再报处理失败')
   })
 
@@ -1876,17 +1899,19 @@ describe('正文标记（非工具调用模式）', () => {
     assert.equal(submitted.custom.image_prompt, 'Qwen 多图生图：<image1> 中的女子站在门口。')
   })
 
-  test('格式错误的块不提交，但会清理正文并挂一条失败占位', async () => {
+  test('格式错误的块不提交，只挂一条失败占位，正文交给正则清理', async () => {
     const rawText = '正文。\n\n[[RH:SHOT]]\n@after\n正文。\n[[/RH:SHOT]]'
     const gateway = makeGatewayFetch({ workflows: [{ alias: 'demo', customFields: [], referenceSlots: [], capabilities: {} }],
       settings: { defaultModel: 'demo' }, portDirectiveText: '【模板】\n写一个写实镜头。' })
     const fake = markerTavern({ rawText })
-    const { host } = await makeHost({ configured: true, gateway, tavernImpl: fake.tavern })
+    const { host, regexLibraryFile } = await makeHost({ configured: true, gateway, tavernImpl: fake.tavern })
     await host.dispatch({ action: 'preferences', generationMode: 'marker', autoInsert: true })
     await host.dispatch({ action: 'select-model', model: 'demo' })
     await host.handleTurn({ gameId: 'game-marker', turn: 5, textVersion: 'v1', rawText, text: rawText })
-    assert.equal(fake.calls.edits[0].text, '正文。')
     assert.equal((await host.store.list()).length, 0, '格式错误不应提交')
+    const stripped = (await readManagedScripts(regexLibraryFile))
+      .reduce((text, script) => applyScript(text, script), rawText)
+    assert.equal(stripped.trim(), '正文。', '格式错误的块也要被正则移除')
     const failed = fake.calls.attaches.find(item => item.item.status === 'failed')
     assert.ok(failed, '应挂失败占位')
     assert.match(failed.item.error, /缺少 @prompt/)
@@ -1904,7 +1929,6 @@ describe('正文标记（非工具调用模式）', () => {
       host.handleTurn({ gameId: 'game-marker', turn: 5, textVersion: 'v1', rawText, text: rawText }),
       host.handleTurn({ gameId: 'game-marker', turn: 5, textVersion: 'v1', rawText, text: rawText }),
     ])
-    assert.equal(fake.calls.edits.length, 1)
-    assert.equal((await host.store.list()).length, 1)
+    assert.equal((await host.store.list()).length, 1, '同一个 textVersion 只收一个任务')
   })
 })

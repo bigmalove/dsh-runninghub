@@ -971,6 +971,7 @@ window.__ModuleLoader__.load({
               jobs: data.jobs, workflows: data.workflows,
               pregen: data.pregen || null,
               markerError: data.markerError || '', markerWarning: data.markerWarning || '',
+              markerRegexError: data.markerRegexError || '',
               gatewayError: data.gatewayError || '', settingsError: data.settingsError || '' })
             if (!prefsLoaded.current) {
               prefsLoaded.current = true
@@ -1167,7 +1168,8 @@ window.__ModuleLoader__.load({
             ...(typeof data?.autoInsert === 'boolean' ? { autoInsert: data.autoInsert } : {}),
             ...(typeof data?.alwaysSendPrompt === 'boolean' ? { alwaysSendPrompt: data.alwaysSendPrompt } : {}),
             ...(Number.isInteger(data?.videosPerTurn) ? { videosPerTurn: data.videosPerTurn } : {}),
-            ...(typeof data?.bindToTurn === 'boolean' ? { bindToTurn: data.bindToTurn } : {}) }))
+            ...(typeof data?.bindToTurn === 'boolean' ? { bindToTurn: data.bindToTurn } : {}),
+            markerRegexError: data?.markerRegexError || '' }))
           return data
         } catch (error) {
           if (alive.current && error.name !== 'AbortError') setPreferenceError(message(error))
@@ -2459,6 +2461,7 @@ window.__ModuleLoader__.load({
             ? '正文标记模式已开启，但自动插入关闭：标记块会被保留，不会提交生成。' : ''),
           alert(summary?.markerError ? '正文标记处理失败：' + summary.markerError : ''),
           alert(summary?.markerWarning ? '正文标记：' + summary.markerWarning : ''),
+          alert(summary?.markerRegexError ? '正文标记正则库同步失败：' + summary.markerRegexError : ''),
           summary && !summary.configured ? h('div', { className: 'rh-notice' }, '连接本地网关后，即可读取工作流并开始创作。 ',
             button('配置连接', () => setSettingsOpen(true), false, null, 'link')) : null,
           h('div', { id: 'rh-create-view', role: 'tabpanel', 'aria-labelledby': 'rh-create-tab', hidden: view !== 'create' },
@@ -2593,7 +2596,7 @@ window.__ModuleLoader__.load({
                 h('option', { value: 'tool' }, '工具调用（runninghub_generate）'),
                 h('option', { value: 'marker' }, '正文标记（非工具调用）'))),
                 note(generationMode === 'marker'
-                  ? '正文标记模式：不注册任何 RunningHub 工具（含 describe / status），模型把镜头提示词写在正文末尾的 [[RH:SHOT]] 块里，宿主在结算时移除提示词，并把成片插回 @after 指定的句子之后。'
+                  ? '正文标记模式：不注册任何 RunningHub 工具（含 describe / status），模型把镜头提示词写在正文末尾的 [[RH:SHOT]] 块里，插件会自动把标记块写进 Tavern 正则库，从正文显示和后续提示词里移除，并把成片插回 @after 指定的句子之后。'
                   : '工具调用模式：模型在同一条回复里调用 runninghub_generate 提交；需要模型支持工具调用。'),
                 generationMode === 'marker' ? h('details', { className: 'rh-fold' },
                   h('summary', null, '正文标记格式'),
@@ -2601,8 +2604,9 @@ window.__ModuleLoader__.load({
                     h('pre', { style: { margin: 0, padding: '10px 12px', borderRadius: 8, background: 'var(--rh-soft)', color: 'var(--rh-ink)', fontSize: 11, lineHeight: 1.65, whiteSpace: 'pre-wrap', overflowX: 'auto' } },
                       '[[RH:SHOT]]\n@after\n正文里紧挨插入位置的一句原句\n@caption\n可选，短镜头名\n@prompt\n单段工作流的提示词\n[[/RH:SHOT]]'),
                     note('两段式管线（Qwen 多图生图 → 图生视频）把 @prompt 换成 @image 与 @video，两段都写。多个镜头就重复多个块，块统一放在正文最后。'),
-                    note('标记块要放在整段 HTML 之后；块内引用 <Picture N> / <Subject N> 时写成 &lt;Picture N&gt; / &lt;Subject N&gt;，否则 Tavern 会把提示词当成 HTML 块，宿主无法从正文移除。'),
-                    note('@after 必须逐字引用本轮正文原句；省略则附在正文末尾。标记块会从正文中移除，不进入后续上下文。'))) : null,
+                    note('启用插件时会把这条标记清理规则自动加入 Tavern 全局正则库，名称「RunningHub · 移除正文标记块（自动管理）」。即使块里出现 <Picture N> / <Subject N>、或标记块跨进 HTML，也会在正文显示和提示词投影时整段移除。'),
+                    note('原始存档正文里仍保留标记，可在 Tavern 正则库查看或停用；正文区和发送给模型的提示词里不会出现。'),
+                    note('@after 必须逐字引用本轮正文原句；省略则附在正文末尾。标记块不会进入后续上下文。'))) : null,
                 generationMode === 'marker' && summary?.alwaysSendPrompt === false
                   ? alert('正文标记模式需要「总是发送当前工作流的提示词模板」：模型看不到标记格式就不会输出镜头。') : null,
                 generationMode === 'marker' && summary?.autoInsert !== true
@@ -2658,7 +2662,7 @@ window.__ModuleLoader__.load({
       inject: ['tavernUi'],
       apply(ctx) {
         // 正文标记（非工具调用模式）：生成过程中先把整块提示词藏成一个镜头占位，
-        // 避免提示词在正文里闪一下；宿主结算时会 editTurn 把块真正移除。
+        // 避免提示词在正文里闪一下；插件会把它写进 Tavern 正则库，结算后从正文显示和提示词里移除。
         if (typeof ctx.tavernUi.registerTextMarker === 'function') {
           try {
             ctx.tavernUi.registerTextMarker({
@@ -2668,7 +2672,7 @@ window.__ModuleLoader__.load({
                 const label = caption ? '镜头 · ' + caption : (streaming ? '正在整理镜头…' : '镜头提示词已捕获')
                 return h('span', {
                   'data-rh-marker': 'shot',
-                  title: 'RunningHub 正文标记：宿主结算后会移除提示词，并把成片插到 @after 指定的句子后面。',
+                  title: 'RunningHub 正文标记：插件已把它加入 Tavern 正则库，正文和后续提示词都会移除；成片会插到 @after 指定的句子后面。',
                   style: { display: 'inline-flex', alignItems: 'center', gap: 6, padding: '2px 10px', border: '1px dashed currentColor', borderRadius: 999, fontSize: '0.85em', lineHeight: 1.6, opacity: 0.75, verticalAlign: 'baseline' },
                 }, '🎬 ', label)
               },

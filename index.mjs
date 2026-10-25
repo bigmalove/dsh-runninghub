@@ -8,6 +8,7 @@ import { GatewayClient, GatewayError, REFERENCE_LIMIT, sanitizeMessage, splitPor
 import { TaskStore, TaskEngine, validateJobId } from './lib/tasks.mjs'
 import { ReplayStore } from './lib/replay.mjs'
 import { hasMarkerBlock, markerPromptSpec, markerRequestId, parseMarkerShots } from './lib/markers.mjs'
+import { disableMarkerRegex as disableManagedRegex, ensureMarkerRegex, markerRegexFile } from './lib/regex-library.mjs'
 import {
   PREGEN_FAILURE_COOLDOWN_MS,
   PREGEN_MAX_AGE,
@@ -126,6 +127,19 @@ async function bodyJSON(req) {
 /** Zero-dependency host bridge. Configuration contains no key; DSH credentials own secrets. */
 export async function createRunningHubHost(ctx, config = {}, options = {}) {
   const directory = path.resolve(config.dataDirectory || path.join(process.env.DSH_HOME || path.join(homedir(), '.dsh'), 'profile-data', 'tavern', 'data', 'runninghub'))
+  // Tavern 的正则库和 runninghub/ 是同一个 data 目录下的兄弟文件；只在文件真实存在时写入。
+  const regexFile = path.resolve(config.regexLibraryFile || markerRegexFile(config.tavernDataDirectory || path.dirname(directory)))
+  let markerRegexState = { ok: false, reason: '尚未同步' }
+  async function syncMarkerRegex() {
+    try { markerRegexState = await ensureMarkerRegex({ file: regexFile }) }
+    catch (error) { markerRegexState = { ok: false, reason: sanitizeMessage(error?.message || error) } }
+    return markerRegexState
+  }
+  async function disableMarkerRegex() {
+    try { markerRegexState = await disableManagedRegex({ file: regexFile }) }
+    catch (error) { markerRegexState = { ok: false, reason: sanitizeMessage(error?.message || error) } }
+    return markerRegexState
+  }
   const store = new TaskStore({ directory: path.join(directory, 'tasks') })
   await store.init()
   // 「重新生成」需要可重放的提示词、参数与参考素材；单独落盘，不写进任务记录。
@@ -1296,9 +1310,11 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
   }
 
   /**
-   * 正文标记（非工具调用模式）：模型把镜头提示词写进正文块，宿主在结算时
-   * 1) 解析；2) 从正文里移除；3) 按 @after 把插件媒体占位挂到新版本上。
-   * 选片失败时不回滚正文：提示词已经清掉了，失败原因挂成一条失败占位，玩家能看到。
+   * 正文标记（非工具调用模式）：模型把镜头提示词写进正文块。宿主在结算时
+   * 1) 解析；2) 按 @after 把插件媒体占位挂到当前正文版本上。
+   * 清理标记块交给 Tavern 全局正则（见 lib/regex-library.mjs）：
+   * 显示投影和写进上下文的 text 都会在投影阶段整段移除，宿主不再调用 editTurn。
+   * 选片失败时不回滚正文：提示词已经不显示，失败原因挂成一条失败占位，玩家能看到。
    */
   async function attachMarkerFailure({ gameId, turn, textVersion, anchor, error }) {
     if (typeof ctx.tavern.attach !== 'function') return
@@ -1316,7 +1332,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
 
   async function processMarkerTurn(value = {}) {
     if (generationMode !== 'marker' || !autoInsert || !alwaysSendPrompt) return null
-    if (typeof ctx.tavern.editTurn !== 'function' || typeof ctx.tavern.attach !== 'function') return null
+    if (typeof ctx.tavern.attach !== 'function') return null
     if (!value || typeof value.rawText !== 'string' || !hasMarkerBlock(value.rawText)) return null
     if (typeof value.gameId !== 'string' || !value.gameId) return null
     if (!Number.isInteger(value.turn) || value.turn < 1) return null
@@ -1324,33 +1340,19 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     const key = value.gameId + '\u0000' + value.turn + '\u0000' + value.textVersion
     if (markerRuns.has(key)) return markerRuns.get(key)
     const run = (async () => {
-      // 模板不可用时仍要清正文：否则提示词会留在历史里污染后续回合。
+      // 每轮都对齐一次：用户在 Tavern 正则库里删掉/停用这条规则时补回来。
+      // ensure 内部有幂等短路，内容没变不落盘。
+      await syncMarkerRegex()
       // 模板没加载时按块里是否同时出现 @image / @video 猜管线，交给网关描述再最终校验。
       const directiveReady = promptDirective.model === model && Boolean(directiveFor('marker'))
       const pipeline = promptDirective.pipeline === true
         || (!directiveReady && /^[ \t]*@image\b/im.test(value.rawText) && /^[ \t]*@video\b/im.test(value.rawText))
       const parsed = parseMarkerShots(value.rawText, { pipeline, limit: videosPerTurn })
       if (!parsed.found) return null
-      if (!parsed.text.trim()) throw fail('正文标记块之外没有正文，未清理这一轮')
-      let edited = null
-      let retained = ''
-      try {
-        edited = await ctx.tavern.editTurn({
-          gameId: value.gameId, turn: value.turn, textVersion: value.textVersion, text: parsed.text,
-        })
-        if (!edited || typeof edited.textVersion !== 'string' || !edited.textVersion) throw fail('正文清理失败，宿主未返回新的正文版本')
-      } catch (error) {
-        const message = sanitizeMessage(error?.message || error || '正文清理失败')
-        // Tavern 的正文编辑器要求 HTML 块保持原样。提示词一旦跨进 HTML 块
-        // （典型情况：模型把 <Picture 1> 写在独立行，Tavern 把后面整段当成 HTML），
-        // editTurn 会拒绝清理。这里不能把整轮任务一起丢掉：保留正文、按当前
-        // 版本提交，并在面板上明确说明提示词只在界面隐藏。下一轮按新的格式
-        // 说明写（标记块放在 HTML 之后，尖括号写成 &lt;…&gt;）就能正常清理。
-        if (!/HTML\s*块|HTML block/i.test(message)) throw error
-        retained = message
-        edited = null
-      }
-      const bindingBase = { gameId: value.gameId, turn: value.turn, textVersion: edited?.textVersion || value.textVersion }
+      if (!parsed.text.trim()) throw fail('正文标记块之外没有正文，本轮镜头不提交')
+      // 不再 editTurn：标记块由 Tavern 正则库在投影阶段整段移除。正则在
+      // displayText 里隐藏提示词，也在下一轮的提示词投影里移除；跨 HTML 块也能匹配。
+      const bindingBase = { gameId: value.gameId, turn: value.turn, textVersion: value.textVersion }
       // 模板和网关都不可用也要把失败原因落下来，不能悄悄吞掉这几个镜头。
       let active = null
       let prepareError = ''
@@ -1387,14 +1389,11 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
         }
       }
       lastMarkerError = ''
-      lastMarkerWarning = retained
-        ? (jobs.length
-          ? '本轮正文含 HTML，提示词没能从存档里移除（只在界面隐藏）；镜头已照常提交。'
-          : '本轮正文含 HTML，提示词没能从存档里移除；本轮没有可提交的镜头。')
-        : ''
-      if (retained) console.warn('[dsh-runninghub] 正文标记清理被 HTML 块拦下，已继续提交：' + retained)
-      return { edited: Boolean(edited), jobs, textVersion: bindingBase.textVersion,
-        ...(retained ? { warning: lastMarkerWarning } : {}) }
+      lastMarkerWarning = markerRegexState.ok
+        ? ''
+        : '正文标记正则没有写入 Tavern 正则库，提示词可能仍会出现在正文和后续提示词里：' + (markerRegexState.reason || '未知原因')
+      return { jobs, textVersion: bindingBase.textVersion,
+        ...(lastMarkerWarning ? { warning: lastMarkerWarning } : {}) }
     })()
     markerRuns.set(key, run)
     try {
@@ -1411,8 +1410,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     if (disposed) return
     if (generationMode === 'marker') {
       const markerTurn = await processMarkerTurn(value)
-      // editTurn 换了一个正文版本；后面的待结算绑定与池子发送必须落在新版本上，
-      // 否则媒体会挂到已经不在显示的旧版本，玩家看不到。
+      // 标记模式不再编辑正文版本；保留版本透传，媒体仍按当前正文版本挂载。
       if (markerTurn?.textVersion) value = { ...value, textVersion: markerTurn.textVersion }
     }
     if (await resolvePendingBindings(value)) await reconcile()
@@ -1509,6 +1507,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
       ...(pregen ? { pregen } : {}),
       ...(lastMarkerError ? { markerError: lastMarkerError } : {}),
       ...(lastMarkerWarning ? { markerWarning: lastMarkerWarning } : {}),
+      ...(markerRegexState.ok ? {} : { markerRegexError: markerRegexState.reason || '正则库同步失败' }),
       ...(directive ? { templateMode: directive.mode, ...(directive.error ? { templateError: directive.error } : {}) } : {}),
       ...(workflowError ? { gatewayError: workflowError } : {}), ...(settingsError ? { settingsError } : {}) }
   }
@@ -1601,12 +1600,17 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
         if (input.generationMode !== undefined && input.generationMode !== 'tool' && input.generationMode !== 'marker') {
           throw fail('生成方式只能是 tool 或 marker')
         }
-        if (input.generationMode === 'marker'
-          && (typeof ctx.tavern.editTurn !== 'function' || typeof ctx.tavern.attach !== 'function' || typeof ctx.tavern.onTurnSettled !== 'function')) {
-          throw fail('当前 Tavern 宿主不支持正文编辑/媒体插入，无法使用正文标记模式')
+        const nextMode = input.generationMode === undefined ? generationMode : input.generationMode
+        if (nextMode === 'marker') {
+          if (typeof ctx.tavern.attach !== 'function' || typeof ctx.tavern.onTurnSettled !== 'function') {
+            throw fail('当前 Tavern 宿主不支持媒体插入/结算通知，无法使用正文标记模式')
+          }
+          // 正则库写不进去就不让切到标记模式：否则提示词会留在正文里。
+          const regex = await syncMarkerRegex()
+          if (!regex.ok) throw fail('无法把正文标记正则写入 Tavern 正则库：' + (regex.reason || '未知原因'))
         }
         const next = {
-          generationMode: input.generationMode === undefined ? generationMode : input.generationMode,
+          generationMode: nextMode,
           autoInsert: input.autoInsert === undefined ? autoInsert : input.autoInsert,
           alwaysSendPrompt: input.alwaysSendPrompt === undefined ? alwaysSendPrompt : input.alwaysSendPrompt,
           videosPerTurn: input.videosPerTurn === undefined ? videosPerTurn : input.videosPerTurn,
@@ -2079,8 +2083,10 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
   reconcileTimer = setInterval(() => { void reconcile().catch(() => {}) }, options.reconcileMs ?? 5000)
   reconcileTimer.unref?.()
   await initPregen()
+  await syncMarkerRegex()
   return { dispatch, route, store, replays, resume, dispose, reconcile, promptText, promptSections, turnReminder, handleTurn,
     removeGame: removePregenGame,
+    syncMarkerRegex, disableMarkerRegex,
     setToolSync(fn) { toolSync = typeof fn === 'function' ? fn : () => {}; toolSync() },
     get generationMode() { return generationMode }, get autoInsert() { return autoInsert },
     get alwaysSendPrompt() { return alwaysSendPrompt }, get videosPerTurn() { return videosPerTurn } }
@@ -2109,7 +2115,7 @@ export async function apply(ctx, config = {}) {
   if (ctx.tavern.turnSection) {
     ctx.tavern.turnSection({ name: 'auto-insert-reminder', text: context => host.turnReminder(context?.input) })
   }
-  // 正文标记块在 editTurn 之前还会被这一轮的结算 / 候选 / 压缩看到：
+  // 正文标记块在结算 / 候选 / 压缩读取正文时仍可能被看到：
   // 明确告诉后台这截是生成提示词，不是剧情，避免写进变量或摘要。
   const markerIgnore = '正文末尾 [[RH:SHOT]] 到 [[/RH:SHOT]] 之间是给视频生成用的提示词，不属于剧情；不要据此更新变量、人物状态、摘要或候选。'
   const markerIgnoreText = () => host.generationMode === 'marker' ? markerIgnore : ''
