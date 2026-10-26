@@ -127,6 +127,7 @@ test('RunningHub 重设计界面：jsdom + React DOM 隔离交互', {
     autoInsert: false,
     alwaysSendPrompt: true,
     videosPerTurn: 3,
+    streamPreclaim: false,
     applyDefaults: true,
     bindToTurn: true,
     baseURL,
@@ -238,6 +239,7 @@ test('RunningHub 重设计界面：jsdom + React DOM 隔离交互', {
     if (method === 'GET') {
       return response({ configured: state.configured, generationMode: state.generationMode, autoInsert: state.autoInsert,
         alwaysSendPrompt: state.alwaysSendPrompt !== false, videosPerTurn: state.videosPerTurn,
+        streamPreclaim: state.streamPreclaim === true,
         applyDefaults: state.applyDefaults !== false, bindToTurn: state.bindToTurn !== false, workflowSettings: true, baseURL: state.baseURL,
         model: state.model, defaultModel: 'h3参考', templateMode: 'h3-ref2va', adapter: 'ui-fixture', jobs: state.jobs,
         pregen: structuredClone(state.pregen),
@@ -255,7 +257,7 @@ test('RunningHub 重设计界面：jsdom + React DOM 隔离交互', {
         return response(description(body.model))
       }
       case 'preferences': {
-        const keys = ['autoInsert', 'alwaysSendPrompt', 'applyDefaults', 'bindToTurn'].filter(key => body[key] !== undefined)
+        const keys = ['autoInsert', 'alwaysSendPrompt', 'streamPreclaim', 'applyDefaults', 'bindToTurn'].filter(key => body[key] !== undefined)
         const hasVideos = body.videosPerTurn !== undefined
         const hasMode = body.generationMode !== undefined
         assert.ok(keys.length || hasVideos || hasMode, 'preferences 至少带一个设置')
@@ -272,7 +274,8 @@ test('RunningHub 重设计界面：jsdom + React DOM 隔离交互', {
           state.generationMode = body.generationMode
         }
         return response({ generationMode: state.generationMode, autoInsert: state.autoInsert, alwaysSendPrompt: state.alwaysSendPrompt,
-          videosPerTurn: state.videosPerTurn, applyDefaults: state.applyDefaults, bindToTurn: state.bindToTurn })
+          videosPerTurn: state.videosPerTurn, streamPreclaim: state.streamPreclaim === true,
+          applyDefaults: state.applyDefaults, bindToTurn: state.bindToTurn })
       }
       case 'pregen-settings': {
         assert.equal(body.gameId, 'fixture-game')

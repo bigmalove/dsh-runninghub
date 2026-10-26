@@ -11,6 +11,7 @@ import { createServer } from 'node:http'
 import { test, describe, afterEach } from 'node:test'
 
 import { createRunningHubHost, apply, API, LIBRARY, MEDIA, REFERENCE } from '../index.mjs'
+import { shotFingerprint } from '../lib/markers.mjs'
 
 const BASE = 'http://127.0.0.1:6888'
 const NEW_BASE = 'http://127.0.0.1:6889'
@@ -1335,13 +1336,14 @@ describe('preferences: alwaysSendPrompt, videosPerTurn, applyDefaults and bindTo
     const gateway = makeGatewayFetch({ workflows: [{ alias: 'demo', customFields: [], referenceSlots: [], capabilities: {} }] })
     const { host, dataDirectory, ctx } = await makeHost({ configured: true, gateway })
     assert.deepEqual(await host.dispatch({ action: 'preferences', alwaysSendPrompt: false, videosPerTurn: 6, applyDefaults: false, bindToTurn: false }),
-      { generationMode: 'tool', autoInsert: false, alwaysSendPrompt: false, videosPerTurn: 6, applyDefaults: false, bindToTurn: false })
+      { generationMode: 'tool', autoInsert: false, alwaysSendPrompt: false, videosPerTurn: 6, streamPreclaim: false, applyDefaults: false, bindToTurn: false })
     await assert.rejects(host.dispatch({ action: 'preferences', applyDefaults: 'false' }), /布尔/)
     await assert.rejects(host.dispatch({ action: 'preferences', alwaysSendPrompt: 'false' }), /布尔/)
     await assert.rejects(host.dispatch({ action: 'preferences', videosPerTurn: 0 }), /1–10 的整数/)
     const listed = await host.dispatch({ action: 'list' })
     assert.equal(listed.alwaysSendPrompt, false)
     assert.equal(listed.videosPerTurn, 6)
+    assert.equal(listed.streamPreclaim, false, '流式预提交默认关闭')
     assert.equal(listed.applyDefaults, false)
     assert.equal(listed.bindToTurn, false)
     host.dispose()
@@ -2084,6 +2086,104 @@ describe('正文标记（非工具调用模式）', () => {
     const failed = fake.calls.attaches.find(item => item.item.status === 'failed')
     assert.ok(failed, '应挂失败占位')
     assert.match(failed.item.error, /缺少 @prompt/)
+  })
+
+  test('流式预提交：正文还没写完就提交，结算按提示词指纹认领，不重复收费', async () => {
+    const rawText = [
+      '林岚推开门，雨水顺着伞沿落下。',
+      '',
+      '[[RH:SHOT]]',
+      '@after',
+      '林岚推开门，雨水顺着伞沿落下。',
+      '@caption',
+      '雨夜入门',
+      '@prompt',
+      '电影感写实照片，林岚站在雨夜的门口。',
+      '[[/RH:SHOT]]',
+    ].join('\n')
+    let submits = 0
+    let submitted = null
+    const gateway = makeGatewayFetch({ kind: 'video', workflows: [{ alias: 'demo', customFields: [], referenceSlots: [], capabilities: {} }],
+      settings: { defaultModel: 'demo' }, portDirectiveText: '【模板】\n写一个写实镜头。',
+      onGenerations: (_url, opts) => { submits += 1; submitted = JSON.parse(opts.body) } })
+    const fake = markerTavern({ rawText })
+    const { host, dataDirectory } = await makeHost({ configured: true, gateway, tavernImpl: fake.tavern })
+    await host.dispatch({ action: 'preferences', generationMode: 'marker', autoInsert: true, videosPerTurn: 1, streamPreclaim: true })
+    await host.dispatch({ action: 'select-model', model: 'demo' })
+    const fingerprint = shotFingerprint({ prompt: '电影感写实照片，林岚站在雨夜的门口。' })
+    const pre = await host.dispatch({ action: 'preclaim', gameId: 'game-marker', turn: 5,
+      shots: [{ index: 0, prompt: '电影感写实照片，林岚站在雨夜的门口。', caption: '雨夜入门',
+        anchor: '林岚推开门，雨水顺着伞沿落下。', fingerprint }] })
+    assert.equal(pre.submitted, 1, '流式阶段就提交出去')
+    const early = (await host.store.list())[0]
+    assert.equal(early.binding.pending, true)
+    assert.equal(early.binding.preclaim, true)
+    assert.equal(early.binding.afterTurn, 4, '等这一轮（5）结算后落位')
+    // 同一块再来一次（浏览器重发/重连）不会变成第二个收费任务。
+    const again = await host.dispatch({ action: 'preclaim', gameId: 'game-marker', turn: 5,
+      shots: [{ prompt: '电影感写实照片，林岚站在雨夜的门口。', fingerprint }] })
+    assert.equal(again.submitted, 0)
+    assert.equal(again.reused, 1)
+    await host.handleTurn({ gameId: 'game-marker', turn: 5, textVersion: 'v1', rawText, text: rawText })
+    const jobs = await host.store.list()
+    assert.equal(jobs.length, 1, '结算不再新建第二个任务')
+    const link = JSON.parse(await readFile(join(dataDirectory, 'bindings', jobs[0].id + '.json'), 'utf8'))
+    assert.equal(link.textVersion, 'v1', '预提交的任务在这一轮结算后落位')
+    assert.equal(link.anchor, '林岚推开门，雨水顺着伞沿落下。')
+    await waitForJob(host, jobs[0].id, value => Boolean(value.remoteTaskId))
+    assert.equal(submits, 1, '网关只收到一次提交')
+    assert.equal(submitted.prompt, '电影感写实照片，林岚站在雨夜的门口。')
+  })
+
+  test('流式预提交：开关关掉时静默放弃，不连网关', async () => {
+    const gateway = makeGatewayFetch({ workflows: [{ alias: 'demo', customFields: [], referenceSlots: [], capabilities: {} }],
+      settings: { defaultModel: 'demo' }, portDirectiveText: '【模板】' })
+    const fake = markerTavern({ rawText: '' })
+    const { host } = await makeHost({ configured: true, gateway, tavernImpl: fake.tavern })
+    await host.dispatch({ action: 'preferences', generationMode: 'marker', autoInsert: true })
+    await host.dispatch({ action: 'select-model', model: 'demo' })
+    const skipped = await host.dispatch({ action: 'preclaim', gameId: 'game-marker', turn: 5,
+      shots: [{ prompt: '一段提示词' }] })
+    assert.equal(skipped.skipped, 'off')
+    assert.equal((await host.store.list()).length, 0)
+    await assert.rejects(host.dispatch({ action: 'preclaim', gameId: 'game-marker', turn: 0, shots: [] }), /轮次编号/)
+    await assert.rejects(host.dispatch({ action: 'preclaim', gameId: 'game-marker', turn: 5, shots: 'x' }), /数组/)
+  })
+
+  test('流式预提交：块格式和当前工作流对不上时不提交，留给结算报错', async () => {
+    const gateway = makeGatewayFetch({ workflows: [{ alias: 'demo', customFields: [], referenceSlots: [], capabilities: {} }],
+      settings: { defaultModel: 'demo' }, portDirectiveText: '【模板】' })
+    const fake = markerTavern({ rawText: '' })
+    const { host } = await makeHost({ configured: true, gateway, tavernImpl: fake.tavern })
+    await host.dispatch({ action: 'preferences', generationMode: 'marker', autoInsert: true, streamPreclaim: true })
+    await host.dispatch({ action: 'select-model', model: 'demo' })
+    // 单段工作流却写了 @image + @video：结算会挂失败占位，预提交不能先花掉积分。
+    const pre = await host.dispatch({ action: 'preclaim', gameId: 'game-marker', turn: 5,
+      shots: [{ image: '生图段', video: '视频段' }] })
+    assert.equal(pre.submitted, 0)
+    assert.equal((await host.store.list()).length, 0)
+  })
+
+  test('流式预提交：这一轮最终没有这个块时清掉绑定，不挂到正文上', async () => {
+    const rawText = '正文。\n\n[[RH:SHOT]]\n@prompt\n结算时的另一段提示词\n[[/RH:SHOT]]'
+    const gateway = makeGatewayFetch({ kind: 'video', workflows: [{ alias: 'demo', customFields: [], referenceSlots: [], capabilities: {} }],
+      settings: { defaultModel: 'demo' }, portDirectiveText: '【模板】' })
+    const fake = markerTavern({ rawText })
+    const { host, dataDirectory } = await makeHost({ configured: true, gateway, tavernImpl: fake.tavern })
+    await host.dispatch({ action: 'preferences', generationMode: 'marker', autoInsert: true, videosPerTurn: 1, streamPreclaim: true })
+    await host.dispatch({ action: 'select-model', model: 'demo' })
+    await host.dispatch({ action: 'preclaim', gameId: 'game-marker', turn: 5,
+      shots: [{ prompt: '模型后来重写掉的提示词', anchor: '正文。' }] })
+    const stale = (await host.store.list())[0]
+    await host.handleTurn({ gameId: 'game-marker', turn: 5, textVersion: 'v1', rawText, text: rawText })
+    const jobs = await host.store.list()
+    assert.equal(jobs.length, 2, '预提交的那条 + 结算真正用到的这条')
+    const dropped = jobs.find(job => job.id === stale.id)
+    assert.deepEqual(dropped.binding, {}, '没有对应块的预提交任务解除绑定')
+    const link = await readFile(join(dataDirectory, 'bindings', stale.id + '.json'), 'utf8').catch(() => '')
+    assert.equal(link, '', '不写绑定文件，也就不往正文挂')
+    const staleAttach = fake.calls.attaches.filter(item => item.item.anchor === '正文。')
+    assert.equal(staleAttach.length, 0, '被重写掉的预提交镜头不挂到正文上')
   })
 
   test('重复的结算通知只处理一次（同一个 textVersion）', async () => {

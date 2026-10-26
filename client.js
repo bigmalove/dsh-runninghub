@@ -12,6 +12,8 @@ window.__ModuleLoader__.load({
     const pendingRequests = new Map()
     // 重新生成的未确认请求按「对话 + 任务」保留，网络不明时重试仍沿用同一 requestId。
     const pendingRegenerations = new Map()
+    // apply(ctx) 时记下来：停靠区组件要用 ctx.tavernUi.watchReply 读正在生成的正文。
+    let tavernUiApi = null
     const own = (object, key) => Object.prototype.hasOwnProperty.call(object || {}, key)
     const message = error => typeof error === 'string' ? error : error?.message || '未知错误'
     const statuses = {
@@ -375,6 +377,73 @@ window.__ModuleLoader__.load({
         h('button', { type: 'button', className: 'rh-video-thumb-hit', onClick, 'aria-label': label, title: label }))
     }
 
+    // ---- 流式预提交（正文标记模式）----------------------------------------
+    // 这里的指纹必须和 lib/markers.mjs 的 shotFingerprint 逐字节一致：浏览器在正文
+    // 还没写完时先算一次，宿主结算时再算一次，同一个键才认成同一个镜头、不重复收费。
+    function fnv1a(text, seed) {
+      let hash = seed >>> 0
+      for (let index = 0; index < text.length; index += 1) {
+        hash = Math.imul(hash ^ text.charCodeAt(index), 16777619) >>> 0
+      }
+      return hash.toString(16).padStart(8, '0')
+    }
+    function shotFingerprint({ prompt = '', image = '', video = '' } = {}) {
+      const base = [prompt, image, video].map(value => String(value ?? '').trim()).join('\u0000')
+      return fnv1a(base, 0x811c9dc5) + fnv1a(base, 0x9e3779b9)
+    }
+    const STREAM_SHOT_OPEN = /\[\[\s*RH\s*[:：]\s*SHOT\s*\]\]/gi
+    const STREAM_SHOT_CLOSE = /\[\[\s*\/\s*RH\s*(?:[:：]\s*SHOT\s*)?\]\]/gi
+    const STREAM_FIELD = /^[ \t]*@(after|caption|prompt|image|video)\b[ \t]*[:：]?[ \t]*(.*)$/i
+    function decodeStreamEntities(text) {
+      return String(text ?? '').replace(/&lt;/gi, '<').replace(/&gt;/gi, '>')
+        .replace(/&quot;/gi, '"').replace(/&#39;|&apos;/gi, "'")
+    }
+    /**
+     * 从正在生成的正文里取「已经写完」的标记块。半截块（还没有 [[/RH:SHOT]]）一律跳过：
+     * 模型可能还在写 @prompt，拿它去提交就是白花积分。
+     */
+    function streamShots(text) {
+      const source = String(text ?? '').replaceAll('［', '[').replaceAll('］', ']')
+      const shots = []
+      let cursor = 0
+      while (shots.length < 20) {
+        STREAM_SHOT_OPEN.lastIndex = cursor
+        const open = STREAM_SHOT_OPEN.exec(source)
+        if (!open) break
+        STREAM_SHOT_CLOSE.lastIndex = open.index + open[0].length
+        const close = STREAM_SHOT_CLOSE.exec(source)
+        if (!close) break
+        const inner = source.slice(open.index + open[0].length, close.index)
+        cursor = close.index + close[0].length
+        const fields = {}
+        let current = ''
+        let leading = ''
+        for (const line of inner.split(/\r?\n/)) {
+          const match = STREAM_FIELD.exec(line)
+          if (match) {
+            current = match[1].toLowerCase()
+            const value = match[2] ?? ''
+            fields[current] = fields[current] ? fields[current] + '\n' + value : value
+            continue
+          }
+          if (current) fields[current] += '\n' + line
+          // 没有字段名的裸文本：结算时宿主会当提示词用，这里不预提交。
+          else leading += (leading ? '\n' : '') + line
+        }
+        for (const key of Object.keys(fields)) fields[key] = fields[key].trim()
+        const prompt = decodeStreamEntities(fields.prompt)
+        const image = decodeStreamEntities(fields.image)
+        const video = decodeStreamEntities(fields.video)
+        shots.push({
+          prompt, image, video,
+          anchor: String(fields.after ?? '').trim().split(/\r?\n/)[0].trim(),
+          caption: String(fields.caption ?? '').split(/\r?\n/).map(line => line.trim()).find(Boolean) ?? '',
+          fingerprint: shotFingerprint({ prompt, image, video }),
+        })
+      }
+      return shots
+    }
+
     async function request(body, signal, gameId) {
       let response
       try {
@@ -497,6 +566,49 @@ window.__ModuleLoader__.load({
           if (timer) clearTimeout(timer)
           if (controller) controller.abort()
         }
+      }, [sessionId])
+
+      // 流式预提交：正文还在逐字生成时，只要出现写完的 [[RH:SHOT]] 块，就交给宿主
+      // 先提交任务，省掉「正文写完 + 后台结算结束」那段等待。宿主没开开关、模板还没
+      // 就绪或网关不可用时返回 skipped，这一轮就不再试（下一轮重新开始）。
+      // 订阅挂在 story 模式的停靠区上（本插件自己的 dock）：停靠区被别的插件先占掉、
+      // 或旧宿主没有 watchReply 时就不提速，结算时仍按正常路径提交，不影响正确性。
+      useEffect(() => {
+        if (!sessionId) return undefined
+        const ui = tavernUiApi
+        if (!ui || typeof ui.watchReply !== 'function') return undefined
+        const sent = new Set()
+        let turn = 0
+        let blocked = false
+        const stop = ui.watchReply(sessionId, state => {
+          if (!state || typeof state.text !== 'string') return
+          if (state.streaming !== true) {
+            // 这一轮写完了：下次生成重新开始判断。
+            if (!state.busy) { sent.clear(); turn = 0; blocked = false }
+            return
+          }
+          const index = Number(state.turn)
+          if (!Number.isInteger(index) || index < 1) return
+          if (index !== turn) { sent.clear(); turn = index; blocked = false }
+          if (blocked || !state.text.includes('RH')) return
+          const fresh = []
+          for (const shot of streamShots(state.text)) {
+            if (sent.has(shot.fingerprint)) continue
+            if (!shot.prompt && !shot.image && !shot.video) continue
+            fresh.push(shot)
+          }
+          if (!fresh.length) return
+          for (const shot of fresh) sent.add(shot.fingerprint)
+          request({ action: 'preclaim', gameId: sessionId, turn: index, shots: fresh })
+            .then(data => {
+              if (data && data.skipped) blocked = true
+            })
+            .catch(() => {
+              // 网络失败不要把指纹记成已发：结算时宿主还会照常提交一次。
+              for (const shot of fresh) sent.delete(shot.fingerprint)
+            })
+        })
+        return () => { if (typeof stop === 'function') stop() }
       }, [sessionId])
 
       const summary = dockSummary(jobs)
@@ -793,6 +905,10 @@ window.__ModuleLoader__.load({
       const [autoInsertBusy, setAutoInsertBusy] = useState(false)
       const [autoInsertError, setAutoInsertError] = useState('')
       const autoInsertLock = useRef(false)
+      const [streamPreclaim, setStreamPreclaim] = useState(false)
+      const [streamPreclaimBusy, setStreamPreclaimBusy] = useState(false)
+      const [streamPreclaimError, setStreamPreclaimError] = useState('')
+      const streamPreclaimLock = useRef(false)
       const [configError, setConfigError] = useState('')
       const [configNotice, setConfigNotice] = useState('')
       const [configVersion, setConfigVersion] = useState(0)
@@ -964,6 +1080,7 @@ window.__ModuleLoader__.load({
               generationMode: data.generationMode === 'marker' ? 'marker' : 'tool',
               autoInsert: data.autoInsert === true, alwaysSendPrompt: data.alwaysSendPrompt !== false,
               videosPerTurn: Number.isInteger(data.videosPerTurn) ? data.videosPerTurn : 3,
+              streamPreclaim: data.streamPreclaim === true,
               applyDefaults: data.applyDefaults !== false,
               bindToTurn: data.bindToTurn !== false, workflowSettings: data.workflowSettings === true,
               adapter: data.adapter, model: data.model, defaultModel: data.defaultModel || '',
@@ -981,6 +1098,7 @@ window.__ModuleLoader__.load({
               const videos = Number.isInteger(data.videosPerTurn) ? data.videosPerTurn : 3
               setVideosPerTurn(videos)
               setVideosPerTurnDraft(String(videos))
+              setStreamPreclaim(data.streamPreclaim === true)
             }
             if (!baseInitialized.current) {
               if (!baseDirty.current) setBaseURL(data.baseURL || DEFAULT_BASE)
@@ -1168,6 +1286,7 @@ window.__ModuleLoader__.load({
             ...(typeof data?.autoInsert === 'boolean' ? { autoInsert: data.autoInsert } : {}),
             ...(typeof data?.alwaysSendPrompt === 'boolean' ? { alwaysSendPrompt: data.alwaysSendPrompt } : {}),
             ...(Number.isInteger(data?.videosPerTurn) ? { videosPerTurn: data.videosPerTurn } : {}),
+            ...(typeof data?.streamPreclaim === 'boolean' ? { streamPreclaim: data.streamPreclaim } : {}),
             ...(typeof data?.bindToTurn === 'boolean' ? { bindToTurn: data.bindToTurn } : {}),
             markerRegexError: data?.markerRegexError || '' }))
           return data
@@ -1225,6 +1344,32 @@ window.__ModuleLoader__.load({
           setVideosPerTurn(previous)
           setVideosPerTurnDraft(String(previous))
         })
+      }
+
+      async function saveStreamPreclaim(value) {
+        if (streamPreclaimLock.current) return
+        streamPreclaimLock.current = true
+        setStreamPreclaimBusy(true)
+        setStreamPreclaimError('')
+        const previous = streamPreclaim
+        setStreamPreclaim(value)
+        const current = controller()
+        try {
+          const data = await request({ action: 'preferences', streamPreclaim: value }, current.signal)
+          if (alive.current) {
+            setStreamPreclaim(data?.streamPreclaim === true)
+            setSummary(prev => ({ ...(prev || {}), streamPreclaim: data?.streamPreclaim === true }))
+          }
+        } catch (error) {
+          if (alive.current) {
+            setStreamPreclaim(previous)
+            if (error.name !== 'AbortError') setStreamPreclaimError(message(error))
+          }
+        } finally {
+          streamPreclaimLock.current = false
+          controllers.current.delete(current)
+          if (alive.current) setStreamPreclaimBusy(false)
+        }
       }
 
       function settingsResolution() {
@@ -2623,7 +2768,20 @@ window.__ModuleLoader__.load({
                 note('自动插入开启时，模型会按这个数量拆分镜并提交；默认 3 段。保存后下一轮提示词立即使用新数量。'),
                 h('details', { className: 'rh-fold' }, h('summary', null, '联动说明'), h('div', { className: 'rh-fold-content' },
                   note('开启后，模型每回合都会按「每回合生成视频段数」自动拆分镜并提交（当前 ' + (summary?.videosPerTurn || 3) + ' 段）；仅切换开关不会生成或收费。'),
-                  note('关闭后模型工具提交会被宿主拒绝，面板手动生成仍可用；已提交的任务仍按原约定插入。'))), alert(autoInsertError)),
+                  note('关闭后模型工具提交会被宿主拒绝，面板手动生成仍可用；已提交的任务仍按原约定插入。'))), alert(autoInsertError),
+                generationMode === 'marker' ? h('div', null,
+                  h('label', { className: 'rh-toggle-row' }, h('span', null, '正文写完前就提交（流式预提交）'),
+                    h('span', { className: 'rh-switch' }, h('input', { type: 'checkbox', checked: streamPreclaim,
+                      disabled: streamPreclaimBusy || !summary, onChange: event => saveStreamPreclaim(event.target.checked) }), h('span', { className: 'rh-switch-track', 'aria-hidden': true }))),
+                  note(streamPreclaim
+                    ? '网页读到某一镜的结束标记时立刻提交，不再等后台结算结束；同一镜头结算时会认出已经提交过，不会重复扣费。'
+                    : '关闭时整条回复写完、后台结算结束后才提交。'),
+                  note('预提交发生在正文版本确定之前：这一轮最终被重写或回退，已经提交的镜头仍会计费，只在任务历史里保留，不插进正文。'),
+                  h('details', { className: 'rh-fold' }, h('summary', null, '为什么能省时间'),
+                    h('div', { className: 'rh-fold-content' },
+                      note('Tavern 宿主侧只有「结算结束」一个通知，正文写完到结算结束之间拿不到完整正文；流式预提交改由网页侧读正在生成的回复（watchReply），把写完的标记块提前交给宿主。'),
+                      note('只认写完的 [[RH:SHOT]] 块：半截提示词不会被提交；正文或标记块放在工具参数里（submit_story）时读不到，仍按结算后的正常路径提交。'))),
+                  alert(streamPreclaimError)) : null),
               h('div', { className: 'rh-rule' }),
               h('section', { className: 'rh-setting-group' }, h('div', { className: 'rh-setting-heading' }, icon('grid'), '预生成视频池'),
                 note('按局配置与查看：在「预生成」页里设置目标数量、每轮上限、自动退出轮数与复审。'),
@@ -2661,6 +2819,8 @@ window.__ModuleLoader__.load({
       name: 'dsh-runninghub',
       inject: ['tavernUi'],
       apply(ctx) {
+        // 停靠区要用 watchReply 读正在生成的正文（流式预提交）。
+        tavernUiApi = ctx.tavernUi || null
         // 正文标记（非工具调用模式）：生成过程中先把整块提示词藏成一个镜头占位，
         // 避免提示词在正文里闪一下；插件会把它写进 Tavern 正则库，结算后从正文显示和提示词里移除。
         if (typeof ctx.tavernUi.registerTextMarker === 'function') {

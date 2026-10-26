@@ -9,6 +9,7 @@ import {
   parseMarkerShot,
   parseMarkerShots,
   scanMarkerBlocks,
+  shotFingerprint,
   stripMarkerBlocks,
 } from '../lib/markers.mjs'
 
@@ -127,14 +128,48 @@ test('parseMarkerFields 把同一字段的多行保留下来', () => {
   assert.equal(fields.caption, '标题')
 })
 
-test('markerRequestId 同一输入稳定，不同块不同', () => {
-  const a = markerRequestId({ gameId: 'g', turn: 2, textVersion: 'v1', index: 0 })
-  const b = markerRequestId({ gameId: 'g', turn: 2, textVersion: 'v1', index: 0 })
-  const c = markerRequestId({ gameId: 'g', turn: 2, textVersion: 'v1', index: 1 })
+test('markerRequestId 只跟「局 + 轮 + 提示词指纹」有关，与正文版本无关', () => {
+  const fp = shotFingerprint({ prompt: '同一段提示词' })
+  const a = markerRequestId({ gameId: 'g', turn: 2, fingerprint: fp })
+  const b = markerRequestId({ gameId: 'g', turn: 2, fingerprint: fp })
+  const other = markerRequestId({ gameId: 'g', turn: 2, fingerprint: shotFingerprint({ prompt: '另一段' }) })
+  const laterTurn = markerRequestId({ gameId: 'g', turn: 3, fingerprint: fp })
   assert.equal(a, b)
-  assert.notEqual(a, c)
+  assert.notEqual(a, other)
+  assert.notEqual(a, laterTurn)
   assert.match(a, /^rh-[0-9a-f]{40}$/)
   assert.ok(a.length < 128)
+})
+
+test('shotFingerprint 同一段取同一个值，忽略首尾空白，随任一段变化', () => {
+  const base = shotFingerprint({ prompt: '镜头 A', image: '', video: '' })
+  assert.match(base, /^[0-9a-f]{16}$/)
+  assert.equal(base, shotFingerprint({ prompt: '  镜头 A  ' }))
+  assert.notEqual(base, shotFingerprint({ prompt: '镜头 B' }))
+  assert.notEqual(base, shotFingerprint({ prompt: '镜头 A', image: '生图段' }))
+  // 解析出的镜头直接带指纹，宿主结算时不必再猜字段。
+  const parsed = parseMarkerShots('正文。\n[[RH:SHOT]]\n@prompt\n镜头 A\n[[/RH:SHOT]]')
+  assert.equal(parsed.shots[0].fingerprint, base)
+})
+
+test('closedOnly 只认写完的块：流式预提交不拿半截提示词去提交', () => {
+  const text = [
+    '正文一句。',
+    '[[RH:SHOT]]',
+    '@prompt',
+    '写完的镜头。',
+    '[[/RH:SHOT]]',
+    '[[RH:SHOT]]',
+    '@prompt',
+    '还在写',
+  ].join('\n')
+  const open = parseMarkerShots(text)
+  assert.equal(open.found, 2)
+  assert.ok(open.shots[1].error, '未闭合块照常标 error')
+  const closed = parseMarkerShots(text, { closedOnly: true })
+  assert.equal(closed.found, 1)
+  assert.equal(closed.shots.length, 1)
+  assert.equal(closed.shots[0].prompt, '写完的镜头。')
 })
 
 test('标记块里的 &lt;Picture N&gt; 在提交前还原成尖括号', () => {

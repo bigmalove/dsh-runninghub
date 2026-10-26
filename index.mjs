@@ -7,7 +7,7 @@ import path from 'node:path'
 import { GatewayClient, GatewayError, REFERENCE_LIMIT, sanitizeMessage, splitPortPrompt, validateBaseURL, validateInput, validateRequestId } from './lib/client.mjs'
 import { TaskStore, TaskEngine, validateJobId } from './lib/tasks.mjs'
 import { ReplayStore } from './lib/replay.mjs'
-import { hasMarkerBlock, markerPromptSpec, markerRequestId, parseMarkerShots } from './lib/markers.mjs'
+import { hasMarkerBlock, markerPromptSpec, markerRequestId, parseMarkerShots, shotFingerprint } from './lib/markers.mjs'
 import { disableMarkerRegex as disableManagedRegex, ensureMarkerRegex, markerRegexFile } from './lib/regex-library.mjs'
 import {
   PREGEN_FAILURE_COOLDOWN_MS,
@@ -160,6 +160,9 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
   let generationMode = settings?.generationMode === 'marker' ? 'marker' : 'tool'
   // 默认开启：选中工作流后，插件每轮直接把完整模板发进正文提示词，不再让模型读 Skill。
   let alwaysSendPrompt = settings?.alwaysSendPrompt !== false
+  // 流式预提交：正文还在逐字生成时，浏览器侧先把写完的标记块交给宿主提交，不等结算。
+  // 提示词指纹相同的块在结算时会命中同一个 requestId，不会重复收费。
+  let streamPreclaim = settings?.streamPreclaim === true
   // 自动插入时一回合提交几段视频；提示词按这个数量要求模型拆分镜。
   let videosPerTurn = normalizeVideosPerTurn(settings?.videosPerTurn)
   const linksDirectory = path.join(directory, 'bindings')
@@ -205,6 +208,8 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
   // apply() 注册工具后把同步函数交回来：正文标记模式下要把生成工具从游玩请求里拿掉。
   let toolSync = () => {}
   const markerRuns = new Map()
+  // 流式预提交在结算时被判定为「本轮没有这个块」的任务；不再往正文上挂。
+  const droppedPreclaims = new Set()
   let lastMarkerError = ''
   let lastMarkerWarning = ''
   let queue = Promise.resolve()
@@ -266,6 +271,8 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     } catch { return attachment }
   }
   async function insert(job, media, outputIndex = 0, resolutions) {
+    // 流式预提交但这一轮没有对应块的镜头：不在正文里挂任何东西。
+    if (droppedPreclaims.has(job.id)) return
     const binding = await resolvedBinding(job, resolutions)
     if (!binding?.gameId) return
     const items = await ctx.tavern.list({ gameId: binding.gameId, turn: binding.turn })
@@ -1390,6 +1397,8 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     let changed = false
     for (const job of await store.list()) {
       if (!job.binding?.pending || job.binding.generationId || job.binding.gameId !== value.gameId) continue
+      // 流式预提交了、但这一轮最终没有这个块：不落位，留在历史里。
+      if (droppedPreclaims.has(job.id)) continue
       const after = Number.isInteger(job.binding.afterTurn) ? job.binding.afterTurn : 0
       if (value.turn <= after) continue
       try {
@@ -1430,6 +1439,93 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     })
   }
 
+  /**
+   * 流式预提交（正文标记模式）。
+   *
+   * 浏览器侧用 Tavern 的 watchReply 读到正在生成的正文；只要出现闭合的
+   * [[RH:SHOT]] 块，就把它 POST 到这里。宿主当场提交任务，省掉「正文写完 +
+   * 后台结算结束」这段等待。预提交不带 textVersion（那时还没有），所以用
+   * 「同一局 + 同一轮 + 提示词指纹」算 requestId；结算时 processMarkerTurn
+   * 再算一次同样的 ID，命中就复用，网关只收一次费。
+   *
+   * 只在开关打开、而且是正文标记 + 自动插入 + 发送模板三件齐备时才工作，
+   * 其余情况返回 skipped（不是错误，避免面板和停靠区刷错误）。
+   */
+  async function preclaimStreamShots(input = {}) {
+    keys(input, ['action', 'gameId', 'turn', 'shots'])
+    if (typeof input.gameId !== 'string' || !input.gameId) throw fail('gameId 必须是当前对话 ID')
+    if (!Number.isInteger(input.turn) || input.turn < 1) throw fail('turn 必须是轮次编号')
+    if (!Array.isArray(input.shots)) throw fail('shots 必须是数组')
+    if (input.shots.length > 20) throw fail('一次预提交最多 20 个镜头')
+    if (generationMode !== 'marker' || !autoInsert || !alwaysSendPrompt || !streamPreclaim) return { skipped: 'off' }
+    if (!input.shots.length) return { submitted: 0, reused: 0 }
+    // 模板没准备好就先不发：模型这一轮拿到的格式可能和模板对不上，等结算按正常路径处理。
+    if (promptDirective.model !== model || !directiveFor('marker')) return { skipped: 'no-template' }
+    let active
+    try { active = await connect() } catch { return { skipped: 'gateway' } }
+    try { await ensureModel(active) } catch { return { skipped: 'gateway' } }
+    const known = new Map((await store.list()).map(job => [job.requestId, job]))
+    const pipeline = promptDirective.pipeline === true
+    const submitted = []
+    const reused = []
+    const errors = []
+    for (const raw of input.shots) {
+      if (!object(raw)) continue
+      const prompt = String(raw.prompt ?? '').trim()
+      const image = String(raw.image ?? '').trim()
+      const video = String(raw.video ?? '').trim()
+      // 单段块里的 @image / @video 在结算时会被当作主提示词；这里同样兜底。
+      if (!prompt && !image && !video) continue
+      // 格式和当前工作流对不上就先不发：结算时会把失败原因挂成占位，不能在这里白花积分。
+      if (pipeline && !(image && video)) continue
+      if (!pipeline && image && video) continue
+      const claimed = /^[0-9a-f]{16}$/.test(String(raw.fingerprint ?? ''))
+        ? String(raw.fingerprint)
+        : shotFingerprint({ prompt, image, video })
+      const requestId = markerRequestId({ gameId: input.gameId, turn: input.turn, fingerprint: claimed })
+      if (known.has(requestId)) { reused.push(known.get(requestId).id); continue }
+      try {
+        const job = await submitJob({
+          action: 'submit', requestId, bindToTurn: false,
+          input: image && video ? { prompt: video, image_prompt: image } : { prompt: prompt || image || video },
+        }, undefined, {
+          marker: true,
+          binding: {
+            gameId: input.gameId, pending: true, preclaim: true,
+            afterTurn: Math.max(0, input.turn - 1),
+            anchor: typeof raw.anchor === 'string' ? raw.anchor.slice(0, 500) : '',
+            caption: typeof raw.caption === 'string' ? raw.caption.slice(0, 200) : '',
+          },
+        })
+        known.set(requestId, job)
+        submitted.push(job.id)
+      } catch (error) {
+        // 单块失败不连累其它块；结算时会再走一次正常路径，玩家不会白等。
+        errors.push(sanitizeMessage(error?.message || error || '预提交失败'))
+      }
+    }
+    return { submitted: submitted.length, reused: reused.length, ...(errors.length ? { errors } : {}) }
+  }
+
+  /**
+   * 结算后清掉「预提交了但这一轮没有对应块」的任务：模型重写正文、回退或块被删掉时，
+   * 任务已经花过积分、退不回来，但不能把镜头挂到不相干的正文上。清 binding 后它只是
+   * 一条独立任务，留在历史里可播放。
+   */
+  async function dropStalePreclaims({ gameId, turn, claimed }) {
+    let dropped = 0
+    for (const job of await store.list()) {
+      if (job.binding?.pending !== true || job.binding?.preclaim !== true) continue
+      if (job.binding.gameId !== gameId) continue
+      if (job.binding.afterTurn !== Math.max(0, turn - 1)) continue
+      if (claimed.has(job.requestId)) continue
+      droppedPreclaims.add(job.id)
+      try { await store.write({ ...job, binding: {} }) } catch { /* 内存标记已经拦住落位 */ }
+      dropped += 1
+    }
+    return dropped
+  }
+
   async function processMarkerTurn(value = {}) {
     if (generationMode !== 'marker' || !autoInsert || !alwaysSendPrompt) return null
     if (typeof ctx.tavern.attach !== 'function') return null
@@ -1463,6 +1559,8 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
         prepareError = sanitizeMessage(error?.message || error || '网关不可用')
       }
       const jobs = []
+      // 本轮真正存在的镜头指纹：结算时用来认领流式预提交，也用来清掉没有对应块的任务。
+      const claimed = new Set()
       for (const shot of parsed.shots) {
         const anchor = shot.anchor || ''
         if (shot.error) {
@@ -1473,8 +1571,10 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
           await attachMarkerFailure({ ...bindingBase, anchor, error: prepareError || '网关不可用，未提交' }).catch(() => {})
           continue
         }
+        // 同一指纹在流式阶段已经提交过：这个 requestId 命中已有任务，不重复收费。
+        const requestId = markerRequestId({ gameId: value.gameId, turn: value.turn, fingerprint: shot.fingerprint })
+        claimed.add(requestId)
         try {
-          const requestId = markerRequestId({ gameId: value.gameId, turn: value.turn, textVersion: value.textVersion, index: shot.index })
           const input = shot.image && shot.video
             ? { prompt: shot.video, image_prompt: shot.image }
             : { prompt: shot.prompt }
@@ -1488,6 +1588,8 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
           await attachMarkerFailure({ ...bindingBase, anchor, error }).catch(() => {})
         }
       }
+      // 预提交过、但这一轮没有这个块（模型重写/回退）：不挂到正文上，只留在历史里。
+      await dropStalePreclaims({ gameId: value.gameId, turn: value.turn, claimed }).catch(() => {})
       lastMarkerError = ''
       lastMarkerWarning = markerRegexState.ok
         ? ''
@@ -1601,7 +1703,8 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
         pregen = { ...publicPregenState(normalizePregenState(undefined, gameId)), lastError: sanitizeMessage(error.message) }
       }
     }
-    return { configured, baseURL, generationMode, autoInsert, alwaysSendPrompt, videosPerTurn,
+    return { configured, baseURL, generationMode, autoInsert, alwaysSendPrompt, videosPerTurn, streamPreclaim,
+      markerPipeline: promptDirective.pipeline === true,
       applyDefaults: applyDefaultsPref, bindToTurn: bindToTurnPref,
       workflowSettings: true,
       adapter: 'gateway', model, defaultModel, jobs: clientJobs(await store.list()), workflows,
@@ -1625,7 +1728,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
       if (previous?.source === 'env' || info?.source === 'env' || info?.writable === false) throw fail('网关 Key 来自只读凭据，请修改凭据来源')
       await ctx.credentials.set(ref, supplied)
     }
-    await atomicJSON(settingsFile, { baseURL: nextBase, autoInsert, alwaysSendPrompt, videosPerTurn, applyDefaults: applyDefaultsPref, bindToTurn: bindToTurnPref, generationMode })
+    await atomicJSON(settingsFile, { baseURL: nextBase, autoInsert, alwaysSendPrompt, videosPerTurn, streamPreclaim, applyDefaults: applyDefaultsPref, bindToTurn: bindToTurnPref, generationMode })
     engine?.dispose(); engine = undefined; client = undefined; clientIdentity = undefined
     baseURL = nextBase; workflows = []; workflowError = ''
     selectedModel = ''; model = ''; defaultModel = ''
@@ -1685,13 +1788,16 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     // 提交不进全局串行锁：校验、describe 往返和绑定都要等网关或宿主，
     // 同一轮的三段视频不该一段一段排队，面板轮询也不该追在它们后面。
     if (input.action === 'submit') return submitJob(input, exec)
+    // 流式预提交要尽量早发，也不能和面板轮询挤在同一个串行锁里。
+    if (input.action === 'preclaim') return preclaimStreamShots(input)
     return serial(async () => {
       if (input.action === 'preferences') {
-        keys(input, ['action', 'autoInsert', 'alwaysSendPrompt', 'videosPerTurn', 'applyDefaults', 'bindToTurn', 'generationMode'])
+        keys(input, ['action', 'autoInsert', 'alwaysSendPrompt', 'videosPerTurn', 'streamPreclaim', 'applyDefaults', 'bindToTurn', 'generationMode'])
         if (input.autoInsert === undefined && input.alwaysSendPrompt === undefined
-          && input.videosPerTurn === undefined && input.generationMode === undefined
+          && input.videosPerTurn === undefined && input.streamPreclaim === undefined
+          && input.generationMode === undefined
           && input.applyDefaults === undefined && input.bindToTurn === undefined) throw fail('没有要保存的偏好')
-        for (const key of ['autoInsert', 'alwaysSendPrompt', 'applyDefaults', 'bindToTurn']) {
+        for (const key of ['autoInsert', 'alwaysSendPrompt', 'streamPreclaim', 'applyDefaults', 'bindToTurn']) {
           if (input[key] !== undefined && typeof input[key] !== 'boolean') throw fail(key + ' 必须是布尔值')
         }
         if (input.videosPerTurn !== undefined
@@ -1715,6 +1821,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
           autoInsert: input.autoInsert === undefined ? autoInsert : input.autoInsert,
           alwaysSendPrompt: input.alwaysSendPrompt === undefined ? alwaysSendPrompt : input.alwaysSendPrompt,
           videosPerTurn: input.videosPerTurn === undefined ? videosPerTurn : input.videosPerTurn,
+          streamPreclaim: input.streamPreclaim === undefined ? streamPreclaim : input.streamPreclaim,
           applyDefaults: input.applyDefaults === undefined ? applyDefaultsPref : input.applyDefaults,
           bindToTurn: input.bindToTurn === undefined ? bindToTurnPref : input.bindToTurn,
         }
@@ -1723,6 +1830,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
         autoInsert = next.autoInsert
         alwaysSendPrompt = next.alwaysSendPrompt
         videosPerTurn = next.videosPerTurn
+        streamPreclaim = next.streamPreclaim
         applyDefaultsPref = next.applyDefaults
         bindToTurnPref = next.bindToTurn
         // 正文标记模式不向模型开放生成工具；切回工具调用时再注册回来。
@@ -2206,7 +2314,8 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     syncMarkerRegex, disableMarkerRegex,
     setToolSync(fn) { toolSync = typeof fn === 'function' ? fn : () => {}; toolSync() },
     get generationMode() { return generationMode }, get autoInsert() { return autoInsert },
-    get alwaysSendPrompt() { return alwaysSendPrompt }, get videosPerTurn() { return videosPerTurn } }
+    get alwaysSendPrompt() { return alwaysSendPrompt }, get videosPerTurn() { return videosPerTurn },
+    get streamPreclaim() { return streamPreclaim } }
 }
 
 export async function apply(ctx, config = {}) {
