@@ -66,6 +66,7 @@ function resBody(res) {
 // ---- gateway fetch stub implementing the local gateway protocol ----
 function makeGatewayFetch({
   kind = 'image',
+  outputs = null,
   taskStatus = 'succeeded',
   workflows = null,
   onGenerations,
@@ -89,6 +90,10 @@ function makeGatewayFetch({
   const fileBytes = kind === 'video' ? MP4_BYTES : PNG_BYTES
   const fileType = kind === 'video' ? 'video/mp4' : 'image/png'
   const outPath = `/files/out/result.${ext}`
+  const outputKinds = Array.isArray(outputs) && outputs.length ? outputs : [kind]
+  const outputPaths = outputKinds.length === 1
+    ? [outPath]
+    : outputKinds.map((item, index) => `/files/out/result-${index}.${item === 'video' ? 'mp4' : 'png'}`)
   const list = workflows ?? [{ alias: 'demo', customFields: [], referenceSlots: [], capabilities: {} }]
   const portDirectiveCalls = []
   const settingsWrites = { defaults: [], duration: [], seeds: [], modelFields: [], slots: [] }
@@ -168,10 +173,11 @@ function makeGatewayFetch({
       return new Response(JSON.stringify({ task_id: ['task-' + generations], accepted: 1 }), { status: 200, headers: { 'content-type': 'application/json' } })
     }
     if (/^\/v1\/tasks\//.test(u.pathname)) {
-      return new Response(JSON.stringify({ status: taskStatus, outputs: [{ path: outPath }] }), { status: 200, headers: { 'content-type': 'application/json' } })
+      return new Response(JSON.stringify({ status: taskStatus, outputs: outputPaths.map(path => ({ path })) }), { status: 200, headers: { 'content-type': 'application/json' } })
     }
     if (u.pathname.startsWith('/files/')) {
-      return new Response(fileBytes, { status: 200, headers: { 'content-type': fileType } })
+      const video = u.pathname.endsWith('.mp4')
+      return new Response(video ? MP4_BYTES : PNG_BYTES, { status: 200, headers: { 'content-type': video ? 'video/mp4' : 'image/png' } })
     }
     return new Response(JSON.stringify({ error: 'not found' }), { status: 404 })
   }
@@ -228,6 +234,7 @@ async function makeHost({ baseURL = BASE, configured = true, gateway = null, tav
     list: async () => [],
     update: async () => {},
     attach: async () => {},
+    remove: async () => false,
   }
   const credentials = {
     resolve: async (name) => (credentialStore.has(name) ? { value: credentialStore.get(name), source: 'runtime', writable: true } : undefined),
@@ -610,6 +617,66 @@ describe('onMedia: image uses saveImage(with mediaType), video uses saveFile(wit
     assert.equal(calls.saveFile.length, 1, 'video must call saveFile')
     assert.equal(calls.saveImage.length, 0, 'video must not call saveImage')
     assert.equal('mediaType' in calls.saveFile[0], false, 'saveFile must NOT receive mediaType')
+  })
+})
+
+// =====================================================================
+describe('管线任务（先图片后视频）只把成片视频挂进正文', () => {
+  function mediaTavern() {
+    const items = []
+    const removed = []
+    const tavern = {
+      getTurnState: async () => ({ settled: true, busy: false, turn: 5, textVersion: 'v1' }),
+      getTurn: async ({ gameId, turn }) => ({ gameId, turn, textVersion: 'v1' }),
+      // Tavern 的 list 返回的是扁平媒体项（kind/status/data 与 id 同级），不是 attach 参数原样。
+      list: async ({ gameId, turn }) => items.filter(item => item.gameId === gameId && item.turn === turn)
+        .map(({ id, textVersion, ...item }) => ({ id, textVersion, ...item })),
+      attach: async ({ gameId, turn, textVersion, item }) => {
+        const record = { id: 'm' + (items.length + 1), gameId, turn, textVersion, ...item }
+        items.push(record)
+        return { id: record.id }
+      },
+      update: async (id, changes) => {
+        const record = items.find(item => item.id === id)
+        if (record) Object.assign(record, changes)
+      },
+      remove: async (id) => {
+        const index = items.findIndex(item => item.id === id)
+        if (index < 0) return false
+        removed.push(items.splice(index, 1)[0])
+        return true
+      },
+    }
+    return { tavern, items, removed }
+  }
+
+  test('中间图不先挂进正文，只保留视频产物', async () => {
+    const gateway = makeGatewayFetch({ outputs: ['image', 'video'] })
+    const fake = mediaTavern()
+    const { host } = await makeHost({ configured: true, gateway, tavernImpl: fake.tavern })
+    const job = await host.dispatch({ action: 'submit', requestId: 'req-pipe', input: { model: 'demo', prompt: 'x' }, bindToTurn: true, gameId: 'game-1' })
+    const ready = await waitForJob(host, job.id, value => value.status === 'ready')
+    assert.deepEqual(ready.attachments.map(item => item.kind), ['image', 'video'], '任务记录仍保留中间图供面板预览')
+    await host.reconcile()
+    const attached = fake.items.filter(item => item.data?.runninghubJob === job.id)
+    assert.deepEqual(attached.map(item => [item.kind, item.data.outputIndex]), [['video', 1]],
+      '正文里只应有成片视频，不能同时出现中间图')
+  })
+
+  test('旧版本已经挂上的中间图会在对账时移除', async () => {
+    const gateway = makeGatewayFetch({ outputs: ['image', 'video'] })
+    const fake = mediaTavern()
+    const { host } = await makeHost({ configured: true, gateway, tavernImpl: fake.tavern })
+    const job = await host.dispatch({ action: 'submit', requestId: 'req-pipe-legacy', input: { model: 'demo', prompt: 'x' }, bindToTurn: true, gameId: 'game-1' })
+    await waitForJob(host, job.id, value => value.status === 'ready')
+    fake.items.push({
+      id: 'legacy-image', gameId: 'game-1', turn: 5, textVersion: 'v1',
+      kind: 'image', status: 'ready', data: { runninghubJob: job.id, outputIndex: 0 },
+    })
+    await host.reconcile()
+    assert.equal(fake.items.some(item => item.id === 'legacy-image'), false, '同一任务的中间图必须被移除')
+    const remaining = fake.items.filter(item => item.data?.runninghubJob === job.id)
+    assert.deepEqual(remaining.map(item => item.kind), ['video'], '移除中间图后仍保留视频')
   })
 })
 

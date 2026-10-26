@@ -283,13 +283,47 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
         || sizeChanged) await ctx.tavern.update(existing.id, changes)
     } else await ctx.tavern.attach({ ...binding, item: { ...changes, data: { runninghubJob: job.id, outputIndex } } })
   }
+  /**
+   * 先图片后视频的管线（首帧、四宫格故事板等）会返回中间图和成片两段产物。
+   * 成片已经在正文里时，中间图只是生成素材，再挂一次会让同一段正文出现两张图。
+   * 只清理同一任务、同一正文版本下的中间图和失效占位；其它产物保持原样，旧宿主没有 remove 时不动。
+   */
+  async function removeIntermediateItems(job, videoIndexes, resolutions) {
+    if (typeof ctx.tavern.list !== 'function' || typeof ctx.tavern.remove !== 'function') return
+    const binding = await resolvedBinding(job, resolutions)
+    if (!binding?.gameId) return
+    const items = await ctx.tavern.list({ gameId: binding.gameId, turn: binding.turn })
+    const attachments = Array.isArray(job.attachments) ? job.attachments : []
+    for (const item of items) {
+      if (item.textVersion !== binding.textVersion || item.data?.runninghubJob !== job.id) continue
+      const index = Number(item.data?.outputIndex)
+      // 只处理中间图和还没落到实处的占位；视频、音频等其余产物保持原样。
+      const intermediate = item.kind === 'image' || attachments[index]?.kind === 'image'
+        || (!item.attachment && !videoIndexes.has(index))
+      if (!intermediate) continue
+      try { await ctx.tavern.remove(item.id) } catch { /* 宿主不支持或该项已不存在 */ }
+    }
+  }
   async function reconcileJob(job, resolutions) {
     if (!job.binding?.gameId || disposed) return
     return bindingSerial(job, async () => {
       try {
-        if (job.attachments?.length) {
-          for (let index = 0; index < job.attachments.length; index++) await insert(job, job.attachments[index], index, resolutions)
-        } else if (job.binding.generationId || job.binding.pending) await insert(job, undefined, 0, resolutions)
+        const attachments = Array.isArray(job.attachments) ? job.attachments : []
+        const videos = attachments.map((media, index) => ({ media, index }))
+          .filter(entry => entry.media?.kind === 'video')
+        const expectsVideo = (Array.isArray(job.outputs) ? job.outputs : []).some(output => output?.kind === 'video')
+        // 视频还没下载完时先保留「生成中」占位；视频最终失败才回退到已经下载好的图片，
+        // 免得中间图和成片同时出现。
+        const failedFinal = ['failed', 'download_failed', 'submit_unknown'].includes(job.status)
+        if (videos.length) {
+          // 先确保成片挂上，再清中间图：视频落位失败时至少不会把已经存在的图删掉。
+          for (const entry of videos) await insert(job, entry.media, entry.index, resolutions)
+          await removeIntermediateItems(job, new Set(videos.map(entry => entry.index)), resolutions)
+        } else if (attachments.length && !(expectsVideo && !failedFinal)) {
+          for (let index = 0; index < attachments.length; index++) await insert(job, attachments[index], index, resolutions)
+        } else if (job.binding.generationId || job.binding.pending) {
+          await insert(job, undefined, 0, resolutions)
+        }
         insertionErrors.delete(job.id)
       } catch (error) { insertionErrors.set(job.id, sanitizeMessage(error.message)) }
     })
@@ -319,7 +353,10 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     const ref = media.kind === 'image' ? attachment : { attachmentId: attachment.attachmentId, name: attachment.name, bytes: attachment.bytes }
     const saved = { kind: media.kind, name: media.name, mediaType: media.mediaType, attachment: ref,
       url: `${MEDIA}?id=${job.id}&index=${job.outputIndex}` }
-    await bindMedia(job, saved)
+    // 同一任务后面还有成片视频时，中间图只留在任务记录里供面板预览，不先挂进正文；
+    // 视频最终失败会由对账回退成图片，视频成功则只保留成片。
+    const expectsVideo = (Array.isArray(job.outputs) ? job.outputs : []).some(output => output?.kind === 'video')
+    if (!(media.kind === 'image' && expectsVideo)) await bindMedia(job, saved)
     return saved
   }
   async function onChange(job) {
