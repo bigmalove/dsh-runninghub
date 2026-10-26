@@ -2240,7 +2240,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
       parts.push(`当前工作流的提示词模板不可用${promptDirective.error ? '（' + promptDirective.error + '）' : ''}，本回合${channel === 'marker' ? '不要写 [[RH:SHOT]] 标记块' : '不要调用 runninghub_generate'}；正文照常写。`)
     } else if (channel === 'marker') {
       if (autoInsert) {
-        parts.push(`本回合生成 ${videosPerTurn} 个镜头。先在思考里定稿完整的本轮正文，从上一轮结束后的下一个动作开始，不要重播上一轮已经写过的画面；然后在本轮正文最后写 ${videosPerTurn} 个标记块（不要多也不要少），上一轮和历史正文不能作为本轮视频内容。标记块会被宿主移除，正文才是玩家看到的剧情。`)
+        parts.push(`本回合生成 ${videosPerTurn} 个镜头。先在思考里定稿完整的本轮正文，从上一轮结束后的下一个动作开始，不要重播上一轮已经写过的画面；然后在回复最前面写 ${videosPerTurn} 个标记块（不要多也不要少），紧接其后才是本轮正文——标记块先写、正文后写，这样镜头能在正文写到一半时就提交出去。上一轮和历史正文不能作为本轮视频内容。标记块会被宿主移除，正文才是玩家看到的剧情。`)
         parts.push(markerPromptSpec({ pipeline: promptDirective.pipeline, count: videosPerTurn }))
       }
       parts.push(directive)
@@ -2249,10 +2249,10 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
       }
       parts.push([
         autoInsert
-          ? '严格按上面的标记格式：块开始 [[RH:SHOT]]、块结束 [[/RH:SHOT]]，字段单独占一行；@after 逐字引用本轮正文原句，省略则附在正文末尾。'
+          ? '严格按上面的标记格式：块开始 [[RH:SHOT]]、块结束 [[/RH:SHOT]]，字段单独占一行；@after 逐字引用后面的正文原句，省略则附在正文末尾。'
           : '本回合不要生成镜头，也不要写 [[RH:SHOT]] 标记块；正文照常写。',
         '不要调用 runninghub_generate、runninghub_send_pregenerated 或其它 RunningHub 工具；Tavern 要求用 submit_story 时，把正文和标记块一起放进 content。',
-        ...(autoInsert ? ['标记块必须放在正文最后，块外不要写提示词说明、摘要或收尾语。'] : []),
+        ...(autoInsert ? ['标记块写在正文前面：先块、后正文；块外不要写提示词说明、摘要或“正文：”之类的引导语。'] : []),
       ].join('\n\n'))
     } else {
       if (autoInsert) {
@@ -2285,7 +2285,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     if (promptDirective.model !== model || !directiveFor(generationMode)) return ''
     const lead = typeof input === 'string' && input.trim() ? `本轮玩家指引：${input.trim().slice(0, 500)}。` : ''
     if (generationMode === 'marker') {
-      return `【RunningHub】${lead}先按这条指引定稿本轮正文；在正文最后按格式写 ${videosPerTurn} 个 [[RH:SHOT]] 标记块（@after 用正文原句），不要调用 RunningHub 生成工具。宿主会移除标记块，并把成片插在 @after 那句之后。不要用上一轮画面，块外不要重复提示词。`
+      return `【RunningHub】${lead}先按这条指引在思考里定稿本轮正文；然后在回复最前面按格式写 ${videosPerTurn} 个 [[RH:SHOT]] 标记块（@after 逐字引用后面正文的原句），写完块再开始正文。不要调用 RunningHub 生成工具。宿主会移除标记块，并把成片插在 @after 那句之后。不要用上一轮画面，块外不要重复提示词。`
     }
     return `【RunningHub】${lead}先按这条指引定稿本轮正文，再从正文里挑 ${videosPerTurn} 个瞬间写视频提示词（anchor 用正文原句）；然后在同一条回复里调用 runninghub_generate 提交 ${videosPerTurn} 段，并紧接着调用 submit_story 提交完整正文（最后一个工具调用）。不要等工具结果再补正文，也不要用上一轮画面。`
   }

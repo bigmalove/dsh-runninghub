@@ -1979,6 +1979,21 @@ describe('正文标记（非工具调用模式）', () => {
     assert.equal(pending.item.caption, '雨夜入门')
   })
 
+  test('块写在正文前面：闭合块整段移除，漏写结束行也只吃到第一个空行', async () => {
+    const gateway = makeGatewayFetch({ workflows: [{ alias: 'demo', customFields: [], referenceSlots: [], capabilities: {} }],
+      settings: { defaultModel: 'demo' }, portDirectiveText: '【模板】' })
+    const fake = markerTavern({ rawText: '' })
+    const { host, regexLibraryFile } = await makeHost({ configured: true, gateway, tavernImpl: fake.tavern })
+    await host.dispatch({ action: 'preferences', generationMode: 'marker', autoInsert: true })
+    const scripts = await readManagedScripts(regexLibraryFile)
+    const strip = text => scripts.reduce((value, script) => applyScript(value, script), text)
+    const body = '林岚推开门。\n\n雨顺着伞沿落下。'
+    assert.equal(strip('[[RH:SHOT]]\n@prompt\n镜头\n[[/RH:SHOT]]\n\n' + body).trim(), body,
+      '块在正文前面也能整段吃掉')
+    assert.equal(strip('[[RH:SHOT]]\n@prompt\n漏写结束行\n\n' + body).trim(), body,
+      '漏写结束行时只吃到空行，正文整篇保留')
+  })
+
   test('标记块跨进 HTML 块也照常提交，正则整段覆盖且不再报保留提示', async () => {
     const rawText = [
       '林岚推开门，雨水顺着伞沿落下。',

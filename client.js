@@ -2748,7 +2748,7 @@ window.__ModuleLoader__.load({
                   h('div', { className: 'rh-fold-content' },
                     h('pre', { style: { margin: 0, padding: '10px 12px', borderRadius: 8, background: 'var(--rh-soft)', color: 'var(--rh-ink)', fontSize: 11, lineHeight: 1.65, whiteSpace: 'pre-wrap', overflowX: 'auto' } },
                       '[[RH:SHOT]]\n@after\n正文里紧挨插入位置的一句原句\n@caption\n可选，短镜头名\n@prompt\n单段工作流的提示词\n[[/RH:SHOT]]'),
-                    note('两段式管线（Qwen 多图生图 → 图生视频）把 @prompt 换成 @image 与 @video，两段都写。多个镜头就重复多个块，块统一放在正文最后。'),
+                    note('两段式管线（Qwen 多图生图 → 图生视频）把 @prompt 换成 @image 与 @video，两段都写。多个镜头就重复多个块，块统一放在正文最前面（先块、后正文）。'),
                     note('启用插件时会把这条标记清理规则自动加入 Tavern 全局正则库，名称「RunningHub · 移除正文标记块（自动管理）」。即使块里出现 <Picture N> / <Subject N>、或标记块跨进 HTML，也会在正文显示和提示词投影时整段移除。'),
                     note('原始存档正文里仍保留标记，可在 Tavern 正则库查看或停用；正文区和发送给模型的提示词里不会出现。'),
                     note('@after 必须逐字引用本轮正文原句；省略则附在正文末尾。标记块不会进入后续上下文。'))) : null,
