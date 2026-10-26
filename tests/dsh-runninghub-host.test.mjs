@@ -242,7 +242,8 @@ async function makeHost({ baseURL = BASE, configured = true, gateway = null, tav
     describe: async (name) => (credentialStore.has(name) ? { source: 'runtime', writable: true } : undefined),
   }
   const ctx = { attachments, credentials, tavern }
-  const options = { pollMs }
+  // 后台配置同步会定时拉工作流列表，测试里关掉，否则会打乱按次断言的 portDirectiveCalls。
+  const options = { pollMs, workflowSyncMs: 0 }
   if (gateway) options.fetchImpl = gateway.fetchImpl
   if (clientFactory) options.clientFactory = clientFactory
   const regexLibraryFile = join(dataDirectory, 'tavern-extension-settings.json')
@@ -267,6 +268,16 @@ async function waitForJob(host, id, predicate, timeout = 5000) {
     await new Promise(r => setTimeout(r, 10))
   }
   throw new Error('job ' + id + ' did not reach expected state')
+}
+
+/** 占位是在下载/对账之后才挂的：remoteTaskId 有了不代表 attach 已经发生。 */
+async function waitForAttach(fake, predicate, timeoutMs = 3000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (fake.calls.attaches.some(predicate)) return true
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+  return false
 }
 
 // =====================================================================
@@ -879,6 +890,95 @@ describe('workflow selection: panel state drives tools and prompt template', () 
     assert.deepEqual(body.references, [{ kind: 'image', label: '生图·参考图 1', tag: '<image1>', note: '女主外貌' }])
     assert.deepEqual(body.mediaLimits, { picture: 1, video: 0, audio: 0 })
     assert.equal(body.durationSeconds, 5)
+  })
+
+  test('grid pipeline with videoRefSource=image numbers only the four slices (defaults are bypassed)', async () => {
+    const gridPipe = {
+      alias: 'MOSS四宫格故事板', revision: 'r-grid', defaultEnhanceMode: 'moss-grid-h3',
+      videoDuration: { seconds: 10.125 },
+      pipeline: {
+        kind: 'grid-storyboard', imageWorkflowAlias: 'MOSS文生图', videoWorkflowAlias: 'h3参考',
+        videoRefSource: 'image', frameSlotNodeIds: ['178', '180', '209', '210'],
+      },
+      customFields: [], referenceSlots: [], capabilities: {}, defaults: {},
+    }
+    const mossImage = {
+      alias: 'MOSS文生图', revision: 'r-moss', defaultEnhanceMode: 'moss-image',
+      customFields: [], capabilities: {}, referenceSlots: [], defaults: { references: [] },
+    }
+    const h3Ref = {
+      alias: 'h3参考', revision: 'r-h3ref', customFields: [], capabilities: {},
+      referenceSlots: [
+        { nodeId: '37', kind: 'image', label: '参考图 1', role: 'ref_images.ref_image_0', tag: '<Picture 1>' },
+        { nodeId: '211', kind: 'image', label: '参考图 2', role: 'ref_images.ref_image_1', tag: '<Picture 2>' },
+        { nodeId: '178', kind: 'image', label: '参考图 3', role: 'ref_images.ref_image_2', bypassed: true },
+        { nodeId: '180', kind: 'image', label: '参考图 4', role: 'ref_images.ref_image_3', bypassed: true },
+        { nodeId: '209', kind: 'image', label: '参考图 5', role: 'ref_images.ref_image_4', bypassed: true },
+        { nodeId: '210', kind: 'image', label: '参考图 6', role: 'ref_images.ref_image_5', bypassed: true },
+        { nodeId: '177', kind: 'audio', label: '参考音频 1', role: 'ref_audios.ref_audio_0', tag: '<Audio 1>' },
+      ],
+      defaults: { references: [
+        { nodeId: '37', kind: 'image', name: '人物设定-有村架纯.png', note: '女主身高1米7,外貌、身材' },
+        { nodeId: '211', kind: 'image', name: 'image_00000.png', note: '男主身高1米5,外貌、身材' },
+        { nodeId: '177', kind: 'audio', name: '杨幂.mp3', note: '女子声音' },
+      ] },
+    }
+    const gateway = makeGatewayFetch({ workflows: [gridPipe, mossImage, h3Ref], settings: { defaultModel: 'MOSS四宫格故事板' }, portDirectiveText: template })
+    const { host } = await makeHost({ configured: true, gateway })
+    const selected = await host.dispatch({ action: 'select-model', model: 'MOSS四宫格故事板' })
+    assert.equal(selected.templateMode, 'moss-grid-h3')
+    const body = gateway.portDirectiveCalls.at(-1).body
+    assert.deepEqual(body.references, [
+      { kind: 'image', label: '视频·参考图 1', tag: '<Picture 1>', note: '本次四宫格的第 1 片（左上格），这场戏的第 1 个剧情节拍' },
+      { kind: 'image', label: '视频·参考图 2', tag: '<Picture 2>', note: '本次四宫格的第 2 片（右上格），这场戏的第 2 个剧情节拍' },
+      { kind: 'image', label: '视频·参考图 3', tag: '<Picture 3>', note: '本次四宫格的第 3 片（左下格），这场戏的第 3 个剧情节拍' },
+      { kind: 'image', label: '视频·参考图 4', tag: '<Picture 4>', note: '本次四宫格的第 4 片（右下格），这场戏的第 4 个剧情节拍' },
+      { kind: 'audio', label: '视频·参考音频 1', tag: '<Audio 1>', note: '女子声音' },
+    ], '设定图 37/211 这一单被四片顶掉，不能再按 <Picture 1>/<Picture 2> 列出来')
+    assert.deepEqual(body.mediaLimits, { picture: 4, video: 0, audio: 1 })
+  })
+
+  test('客户端改过配置后，下一次面板刷新就换模板（不需要手动点同步）', async () => {
+    const gridPipe = {
+      alias: 'MOSS四宫格故事板', revision: 'r-grid-1', defaultEnhanceMode: 'moss-grid-h3',
+      videoDuration: { seconds: 10.125 },
+      pipeline: { kind: 'grid-storyboard', imageWorkflowAlias: 'MOSS文生图', videoWorkflowAlias: 'h3参考', frameSlotNodeIds: ['178', '180', '209', '210'] },
+      customFields: [], referenceSlots: [], capabilities: {}, defaults: {},
+    }
+    const mossImage = {
+      alias: 'MOSS文生图', revision: 'r-moss', defaultEnhanceMode: 'moss-image',
+      customFields: [], capabilities: {}, referenceSlots: [], defaults: { references: [] },
+    }
+    const h3Ref = {
+      alias: 'h3参考', revision: 'r-h3ref', customFields: [], capabilities: {},
+      referenceSlots: [
+        { nodeId: '37', kind: 'image', label: '参考图 1', role: 'ref_images.ref_image_0', tag: '<Picture 1>' },
+        { nodeId: '211', kind: 'image', label: '参考图 2', role: 'ref_images.ref_image_1', tag: '<Picture 2>' },
+        { nodeId: '178', kind: 'image', label: '参考图 3', role: 'ref_images.ref_image_2', bypassed: true },
+        { nodeId: '180', kind: 'image', label: '参考图 4', role: 'ref_images.ref_image_3', bypassed: true },
+        { nodeId: '209', kind: 'image', label: '参考图 5', role: 'ref_images.ref_image_4', bypassed: true },
+        { nodeId: '210', kind: 'image', label: '参考图 6', role: 'ref_images.ref_image_5', bypassed: true },
+        { nodeId: '177', kind: 'audio', label: '参考音频 1', role: 'ref_audios.ref_audio_0', tag: '<Audio 1>' },
+      ],
+      defaults: { references: [
+        { nodeId: '37', kind: 'image', name: '人物设定-有村架纯.png', note: '女主身高1米7,外貌、身材' },
+        { nodeId: '211', kind: 'image', name: 'image_00000.png', note: '男主身高1米5,外貌、身材' },
+        { nodeId: '177', kind: 'audio', name: '杨幂.mp3', note: '女子声音' },
+      ] },
+    }
+    const gateway = makeGatewayFetch({ workflows: [gridPipe, mossImage, h3Ref], settings: { defaultModel: 'MOSS四宫格故事板' }, portDirectiveText: template })
+    const { host } = await makeHost({ configured: true, gateway })
+    await host.dispatch({ action: 'list' })
+    assert.deepEqual(gateway.portDirectiveCalls.at(-1).body.mediaLimits, { picture: 2, video: 0, audio: 1 }, 'video 规则下只列两张设定图 + 默认声音')
+
+    // 用户在 6888 管理页把「视频的参考素材」切成 image：revision 变了，下一次刷新必须重建模板。
+    gridPipe.revision = 'r-grid-2'
+    gridPipe.pipeline.videoRefSource = 'image'
+    await host.dispatch({ action: 'list' })
+    const body = gateway.portDirectiveCalls.at(-1).body
+    assert.deepEqual(body.mediaLimits, { picture: 4, video: 0, audio: 1 })
+    assert.equal(body.references[0].tag, '<Picture 1>')
+    assert.match(body.references[0].note, /第 1 片（左上格）/)
   })
 
   test('reference workflows inject the picture-binding rule and rewrite “只引用用户提到过的素材”', async () => {
@@ -1870,6 +1970,7 @@ describe('正文标记（非工具调用模式）', () => {
     assert.equal(job.binding.anchor, '林岚推开门，雨水顺着伞沿落下。')
     await waitForJob(host, job.id, value => Boolean(value.remoteTaskId))
     assert.equal(submitted.prompt, '电影感写实照片，林岚站在雨夜的门口。')
+    await waitForAttach(fake, item => item.textVersion === 'v1')
     const pending = fake.calls.attaches.find(item => item.textVersion === 'v1')
     assert.ok(pending, '应在当前正文版本上挂占位')
     assert.equal(pending.item.anchor, '林岚推开门，雨水顺着伞沿落下。')
@@ -1915,6 +2016,7 @@ describe('正文标记（非工具调用模式）', () => {
     assert.equal(job.binding.textVersion, 'v1', '按当前版本绑定')
     await waitForJob(host, job.id, value => Boolean(value.remoteTaskId))
     assert.equal(submitted.prompt, '<Picture 1> 雨夜门口的电影感镜头。')
+    await waitForAttach(fake, item => item.textVersion === 'v1')
     const pending = fake.calls.attaches.find(item => item.textVersion === 'v1')
     assert.ok(pending, '应在当前正文版本上挂占位')
     const summary = await host.dispatch({ action: 'list' })

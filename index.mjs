@@ -178,6 +178,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
       ...(insertionErrors.has(job.id) ? { insertionError: insertionErrors.get(job.id) } : {}) }))
   }
   let reconcileTimer
+  let workflowSyncTimer
   let engine, client, clientIdentity, disposed = false, workflows = [], workflowError = ''
   // 工作流由面板决定，模型只写提示词。selectedModel 是玩家显式选中的别名；
   // model 是本次实际生效的别名（选中项失效时回落到网关默认/第一个可用项）。
@@ -404,6 +405,42 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     }
     return /qwen/i.test(description?.alias || '') ? 'qwen-image' : 'krea2-image'
   }
+  // 四宫格格位：与客户端 gridSliceNote 同口径，清单只写「第几片」时模型得自己猜哪片是哪格。
+  const GRID_SLICE_POSITIONS = ['左上格', '右上格', '左下格', '右下格']
+  function gridSliceNote(index) {
+    const position = GRID_SLICE_POSITIONS[index - 1]
+    return `本次四宫格的第 ${index} 片${position ? `（${position}）` : ''}，这场戏的第 ${index} 个剧情节拍`
+  }
+  function isImageSideGrid(description) {
+    const pipeline = description?.pipeline
+    return pipeline?.kind === 'grid-storyboard' && pipeline.videoRefSource === 'image'
+  }
+  /**
+   * 四宫格管线 videoRefSource=image 时视频侧真正接得上的素材。
+   *
+   * 客户端生成时（pipeline.ts planImageSideVideoSlots）把四片依次塞进前 4 个参考图槽，
+   * 视频工作流自己的默认设定图这一单被顶掉、其余图片槽临时旁路；只留默认声音。
+   * 插件若照默认素材清单编号，模型会以为「设定图占了 <Picture 1>/<Picture 2>、裁片顺延到 3～6」，
+   * 而远端只接了 4 张，strict_prompt_tags 整单拒收（10-25 那批任务就是这么丢的）。
+   */
+  function imageSideVideoReferences(workflow) {
+    if (!workflow) return []
+    const slots = workflow.referenceSlots || []
+    const defaults = new Map((workflow.defaults?.references || []).map((asset) => [String(asset.nodeId), asset]))
+    const used = slots.filter((slot) => slot.kind === 'image' && /ref_image/i.test(slot.role || '')).slice(0, 4)
+    const pictures = used.map((slot, index) => ({
+      side: '视频', kind: 'image', label: slot.label || slot.nodeId,
+      tag: `<Picture ${index + 1}>`, note: gridSliceNote(index + 1),
+    }))
+    const audio = slots
+      .filter((slot) => slot.kind === 'audio' && !slot.bypassed && slot.tag && defaults.has(String(slot.nodeId)))
+      .map((slot) => {
+        const asset = defaults.get(String(slot.nodeId))
+        return { side: '视频', kind: 'audio', label: slot.label || slot.nodeId, tag: slot.tag,
+          ...(asset.name ? { name: asset.name } : {}), ...(asset.note ? { note: asset.note } : {}) }
+      })
+    return [...pictures, ...audio]
+  }
   /**
    * 当前工作流实际会附上的默认参考素材：只看没停用的槽位，且槽位在默认值里有素材。
    * tag 就是提示词里的编号（<Picture 1> / <Audio 1>），备注是给模型看的事实。
@@ -427,7 +464,10 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     }
     if (description.pipeline) {
       addSide(byAlias.get(description.pipeline.imageWorkflowAlias), '生图', { qwenTags })
-      addSide(byAlias.get(description.pipeline.videoWorkflowAlias), '视频', { video: true, firstFrame: description.pipeline.kind === 'first-frame' })
+      const videoWorkflow = byAlias.get(description.pipeline.videoWorkflowAlias)
+      // 四宫格 videoRefSource=image：视频侧只有四片（设定图被顶掉），不能按默认素材清单编号。
+      if (isImageSideGrid(description)) references.push(...imageSideVideoReferences(videoWorkflow))
+      else addSide(videoWorkflow, '视频', { video: true, firstFrame: description.pipeline.kind === 'first-frame' })
     } else addSide(description, '参考', { qwenTags })
     return references
   }
@@ -645,11 +685,15 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
   // 同一轮并行提交时只拉一次工作流列表：三段视频不该各打一次网关，
   // 也不能让后到的调用看到半空的 workflows 再拉一遍。
   let workflowsLoading = null
+  // 列表缓存时间。客户端里改过槽位启用状态或管线的 videoRefSource 之后，插件不能一直拿旧列表
+  // 算素材清单——那会让提示词编号与实际接线条数错开（10-25 那批 3～6 的提交）。
+  let workflowsLoadedAt = 0
+  const WORKFLOW_CACHE_MS = 10_000
   async function ensureModel(active) {
-    if (!workflows.length) {
+    if (!workflows.length || Date.now() - workflowsLoadedAt > WORKFLOW_CACHE_MS) {
       if (!workflowsLoading) {
         workflowsLoading = active.client.listWorkflows()
-          .then(list => { workflows = list; return list })
+          .then(list => { workflows = list; workflowsLoadedAt = Date.now(); return list })
           .finally(() => { workflowsLoading = null })
       }
       await workflowsLoading
@@ -669,6 +713,25 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     model = next
     await refreshDirective(active, usable.find((w) => w.alias === next))
     return model
+  }
+  /**
+   * 后台静默对齐客户端配置。
+   *
+   * 面板收起时没有人点「同步客户端」，也没人触发 5 秒轮询；而工作流随时可能在 6888 管理页
+   * 改槽位启用状态、切管线的 videoRefSource、换默认工作流。插件不能等玩家来点按钮才更新模板：
+   * 这里定期重读列表，revision 变了就重建模板；失败静默（面板另报连接异常）。
+   */
+  async function syncWorkflowConfig() {
+    const credential = await ctx.credentials.resolve(credentialName(baseURL))
+    if (!credential?.value) return
+    const active = await connect()
+    if (typeof active.client.getSettings === 'function') {
+      try {
+        const next = (await active.client.getSettings())?.defaultModel ?? ''
+        if (next !== defaultModel) defaultModel = next
+      } catch { /* 读不到就沿用旧默认 */ }
+    }
+    await ensureModel(active)
   }
   /* ---------- 预生成视频池 ---------- */
 
@@ -1505,6 +1568,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
       try {
         const active = await connect()
         workflows = await active.client.listWorkflows()
+        workflowsLoadedAt = Date.now()
         workflowError = ''
         // 默认模型取服务端默认；获取失败不让工作流列表丢失，单独记录同步错误。
         try {
@@ -1723,6 +1787,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
         keys(input, ['action', 'model'])
         if (typeof input.model !== 'string' || !input.model.trim()) throw fail('工作流别名不能为空')
         workflows = await active.client.listWorkflows()
+        workflowsLoadedAt = Date.now()
         const target = workflows.find((w) => w.alias === input.model && !w.broken)
         if (!target) throw fail('未找到工作流别名')
         selectedModel = target.alias
@@ -1864,6 +1929,13 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     if (input.input.model !== undefined && input.input.model !== alias) throw fail('工作流由面板选择，不能在工具参数里指定')
     if (input.input.custom !== undefined && !object(input.input.custom)) throw fail('custom 必须是对象')
     const description = await active.client.describe(alias)
+    // 这一单按 describe 的最新描述接线：客户端可能刚改过槽位启用状态或管线的 videoRefSource，
+    // 面板缓存里还是旧列表——提示词模板与素材清单必须与生成时的接线同一份，否则模型按旧接线写编号。
+    if (description.revision && workflows.find((item) => item.alias === alias)?.revision !== description.revision) {
+      workflows = workflows.map((item) => item.alias === alias ? description : item)
+      workflowsLoadedAt = Date.now()
+      await refreshDirective(active, description)
+    }
     const pipelineKind = description.pipeline?.kind || ''
     if (input.input.image_prompt !== undefined && typeof input.input.image_prompt !== 'string') throw fail('image_prompt 必须是文本')
     const structuredImage = typeof input.input.image_prompt === 'string' ? input.input.image_prompt.trim() : ''
@@ -2112,6 +2184,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
   function dispose() {
     disposed = true
     clearInterval(reconcileTimer)
+    clearInterval(workflowSyncTimer)
     for (const handle of pregenPlanners.values()) handle.controller.abort()
     pregenPlanners.clear()
     markerRuns.clear()
@@ -2119,6 +2192,13 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
   }
   reconcileTimer = setInterval(() => { void reconcile().catch(() => {}) }, options.reconcileMs ?? 5000)
   reconcileTimer.unref?.()
+  // 配置同步周期；options.workflowSyncMs=0 关闭（测试、只读部署）。
+  if (options.workflowSyncMs !== 0) {
+    workflowSyncTimer = setInterval(() => {
+      if (!disposed) void syncWorkflowConfig().catch(() => {})
+    }, options.workflowSyncMs ?? 15_000)
+    workflowSyncTimer.unref?.()
+  }
   await initPregen()
   await syncMarkerRegex()
   return { dispatch, route, store, replays, resume, dispose, reconcile, promptText, promptSections, turnReminder, handleTurn,
