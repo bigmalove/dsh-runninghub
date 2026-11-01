@@ -520,6 +520,23 @@ window.__ModuleLoader__.load({
 @media (prefers-reduced-motion:reduce){.rh-dock-dot{animation:none}.rh-dock-bar>span{animation:none;width:100%}}
 `
 
+    // 预提交去重表放在闭包里，不是组件里：停靠区和工作室面板可能同时挂一个
+    // GenerationDock（同一个 sessionId），组件级 Set 会让两个实例各发一次同样的镜头，
+    // 宿主每次都得再挡一遍。按 sessionId 记「已发过的指纹」和「当前轮次」。
+    const preclaimRegistries = new Map()
+    function preclaimRegistry(sessionId) {
+      let entry = preclaimRegistries.get(sessionId)
+      if (!entry) {
+        entry = { sent: new Set(), turn: 0, at: Date.now() }
+        preclaimRegistries.set(sessionId, entry)
+      }
+      entry.at = Date.now()
+      for (const [key, value] of preclaimRegistries) {
+        if (Date.now() - value.at > 30 * 60 * 1000) preclaimRegistries.delete(key)
+      }
+      return entry
+    }
+
     function GenerationDock(props) {
       const sessionId = typeof props?.sessionId === 'string' ? props.sessionId : ''
       const [jobs, setJobs] = useState(null)
@@ -577,35 +594,34 @@ window.__ModuleLoader__.load({
         if (!sessionId) return undefined
         const ui = tavernUiApi
         if (!ui || typeof ui.watchReply !== 'function') return undefined
-        const sent = new Set()
-        let turn = 0
+        const registry = preclaimRegistry(sessionId)
         let blocked = false
         const stop = ui.watchReply(sessionId, state => {
           if (!state || typeof state.text !== 'string') return
           if (state.streaming !== true) {
             // 这一轮写完了：下次生成重新开始判断。
-            if (!state.busy) { sent.clear(); turn = 0; blocked = false }
+            if (!state.busy) { registry.sent.clear(); registry.turn = 0; blocked = false }
             return
           }
           const index = Number(state.turn)
           if (!Number.isInteger(index) || index < 1) return
-          if (index !== turn) { sent.clear(); turn = index; blocked = false }
+          if (index !== registry.turn) { registry.sent.clear(); registry.turn = index; blocked = false }
           if (blocked || !state.text.includes('RH')) return
           const fresh = []
           for (const shot of streamShots(state.text)) {
-            if (sent.has(shot.fingerprint)) continue
+            if (registry.sent.has(shot.fingerprint)) continue
             if (!shot.prompt && !shot.image && !shot.video) continue
             fresh.push(shot)
           }
           if (!fresh.length) return
-          for (const shot of fresh) sent.add(shot.fingerprint)
+          for (const shot of fresh) registry.sent.add(shot.fingerprint)
           request({ action: 'preclaim', gameId: sessionId, turn: index, shots: fresh })
             .then(data => {
               if (data && data.skipped) blocked = true
             })
             .catch(() => {
               // 网络失败不要把指纹记成已发：结算时宿主还会照常提交一次。
-              for (const shot of fresh) sent.delete(shot.fingerprint)
+              for (const shot of fresh) registry.sent.delete(shot.fingerprint)
             })
         })
         return () => { if (typeof stop === 'function') stop() }
@@ -2721,9 +2737,15 @@ window.__ModuleLoader__.load({
               h('div', { className: 'rh-rule' }),
               h('section', { className: 'rh-setting-group' },
                 h('div', { className: 'rh-setting-heading' }, icon('grid'), '工作流'),
+                // 地址连不通时先把「连的是哪个网关、报的什么错」摊开，别只留一个空下拉。
+                summary?.gatewayError
+                  ? h('div', { className: 'rh-warning' }, h('div', { style: { fontWeight: 700 } }, '网关连接失败'),
+                    note('当前地址：' + (summary.baseUrl || summary.baseURL || DEFAULT_BASE) + '　这台设备访问不到它。手机端要填局域网地址（例如 http://192.168.1.10:6888），localhost / 127.0.0.1 只会指向本机。'),
+                    note(String(summary.gatewayError)))
+                  : null,
                 field('工作流', h('select', { className: 'rh-input', 'aria-label': '设置里的工作流', value: model,
                   disabled: locked || settingsBusy || !aliases.length, onChange: event => selectModel(event.target.value) },
-                !aliases.length ? h('option', { value: '' }, '等待客户端工作流') : null,
+                !aliases.length ? h('option', { value: '' }, summary?.configured ? '客户端没有返回工作流' : '等待客户端工作流') : null,
                 aliases.map(alias => h('option', { key: alias, value: alias }, alias)))),
                 summary?.templateMode
                   ? note('提示词模板 · ' + summary.templateMode + (summary?.alwaysSendPrompt === false ? ' · 开关关闭，未发送' : ' · 每轮发送'))

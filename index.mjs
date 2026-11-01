@@ -1439,14 +1439,94 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     })
   }
 
+  // ---- 正文标记镜头的一次性提交 ---------------------------------------------
+  // 一个镜头只能让网关扣一次费。两条入口（浏览器侧的预提交、宿主结算）会并发、
+  // 也会乱序到达：预提交的 POST 可能在结算提交之后才到，也可能在结算查任务表时
+  // 还没落盘。只靠 requestId 或只扫一遍任务表都不够，所以两条入口统一走这套判定：
+  //
+  //   1) 提交之前先登记 claim（同步执行，且在 connect / describe 之前），另一条入口
+  //      等这条 Promise，拿到任务就直接认领，而不是自己再发一次；
+  //   2) 任务记录顶字段常驻 fingerprint + markerGameId，绑定被改写、进程重来都能回查；
+  //   3) 两条都查不到时留一小段等待窗口，兜住「预提交请求还在浏览器到宿主的路上」。
+  const MARKER_REUSE_WINDOW_MS = 6 * 60 * 60 * 1000
+  const MARKER_CLAIM_WAIT_MS = 15_000
+  const MARKER_PRE_SUBMIT_POLL_MS = 200
+  const CLAIM_TIMED_OUT = Symbol('claim-timed-out')
+  const shotClaims = new Map()
+  const shotClaimKey = (gameId, fingerprint) => String(gameId ?? '') + '\u0000' + String(fingerprint ?? '')
+  const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
+
+  function openShotClaim(gameId, fingerprint) {
+    const key = shotClaimKey(gameId, fingerprint)
+    const existing = shotClaims.get(key)
+    // 已经结算过的登记不顶替新的一次提交：那条提交失败了，该由现在的调用方接手重发。
+    if (existing && !existing.done) return { claim: existing, owner: false }
+    let settle
+    const claim = {
+      at: Date.now(), done: false,
+      promise: new Promise(resolve => { settle = resolve }),
+      settle(job) { if (claim.done) return; claim.done = true; settle(job ?? null) },
+    }
+    shotClaims.set(key, claim)
+    // 面板长跑时别让表无限涨：已结算且过了一分钟的登记没有用处了。
+    for (const [name, value] of shotClaims) if (value.done && Date.now() - value.at > 60_000) shotClaims.delete(name)
+    return { claim, owner: true }
+  }
+
+  function closeShotClaim(claim, job) {
+    if (claim?.settle) claim.settle(job ?? null)
+  }
+
+  /** 一条已经存在的任务记录是不是同一个镜头。 */
+  function sameShotJob(job, { gameId, fingerprint, turn, since }) {
+    if (!job) return false
+    // 网关明确拒绝提交（没扣费）：不算提交过，重生成时要能重新发一次。
+    if (job.status === 'failed') return false
+    const printed = typeof job.fingerprint === 'string' ? job.fingerprint : job.binding?.fingerprint
+    if (printed !== fingerprint) return false
+    const owner = typeof job.markerGameId === 'string' ? job.markerGameId : job.binding?.gameId
+    if (owner !== gameId) return false
+    const created = Date.parse(job.createdAt ?? '')
+    if (!Number.isFinite(created) || created < since) return false
+    // 已经落位到别的轮次：同一段提示词在后面的轮次里再出现，是玩家要的新镜头。
+    if (Number.isInteger(turn) && Number.isInteger(job.binding?.turn) && job.binding.turn !== turn) return false
+    return true
+  }
+
+  /**
+   * 找「这个镜头已经提交过」的那条任务。
+   * - `own`：调用方自己登记的 claim，不能等自己；
+   * - `waitMs`：查不到时再等多久（只给结算侧用，等还没到达的预提交请求）。
+   */
+  async function findSubmittedShot({ gameId, fingerprint, turn, waitMs = 0, own = null }) {
+    if (typeof fingerprint !== 'string' || !fingerprint) return null
+    const key = shotClaimKey(gameId, fingerprint)
+    const deadline = Date.now() + Math.max(0, waitMs)
+    for (;;) {
+      const claim = shotClaims.get(key)
+      // 另一条入口正在提交：等它的结果，绝不自己再发一次。
+      if (claim && claim !== own && !claim.done) {
+        const budget = Math.max(200, Math.min(MARKER_CLAIM_WAIT_MS, deadline - Date.now()))
+        const outcome = await Promise.race([claim.promise, sleep(budget).then(() => CLAIM_TIMED_OUT)])
+        if (outcome && outcome !== CLAIM_TIMED_OUT) return outcome
+      }
+      const since = Date.now() - MARKER_REUSE_WINDOW_MS
+      const reuse = (await store.list()).find(job => sameShotJob(job, { gameId, fingerprint, turn, since }))
+      if (reuse) return reuse
+      if (Date.now() >= deadline) return null
+      await sleep(MARKER_PRE_SUBMIT_POLL_MS)
+    }
+  }
   /**
    * 流式预提交（正文标记模式）。
    *
    * 浏览器侧用 Tavern 的 watchReply 读到正在生成的正文；只要出现闭合的
    * [[RH:SHOT]] 块，就把它 POST 到这里。宿主当场提交任务，省掉「正文写完 +
-   * 后台结算结束」这段等待。预提交不带 textVersion（那时还没有），所以用
-   * 「同一局 + 同一轮 + 提示词指纹」算 requestId；结算时 processMarkerTurn
-   * 再算一次同样的 ID，命中就复用，网关只收一次费。
+   * 后台结算结束」这段等待。
+   *
+   * 预提交和结算谁先到都不一定（POST 可能排队到生成结束之后），所以这里不靠
+   * 「同一轮」这种两边未必一致的坐标去重，而是先用指纹登记 claim、再查已经提交过的
+   * 镜头：只要这个镜头已经有任务（或正在提交），就认领它，绝不二次收费。
    *
    * 只在开关打开、而且是正文标记 + 自动插入 + 发送模板三件齐备时才工作，
    * 其余情况返回 skipped（不是错误，避免面板和停靠区刷错误）。
@@ -1461,14 +1541,10 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     if (!input.shots.length) return { submitted: 0, reused: 0 }
     // 模板没准备好就先不发：模型这一轮拿到的格式可能和模板对不上，等结算按正常路径处理。
     if (promptDirective.model !== model || !directiveFor('marker')) return { skipped: 'no-template' }
-    let active
-    try { active = await connect() } catch { return { skipped: 'gateway' } }
-    try { await ensureModel(active) } catch { return { skipped: 'gateway' } }
-    const known = new Map((await store.list()).map(job => [job.requestId, job]))
     const pipeline = promptDirective.pipeline === true
-    const submitted = []
-    const reused = []
-    const errors = []
+    // 先解析、先登记 claim（全同步），再去连网关。结算侧此刻就能看到这条登记，
+    // 于是它会等这里的结果，而不是自己也提交一份。
+    const shots = []
     for (const raw of input.shots) {
       if (!object(raw)) continue
       const prompt = String(raw.prompt ?? '').trim()
@@ -1479,28 +1555,61 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
       // 格式和当前工作流对不上就先不发：结算时会把失败原因挂成占位，不能在这里白花积分。
       if (pipeline && !(image && video)) continue
       if (!pipeline && image && video) continue
-      const claimed = /^[0-9a-f]{16}$/.test(String(raw.fingerprint ?? ''))
+      const fingerprint = /^[0-9a-f]{16}$/.test(String(raw.fingerprint ?? ''))
         ? String(raw.fingerprint)
         : shotFingerprint({ prompt, image, video })
-      const requestId = markerRequestId({ gameId: input.gameId, turn: input.turn, fingerprint: claimed })
-      if (known.has(requestId)) { reused.push(known.get(requestId).id); continue }
+      const { claim, owner } = openShotClaim(input.gameId, fingerprint)
+      // 只有自己开的登记才由自己结算，别人的登记交给别人。
+      shots.push({ raw, prompt, image, video, fingerprint, claim: owner ? claim : null })
+    }
+    const abandon = () => { for (const shot of shots) closeShotClaim(shot.claim, null) }
+    let active
+    try { active = await connect() } catch { abandon(); return { skipped: 'gateway' } }
+    try { await ensureModel(active) } catch { abandon(); return { skipped: 'gateway' } }
+    const submitted = []
+    const reused = []
+    const errors = []
+    for (const shot of shots) {
+      let own = shot.claim
       try {
+        // 这个镜头已经有任务（另一条入口先到、浏览器重发、或结算已经提交过）：
+        // 认领它，不再扣一次费。
+        let existing = await findSubmittedShot({ gameId: input.gameId, fingerprint: shot.fingerprint, turn: null, own })
+        if (!existing && !own) {
+          // 刚才在等别人的登记，而它没成：自己补登记一次再查一遍，才轮到发请求。
+          const reopened = openShotClaim(input.gameId, shot.fingerprint)
+          if (reopened.owner) own = reopened.claim
+          existing = await findSubmittedShot({ gameId: input.gameId, fingerprint: shot.fingerprint, turn: null, own })
+        }
+        if (existing) {
+          closeShotClaim(own, existing)
+          reused.push(existing.id)
+          continue
+        }
+        const requestId = markerRequestId({ gameId: input.gameId, turn: input.turn, fingerprint: shot.fingerprint })
         const job = await submitJob({
           action: 'submit', requestId, bindToTurn: false,
-          input: image && video ? { prompt: video, image_prompt: image } : { prompt: prompt || image || video },
+          input: shot.image && shot.video
+            ? { prompt: shot.video, image_prompt: shot.image }
+            : { prompt: shot.prompt || shot.image || shot.video },
         }, undefined, {
           marker: true,
+          fingerprint: shot.fingerprint,
+          markerGameId: input.gameId,
           binding: {
-            gameId: input.gameId, pending: true, preclaim: true,
+            // 指纹也写进绑定：结算时按它认领这条预提交任务。浏览器给的 turn 来自
+            // watchReply，和宿主结算的轮次编号可能不是同一套计数，不能用来对齐。
+            gameId: input.gameId, pending: true, preclaim: true, fingerprint: shot.fingerprint,
             afterTurn: Math.max(0, input.turn - 1),
-            anchor: typeof raw.anchor === 'string' ? raw.anchor.slice(0, 500) : '',
-            caption: typeof raw.caption === 'string' ? raw.caption.slice(0, 200) : '',
+            anchor: typeof shot.raw.anchor === 'string' ? shot.raw.anchor.slice(0, 500) : '',
+            caption: typeof shot.raw.caption === 'string' ? shot.raw.caption.slice(0, 200) : '',
           },
         })
-        known.set(requestId, job)
+        closeShotClaim(own, job)
         submitted.push(job.id)
       } catch (error) {
         // 单块失败不连累其它块；结算时会再走一次正常路径，玩家不会白等。
+        closeShotClaim(own, null)
         errors.push(sanitizeMessage(error?.message || error || '预提交失败'))
       }
     }
@@ -1512,12 +1621,13 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
    * 任务已经花过积分、退不回来，但不能把镜头挂到不相干的正文上。清 binding 后它只是
    * 一条独立任务，留在历史里可播放。
    */
-  async function dropStalePreclaims({ gameId, turn, claimed }) {
+  async function dropStalePreclaims({ gameId, claimed }) {
     let dropped = 0
     for (const job of await store.list()) {
       if (job.binding?.pending !== true || job.binding?.preclaim !== true) continue
       if (job.binding.gameId !== gameId) continue
-      if (job.binding.afterTurn !== Math.max(0, turn - 1)) continue
+      // 不再拿 afterTurn 比轮次：浏览器的轮次编号和宿主不是一套计数，比了就永远对不上，
+      // 没认领的预提交会一直挂着 pending（卡片上显示「已绑定正文」却永远不落位）。
       if (claimed.has(job.requestId)) continue
       droppedPreclaims.add(job.id)
       try { await store.write({ ...job, binding: {} }) } catch { /* 内存标记已经拦住落位 */ }
@@ -1561,35 +1671,87 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
       const jobs = []
       // 本轮真正存在的镜头指纹：结算时用来认领流式预提交，也用来清掉没有对应块的任务。
       const claimed = new Set()
+      // 结算侧也先登记（同步、在 connect 之前）：预提交请求要是晚到（网络慢、请求排队），
+      // 它会等这条登记的结果，而不是自己也提交一份。
+      const ownClaims = new Map()
+      for (const shot of parsed.shots) {
+        if (shot.error || !shot.fingerprint) continue
+        const { claim, owner } = openShotClaim(value.gameId, shot.fingerprint)
+        if (owner) ownClaims.set(shot.fingerprint, claim)
+      }
+      // 等待窗口只给第一次「查不到」的那一下：预提交的请求会把整批镜头一次发过来，
+      // 它到了之后后面的镜头直接命中登记，不会一段一段地等。
       for (const shot of parsed.shots) {
         const anchor = shot.anchor || ''
+        let own = ownClaims.get(shot.fingerprint) ?? null
         if (shot.error) {
+          closeShotClaim(own, null)
           await attachMarkerFailure({ ...bindingBase, anchor, error: shot.error }).catch(() => {})
           continue
         }
+        const requestId = markerRequestId({ gameId: value.gameId, turn: value.turn, fingerprint: shot.fingerprint })
+        claimed.add(requestId)
+        // 这个镜头已经提交过（预提交先到、同一轮重结算、或上一版正文提交过同一段提示词）：
+        // 认领那条任务，把绑定升级成正式绑定（保留 pending，让 resolvePendingBindings 照常
+        // 写绑定文件），不再走 submitJob，网关不会再收一次费。认领不依赖网关，所以放在
+        // 网关可用性判断之前。
+        let reuse = await findSubmittedShot({
+          gameId: value.gameId, fingerprint: shot.fingerprint, turn: value.turn, own,
+        })
+        if (!reuse && !own) {
+          // 刚才只是在旁观别人的登记，而它没成：自己补登记一次再查一遍，才轮到发请求。
+          const reopened = openShotClaim(value.gameId, shot.fingerprint)
+          if (reopened.owner) { own = reopened.claim; ownClaims.set(shot.fingerprint, own) }
+          reuse = await findSubmittedShot({ gameId: value.gameId, fingerprint: shot.fingerprint, turn: value.turn, own })
+        }
+        if (reuse) {
+          closeShotClaim(own, reuse)
+          claimed.add(reuse.requestId)
+          // 之前因为「这一轮没有这个块」被摘掉绑定的任务又出现了：让它重新参与落位。
+          droppedPreclaims.delete(reuse.id)
+          if (active?.engine?.setBinding) {
+            try {
+              const adopted = await active.engine.setBinding(reuse.id, {
+                ...bindingBase, anchor, caption: shot.caption || '', pending: true, fingerprint: shot.fingerprint,
+              })
+              jobs.push(adopted)
+              await reconcileJob(adopted).catch(error => { insertionErrors.set(adopted.id, sanitizeMessage(error.message)) })
+            } catch (error) {
+              await attachMarkerFailure({ ...bindingBase, anchor, error }).catch(() => {})
+            }
+          } else {
+            // 网关暂时不可用也照样认领：绑定文件由 resolvePendingBindings 写，成片照常落位。
+            jobs.push(reuse)
+            await reconcileJob(reuse).catch(error => { insertionErrors.set(reuse.id, sanitizeMessage(error.message)) })
+          }
+          continue
+        }
         if (!active) {
+          closeShotClaim(own, null)
           await attachMarkerFailure({ ...bindingBase, anchor, error: prepareError || '网关不可用，未提交' }).catch(() => {})
           continue
         }
-        // 同一指纹在流式阶段已经提交过：这个 requestId 命中已有任务，不重复收费。
-        const requestId = markerRequestId({ gameId: value.gameId, turn: value.turn, fingerprint: shot.fingerprint })
-        claimed.add(requestId)
         try {
           const input = shot.image && shot.video
             ? { prompt: shot.video, image_prompt: shot.image }
             : { prompt: shot.prompt }
           const job = await submitJob({
             action: 'submit', requestId, input, bindToTurn: false,
-          }, undefined, { marker: true, binding: { ...bindingBase, anchor, caption: shot.caption || '' } })
+          }, undefined, {
+            marker: true, fingerprint: shot.fingerprint, markerGameId: value.gameId,
+            binding: { ...bindingBase, anchor, caption: shot.caption || '', fingerprint: shot.fingerprint },
+          })
+          closeShotClaim(own, job)
           jobs.push(job)
           // 立刻挂 pending 占位，不等下一次 5s 对账；视频完成后 update 同一个媒体项。
           await reconcileJob(job).catch(error => { insertionErrors.set(job.id, sanitizeMessage(error.message)) })
         } catch (error) {
+          closeShotClaim(own, null)
           await attachMarkerFailure({ ...bindingBase, anchor, error }).catch(() => {})
         }
       }
       // 预提交过、但这一轮没有这个块（模型重写/回退）：不挂到正文上，只留在历史里。
-      await dropStalePreclaims({ gameId: value.gameId, turn: value.turn, claimed }).catch(() => {})
+      await dropStalePreclaims({ gameId: value.gameId, claimed }).catch(() => {})
       lastMarkerError = ''
       lastMarkerWarning = markerRegexState.ok
         ? ''
@@ -2090,10 +2252,14 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     } else binding = await bindingOf(input)
     // 短临界区：并发提交时 describe 已经并行做完，这里只串行「再查一次重 + 建任务」，
     // 同一个 requestId 的第二次提交拿回第一条任务，不会变成第二个收费任务。
+    const shotFingerprintValue = marker && typeof internal.fingerprint === 'string' ? internal.fingerprint : undefined
+    const shotGameId = marker && typeof internal.markerGameId === 'string' ? internal.markerGameId : undefined
     const job = await serial(async () => {
       const raced = (await store.list()).find(item => item.requestId === input.requestId)
       if (raced) return { ...raced, ...(replays.has(raced.id) ? { replayable: true } : {}) }
-      return active.engine.submit(clean, { binding, requestId: input.requestId })
+      return active.engine.submit(clean, { binding, requestId: input.requestId,
+        ...(shotFingerprintValue ? { fingerprint: shotFingerprintValue } : {}),
+        ...(shotGameId ? { markerGameId: shotGameId } : {}) })
     })
     try { await replays.save(job.id, clean); job.replayable = true } catch { /* 任务已提交，快照失败只影响下次重放 */ }
     return job
@@ -2296,6 +2462,9 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     for (const handle of pregenPlanners.values()) handle.controller.abort()
     pregenPlanners.clear()
     markerRuns.clear()
+    // 还在等结果的结算路径不能一直挂着：全部按「没有任务」收尾。
+    for (const claim of shotClaims.values()) closeShotClaim(claim, null)
+    shotClaims.clear()
     engine?.dispose()
   }
   reconcileTimer = setInterval(() => { void reconcile().catch(() => {}) }, options.reconcileMs ?? 5000)

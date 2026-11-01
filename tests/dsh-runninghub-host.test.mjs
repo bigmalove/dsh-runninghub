@@ -79,6 +79,7 @@ function makeGatewayFetch({
   referenceStatus = 200,
   portDirectiveText,
   portDirectiveRejectModes,
+  nodesDelayMs = 0,
   optionGroups,
   defaultsConflict = false,
   galleryItems = [],
@@ -135,6 +136,8 @@ function makeGatewayFetch({
       return new Response(JSON.stringify({ alias: 'demo', referenceSlots: [] }), { status: 200, headers: { 'content-type': 'application/json' } })
     }
     if (/^\/api\/workflows\/[^/]+\/nodes$/.test(u.pathname)) {
+      // describe 会走这条；给并发用例一个可控窗口，模拟真实网关上 describe 的往返耗时。
+      if (nodesDelayMs > 0) await new Promise(resolve => setTimeout(resolve, nodesDelayMs))
       return new Response(JSON.stringify(nodes ?? []), { status: 200, headers: { 'content-type': 'application/json' } })
     }
     if (/^\/api\/workflows\/[^/]+\/port-directive$/.test(u.pathname) && opts.method === 'POST') {
@@ -2150,6 +2153,42 @@ describe('正文标记（非工具调用模式）', () => {
     assert.equal(submitted.prompt, '电影感写实照片，林岚站在雨夜的门口。')
   })
 
+  test('流式预提交：浏览器轮次编号和宿主结算对不上时按指纹认领，不二次收费', async () => {
+    const rawText = [
+      '林岚推开门，雨水顺着伞沿落下。',
+      '',
+      '[[RH:SHOT]]',
+      '@after',
+      '林岚推开门，雨水顺着伞沿落下。',
+      '@caption',
+      '雨夜入门',
+      '@prompt',
+      '电影感写实照片，林岚站在雨夜的门口。',
+      '[[/RH:SHOT]]',
+    ].join('\n')
+    let submits = 0
+    const gateway = makeGatewayFetch({ kind: 'video', workflows: [{ alias: 'demo', customFields: [], referenceSlots: [], capabilities: {} }],
+      settings: { defaultModel: 'demo' }, portDirectiveText: '【模板】\n写一个写实镜头。',
+      onGenerations: () => { submits += 1 } })
+    const fake = markerTavern({ rawText })
+    const { host, dataDirectory } = await makeHost({ configured: true, gateway, tavernImpl: fake.tavern })
+    await host.dispatch({ action: 'preferences', generationMode: 'marker', autoInsert: true, videosPerTurn: 1, streamPreclaim: true })
+    await host.dispatch({ action: 'select-model', model: 'demo' })
+    const fingerprint = shotFingerprint({ prompt: '电影感写实照片，林岚站在雨夜的门口。' })
+    // 实测浏览器 watchReply 给的 turn 是 138，宿主结算这一轮是 10：两套计数不一样。
+    await host.dispatch({ action: 'preclaim', gameId: 'game-marker', turn: 138,
+      shots: [{ index: 0, prompt: '电影感写实照片，林岚站在雨夜的门口。', caption: '雨夜入门',
+        anchor: '林岚推开门，雨水顺着伞沿落下。', fingerprint }] })
+    await host.handleTurn({ gameId: 'game-marker', turn: 10, textVersion: 'v1', rawText, text: rawText })
+    const jobs = await host.store.list()
+    assert.equal(jobs.length, 1, '同一条预提交被认领，不再新建第二个收费任务')
+    assert.equal(jobs[0].binding.turn, 10, '绑定升级成宿主结算的这一轮')
+    const link = JSON.parse(await readFile(join(dataDirectory, 'bindings', jobs[0].id + '.json'), 'utf8'))
+    assert.equal(link.textVersion, 'v1', '预提交的任务在这一轮结算后落位')
+    await waitForJob(host, jobs[0].id, value => Boolean(value.remoteTaskId))
+    assert.equal(submits, 1, '网关只收到一次提交')
+  })
+
   test('流式预提交：开关关掉时静默放弃，不连网关', async () => {
     const gateway = makeGatewayFetch({ workflows: [{ alias: 'demo', customFields: [], referenceSlots: [], capabilities: {} }],
       settings: { defaultModel: 'demo' }, portDirectiveText: '【模板】' })
@@ -2199,6 +2238,91 @@ describe('正文标记（非工具调用模式）', () => {
     assert.equal(link, '', '不写绑定文件，也就不往正文挂')
     const staleAttach = fake.calls.attaches.filter(item => item.item.anchor === '正文。')
     assert.equal(staleAttach.length, 0, '被重写掉的预提交镜头不挂到正文上')
+  })
+
+  test('流式预提交迟到：结算已经提交过，预提交只认领、不再二次收费', async () => {
+    const rawText = [
+      '林岚推开门，雨水顺着伞沿落下。',
+      '',
+      '[[RH:SHOT]]',
+      '@after',
+      '林岚推开门，雨水顺着伞沿落下。',
+      '@prompt',
+      '电影感写实照片，林岚站在雨夜的门口。',
+      '[[/RH:SHOT]]',
+    ].join('\n')
+    let submits = 0
+    const gateway = makeGatewayFetch({ kind: 'video', workflows: [{ alias: 'demo', customFields: [], referenceSlots: [], capabilities: {} }],
+      settings: { defaultModel: 'demo' }, portDirectiveText: '【模板】',
+      onGenerations: () => { submits += 1 } })
+    const fake = markerTavern({ rawText })
+    const { host } = await makeHost({ configured: true, gateway, tavernImpl: fake.tavern })
+    await host.dispatch({ action: 'preferences', generationMode: 'marker', autoInsert: true, videosPerTurn: 1, streamPreclaim: true })
+    await host.dispatch({ action: 'select-model', model: 'demo' })
+    await host.handleTurn({ gameId: 'game-marker', turn: 5, textVersion: 'v1', rawText, text: rawText })
+    const settled = await host.store.list()
+    assert.equal(settled.length, 1, '结算先提交了一条任务')
+    // 预提交的 POST 排队到生成结束之后才到，浏览器轮次编号还和宿主差一大截。
+    const late = await host.dispatch({ action: 'preclaim', gameId: 'game-marker', turn: 138,
+      shots: [{ prompt: '电影感写实照片，林岚站在雨夜的门口。', fingerprint: shotFingerprint({ prompt: '电影感写实照片，林岚站在雨夜的门口。' }) }] })
+    assert.equal(late.submitted, 0, '迟到的预提交不能再发一次')
+    assert.equal(late.reused, 1, '直接认领结算那条任务')
+    assert.equal((await host.store.list()).length, 1, '任务表里仍是一条')
+    await waitForJob(host, settled[0].id, job => Boolean(job.remoteTaskId))
+    assert.equal(submits, 1, '网关只收到一次提交')
+  })
+
+  test('流式预提交和结算并发到达：只提交一次（预提交 describe 还在飞）', async () => {
+    const rawText = [
+      '林岚推开门，雨水顺着伞沿落下。',
+      '',
+      '[[RH:SHOT]]',
+      '@after',
+      '林岚推开门，雨水顺着伞沿落下。',
+      '@prompt',
+      '电影感写实照片，林岚站在雨夜的门口。',
+      '[[/RH:SHOT]]',
+    ].join('\n')
+    let submits = 0
+    const gateway = makeGatewayFetch({ kind: 'video', workflows: [{ alias: 'demo', customFields: [], referenceSlots: [], capabilities: {} }],
+      settings: { defaultModel: 'demo' }, portDirectiveText: '【模板】', nodesDelayMs: 30,
+      onGenerations: () => { submits += 1 } })
+    const fake = markerTavern({ rawText })
+    const { host } = await makeHost({ configured: true, gateway, tavernImpl: fake.tavern })
+    await host.dispatch({ action: 'preferences', generationMode: 'marker', autoInsert: true, videosPerTurn: 1, streamPreclaim: true })
+    await host.dispatch({ action: 'select-model', model: 'demo' })
+    const fingerprint = shotFingerprint({ prompt: '电影感写实照片，林岚站在雨夜的门口。' })
+    const preclaim = host.dispatch({ action: 'preclaim', gameId: 'game-marker', turn: 5,
+      shots: [{ prompt: '电影感写实照片，林岚站在雨夜的门口。', caption: '雨夜入门', anchor: '林岚推开门，雨水顺着伞沿落下。', fingerprint }] })
+    const settle = host.handleTurn({ gameId: 'game-marker', turn: 5, textVersion: 'v1', rawText, text: rawText })
+    const [pre] = await Promise.all([preclaim, settle])
+    assert.equal(pre.submitted + pre.reused, 1, '预提交这一侧只认一个任务')
+    const jobs = await host.store.list()
+    assert.equal(jobs.length, 1, '并发到达也只留一条任务')
+    await waitForJob(host, jobs[0].id, job => Boolean(job.remoteTaskId))
+    assert.equal(submits, 1, '网关只收到一次提交')
+  })
+
+  test('同一段提示词在后面的轮次里再出现：重新生成，不算重复提交', async () => {
+    const rawText = [
+      '林岚推开门，雨水顺着伞沿落下。',
+      '',
+      '[[RH:SHOT]]',
+      '@prompt',
+      '电影感写实照片，林岚站在雨夜的门口。',
+      '[[/RH:SHOT]]',
+    ].join('\n')
+    const gateway = makeGatewayFetch({ kind: 'video', workflows: [{ alias: 'demo', customFields: [], referenceSlots: [], capabilities: {} }],
+      settings: { defaultModel: 'demo' }, portDirectiveText: '【模板】' })
+    const fake = markerTavern({ rawText })
+    const { host } = await makeHost({ configured: true, gateway, tavernImpl: fake.tavern })
+    await host.dispatch({ action: 'preferences', generationMode: 'marker', autoInsert: true, videosPerTurn: 1 })
+    await host.dispatch({ action: 'select-model', model: 'demo' })
+    await host.handleTurn({ gameId: 'game-marker', turn: 5, textVersion: 'v1', rawText, text: rawText })
+    await host.handleTurn({ gameId: 'game-marker', turn: 10, textVersion: 'v2', rawText, text: rawText })
+    const jobs = await host.store.list()
+    assert.equal(jobs.length, 2, '不同轮次的同一段提示词是两个镜头')
+    assert.equal(gateway.generations(), 2)
   })
 
   test('重复的结算通知只处理一次（同一个 textVersion）', async () => {
