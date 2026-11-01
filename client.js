@@ -2737,15 +2737,9 @@ window.__ModuleLoader__.load({
               h('div', { className: 'rh-rule' }),
               h('section', { className: 'rh-setting-group' },
                 h('div', { className: 'rh-setting-heading' }, icon('grid'), '工作流'),
-                // 地址连不通时先把「连的是哪个网关、报的什么错」摊开，别只留一个空下拉。
-                summary?.gatewayError
-                  ? h('div', { className: 'rh-warning' }, h('div', { style: { fontWeight: 700 } }, '网关连接失败'),
-                    note('当前地址：' + (summary.baseUrl || summary.baseURL || DEFAULT_BASE) + '　这台设备访问不到它。手机端要填局域网地址（例如 http://192.168.1.10:6888），localhost / 127.0.0.1 只会指向本机。'),
-                    note(String(summary.gatewayError)))
-                  : null,
                 field('工作流', h('select', { className: 'rh-input', 'aria-label': '设置里的工作流', value: model,
                   disabled: locked || settingsBusy || !aliases.length, onChange: event => selectModel(event.target.value) },
-                !aliases.length ? h('option', { value: '' }, summary?.configured ? '客户端没有返回工作流' : '等待客户端工作流') : null,
+                !aliases.length ? h('option', { value: '' }, '等待客户端工作流') : null,
                 aliases.map(alias => h('option', { key: alias, value: alias }, alias)))),
                 summary?.templateMode
                   ? note('提示词模板 · ' + summary.templateMode + (summary?.alwaysSendPrompt === false ? ' · 开关关闭，未发送' : ' · 每轮发送'))
