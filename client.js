@@ -1056,6 +1056,12 @@ window.__ModuleLoader__.load({
         return () => { cancelAnimationFrame(frame); document.removeEventListener('keydown', keyboard); (previous || settingsButtonRef.current)?.focus?.() }
       }, [settingsOpen])
 
+      // 打开设置抽屉时如果还没拿到宿主状态，主动补一次，别让抽屉一直停在“等待首次响应”。
+      useEffect(() => {
+        if (!settingsOpen || summary !== null) return
+        setRefreshVersion(value => value + 1)
+      }, [settingsOpen, summary])
+
       function controller() {
         const value = new AbortController()
         controllers.current.add(value)
@@ -1098,7 +1104,7 @@ window.__ModuleLoader__.load({
               videosPerTurn: Number.isInteger(data.videosPerTurn) ? data.videosPerTurn : 3,
               streamPreclaim: data.streamPreclaim === true,
               applyDefaults: data.applyDefaults !== false,
-              bindToTurn: data.bindToTurn !== false, workflowSettings: data.workflowSettings === true,
+              bindToTurn: data.bindToTurn !== false,
               adapter: data.adapter, model: data.model, defaultModel: data.defaultModel || '',
               templateMode: data.templateMode || '', templateError: data.templateError || '',
               jobs: data.jobs, workflows: data.workflows,
@@ -1106,6 +1112,8 @@ window.__ModuleLoader__.load({
               markerError: data.markerError || '', markerWarning: data.markerWarning || '',
               markerRegexError: data.markerRegexError || '',
               gatewayError: data.gatewayError || '', settingsError: data.settingsError || '' })
+            // 宿主状态刚到：之前因为拿不到状态而卡住的设置改动，现在可以落地。
+            if (settingsDirtyRef.current) scheduleAutoSave(0)
             if (!prefsLoaded.current) {
               prefsLoaded.current = true
               setBindToTurn(data.bindToTurn !== false)
@@ -1276,7 +1284,7 @@ window.__ModuleLoader__.load({
       }
 
       async function loadOptionGroups() {
-        if (!summary?.configured || summary?.workflowSettings !== true) return
+        if (!summary?.configured) return
         const current = controller()
         try {
           const data = await request({ action: 'option-groups' }, current.signal)
@@ -1501,12 +1509,6 @@ window.__ModuleLoader__.load({
           if (options.auto) scheduleAutoSave(300)
           return
         }
-        if (summary?.workflowSettings !== true) {
-          autoSavePaused.current = true
-          setSettingsStatus('error')
-          setSettingsError('宿主侧还是旧版本：请重启 DSH 后再保存设置。')
-          return
-        }
         settingsLock.current = true
         setSettingsBusy(true)
         setSettingsStatus('saving')
@@ -1653,7 +1655,6 @@ window.__ModuleLoader__.load({
 
       useEffect(() => {
         if (!settingsOpen || !workflow || !(workflow.modelFields || []).length) return
-        if (summary?.workflowSettings !== true) return
         const context = workflow.alias + ':' + (workflow.revision || '')
         if (optionGroupsContext.current === context) return
         optionGroupsContext.current = context
@@ -2162,14 +2163,14 @@ window.__ModuleLoader__.load({
         const adminURL = (() => {
           try { return new URL('/admin/', summary?.baseURL || baseURL || DEFAULT_BASE).href } catch { return '' }
         })()
-        const hostReady = summary?.workflowSettings === true
+        const loaded = summary !== null
         const failed = settingsStatus === 'error'
         return h('div', { className: 'rh-stack', style: { gap: 9 } },
           h('div', { className: 'rh-settings-status', 'data-state': settingsStatus, role: 'status' }, settingsStatusText()),
-          !hostReady ? h('div', { className: 'rh-error', role: 'alert' },
-            '宿主侧还是旧版本：请重启 DSH 后再保存设置。只刷新页面只会更新界面，保存、候选组和切换工作流仍会失败。') : null,
+          !loaded ? h('div', { className: 'rh-settings-status', 'data-state': 'dirty', role: 'status' },
+            '正在读取宿主状态…' + (refreshError ? '（' + refreshError + '）' : '')) : null,
           h('div', { className: 'rh-settings-actions' },
-            failed ? button(settingsBusy ? '同步中…' : '重试同步', retrySave, !hostReady || settingsBusy || !settingsDirty, null, 'primary') : null,
+            failed ? button(settingsBusy ? '同步中…' : '重试同步', retrySave, settingsBusy || !settingsDirty, null, 'primary') : null,
             button(settingsDirty ? '放弃并重新载入' : '重新载入', reloadSettings, settingsBusy),
             adminURL ? h('a', { className: 'rh-btn rh-btn-link', href: adminURL, target: '_blank', rel: 'noopener' }, '打开 6888 管理页') : null))
       }
