@@ -1280,4 +1280,21 @@ test('RunningHub 重设计界面：jsdom + React DOM 隔离交互', {
       state.jobs = state.jobs.filter(job => !job.id.startsWith('dock-'))
     }
   })
+
+  await t.test('画面比例有下拉列表，选值写入输入框，仍可自定义', async () => {
+    const toggle = query('.rh-combo-toggle')
+    assert.ok(toggle, '画幅字段带下拉按钮')
+    await click(toggle)
+    const menu = query('.rh-combo-menu')
+    assert.ok(menu, '点击后展开画幅列表')
+    const portrait = [...menu.querySelectorAll('.rh-combo-option')].find(node => node.textContent.includes('9:16 竖屏'))
+    assert.ok(portrait, '列出与 6888 管理页一致的 9:16 竖屏')
+    await click(portrait)
+    assert.equal(field('画面比例').value, '9:16 (Portrait Widescreen)', '选中项写入输入框')
+    assert.equal(container.querySelector('.rh-combo-menu'), null, '选完自动收起')
+    await input(field('画面比例'), '5:4')
+    assert.equal(field('画面比例').value, '5:4', '自定义画幅仍可手填')
+    // 等自动同步的防抖定时器跑完，别把请求留到卸载之后。
+    await act(async () => { await delay(650) })
+  })
 })

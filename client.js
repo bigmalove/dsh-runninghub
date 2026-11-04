@@ -283,6 +283,16 @@ window.__ModuleLoader__.load({
 @media(prefers-reduced-motion:reduce){.rh-studio *{transition:none!important;animation:none!important}}
 @container (max-width:780px){.rh-pregen-settings{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @container (max-width:480px){.rh-pregen-grid{grid-template-columns:1fr}.rh-pregen-settings{grid-template-columns:1fr}}
+/* 画幅下拉：输入框仍可自由填写自定义比例，右侧按钮展开工作流常用画幅。 */
+.rh-combo{position:relative;display:flex;align-items:center;gap:6px;min-width:0}
+.rh-combo>.rh-input{flex:1 1 auto;min-width:0}
+.rh-combo-toggle{flex:0 0 30px;height:34px;padding:0;border:1px solid var(--rh-line);border-radius:8px;background:var(--rh-surface);color:var(--rh-muted);font-size:14px;line-height:1}
+.rh-combo-toggle:hover:not(:disabled){border-color:var(--rh-brand);color:var(--rh-brand)}
+.rh-combo-toggle[aria-expanded="true"]{border-color:var(--rh-brand);color:var(--rh-brand);background:var(--rh-brand-soft)}
+.rh-combo-menu{position:absolute;top:calc(100% + 4px);left:0;right:0;z-index:20;display:flex;flex-direction:column;max-height:236px;overflow-y:auto;padding:4px;border:1px solid var(--rh-line);border-radius:9px;background:var(--rh-surface);box-shadow:var(--rh-shadow)}
+.rh-combo-option{width:100%;flex:0 0 auto;padding:7px 9px;border:0;border-radius:6px;background:transparent;color:var(--rh-ink);font-size:11px;text-align:left;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.rh-combo-option:hover{background:var(--rh-brand-soft);color:var(--rh-brand)}
+.rh-combo-option[aria-selected="true"]{background:var(--rh-brand-soft);color:var(--rh-brand);font-weight:650}
 `
     const paths = {
       settings: ['M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8', 'm19.4 15 .1.1 1.4 1.1-1.4 2.4-1.7-.7a8 8 0 0 1-2.2 1.3l-.3 1.8h-2.8l-.3-1.8a8 8 0 0 1-2.2-1.3l-1.7.7L6.9 16l1.4-1.1a8 8 0 0 1 0-2.6L6.9 11l1.4-2.4 1.7.7a8 8 0 0 1 2.2-1.3l.3-1.8h2.8l.3 1.8a8 8 0 0 1 2.2 1.3l1.7-.7 1.4 2.4-1.4 1.1a8 8 0 0 1 0 2.9'],
@@ -300,6 +310,18 @@ window.__ModuleLoader__.load({
       check: ['m5 12 4 4L19 6'],
       link: ['m9 15 6-6M8 17l-1 1a3.5 3.5 0 0 1-5-5l4-4a3.5 3.5 0 0 1 5 0M16 7l1-1a3.5 3.5 0 0 1 5 5l-4 4a3.5 3.5 0 0 1-5 0'],
     }
+    // 网关没声明 aspect_ratio 枚举时的兜底：与 6888 管理页「单镜生成」的下拉值保持一致。
+    // 工作流声明了 enum/options 就只用声明值，避免把节点不接受的字符串塞进请求。
+    const ASPECT_PRESETS = [
+      { value: '1:1 (Square)', label: '1:1 方形' },
+      { value: '3:2 (Photo)', label: '3:2 横图' },
+      { value: '2:3 (Portrait Photo)', label: '2:3 竖图' },
+      { value: '4:3 (Standard)', label: '4:3 横图' },
+      { value: '3:4 (Portrait Standard)', label: '3:4 竖图' },
+      { value: '16:9 (Widescreen)', label: '16:9 宽屏' },
+      { value: '9:16 (Portrait Widescreen)', label: '9:16 竖屏' },
+      { value: '21:9 (Ultrawide)', label: '21:9 超宽屏' },
+    ]
     function icon(name, size = 16) {
       const fill = name === 'play'
       return h('svg', { width: size, height: size, viewBox: '0 0 24 24', fill: fill ? 'currentColor' : 'none', stroke: fill ? 'none' : 'currentColor',
@@ -974,6 +996,8 @@ window.__ModuleLoader__.load({
       const [prompt, setPrompt] = useState('')
       const [duration, setDuration] = useState('')
       const [ratio, setRatio] = useState('')
+      // 'create' / 'settings'：单镜页与设置抽屉各有一处画幅下拉，同一时刻只开一个。
+      const [aspectMenu, setAspectMenu] = useState('')
       const [megapixels, setMegapixels] = useState('')
       const [width, setWidth] = useState('')
       const [height, setHeight] = useState('')
@@ -2103,7 +2127,42 @@ window.__ModuleLoader__.load({
         ...(workflow?.pipeline?.kind === 'first-frame' ? workflow.pipeline.imageResolution : workflow?.pipeline?.gridResolution),
         ...workflow?.defaults?.resolution,
       }
+      // 画幅选项优先取工作流声明的枚举；没声明才用与 6888 管理页一致的预设值。
+      const aspectSchema = workflow?.capabilities?.resolutionSchema?.properties?.aspect_ratio
+      const declaredAspects = aspectSchema?.enum ?? aspectSchema?.options
+        ?? workflow?.videoAspect?.enum ?? workflow?.videoAspect?.options
+      const aspectOptions = Array.isArray(declaredAspects) && declaredAspects.length
+        ? declaredAspects.map(item => typeof item === 'object' && item !== null
+          ? { value: String(item.value ?? ''), label: String(item.label ?? item.value ?? '') }
+          : { value: String(item), label: String(item) }).filter(item => item.value)
+        : ASPECT_PRESETS
       const referenceGroups = workflow?.pipeline ? workflow.referenceGroups || [] : []
+      function renderAspectField(label, placeholder, scope) {
+        const open = aspectMenu === scope
+        const choose = value => {
+          setRatio(value)
+          markSettings('resolution')
+          setAspectMenu('')
+        }
+        return field(label,
+          h('div', { className: 'rh-combo', onBlur: event => {
+            if (!event.currentTarget.contains(event.relatedTarget)) setAspectMenu('')
+          } },
+            h('input', { className: 'rh-input', value: ratio, placeholder, disabled: formDisabled,
+              'aria-expanded': open, 'aria-controls': 'rh-aspect-menu-' + scope,
+              onChange: event => { setRatio(event.target.value); markSettings('resolution') } }),
+            h('button', { type: 'button', className: 'rh-combo-toggle', 'aria-label': '选择画面比例',
+              'aria-expanded': open, disabled: formDisabled,
+              onClick: event => { event.preventDefault(); setAspectMenu(open ? '' : scope) } }, '▾'),
+            open ? h('div', { id: 'rh-aspect-menu-' + scope, className: 'rh-combo-menu', role: 'listbox' },
+              h('button', { key: 'default', type: 'button', role: 'option', className: 'rh-combo-option',
+                'aria-selected': ratio === '', onClick: event => { event.preventDefault(); choose('') } },
+                '使用工作流默认' + (placeholder && placeholder !== '客户端默认' && placeholder !== '工作流默认' ? '（' + placeholder + '）' : '')),
+              aspectOptions.map(option => h('button', { key: option.value, type: 'button', role: 'option',
+                className: 'rh-combo-option', 'aria-selected': ratio === option.value,
+                onClick: event => { event.preventDefault(); choose(option.value) } },
+                option.label === option.value ? option.value : option.label + ' · ' + option.value))) : null))
+      }
       function renderCustom(definition, options = {}) {
         const inSettings = options.settings === true
         const changed = own(custom, definition.key)
@@ -2328,9 +2387,8 @@ window.__ModuleLoader__.load({
           h('details', { className: 'rh-fold', open: true },
             h('summary', null, '分辨率与片长'),
             h('div', { className: 'rh-fold-content' },
-              resolutionFields.has('aspect_ratio') ? field('默认画面比例', h('input', { className: 'rh-input', value: ratio,
-                placeholder: String(effectiveResolution.aspect_ratio || workflow?.videoAspect?.ratio || '工作流默认'), disabled: formDisabled,
-                onChange: event => { setRatio(event.target.value); markSettings('resolution') } })) : null,
+              resolutionFields.has('aspect_ratio') ? renderAspectField('默认画面比例',
+                String(effectiveResolution.aspect_ratio || workflow?.videoAspect?.ratio || '工作流默认'), 'settings') : null,
               resolutionFields.has('megapixels') ? field('默认像素量 / MP', h('input', { className: 'rh-input', type: 'number', min: 0.1, max: 16, step: 'any', value: megapixels,
                 placeholder: String(effectiveResolution.megapixels ?? '工作流默认'), disabled: formDisabled,
                 onChange: event => { setMegapixels(event.target.value); markSettings('resolution') } })) : null,
@@ -2739,8 +2797,9 @@ window.__ModuleLoader__.load({
                     h('div', { className: 'rh-section-label', style: { marginBottom: 0 } }, '生成参数',
                       settingsBusy ? h('span', { className: 'rh-note' }, '正在同步…') :
                         settingsDirty ? h('span', { className: 'rh-note' }, '改动待同步…') : null),
-                    resolutionFields.has('aspect_ratio') ? field('画面比例', h('input', { className: 'rh-input', value: ratio,
-                      placeholder: String(effectiveResolution.aspect_ratio || workflow?.videoAspect?.ratio || '客户端默认'), disabled: formDisabled, onChange: event => { setRatio(event.target.value); markSettings('resolution') } })) : null,
+                    resolutionFields.has('aspect_ratio') ? renderAspectField('画面比例',
+                      String(effectiveResolution.aspect_ratio || workflow?.videoAspect?.ratio || '客户端默认'), 'create') : null,
+                    resolutionFields.has('aspect_ratio') ? note('留空＝沿用工作流默认；点 ▾ 选画幅，也可直接填自定义比例。') : null,
                     durationSupported ? field('片长 / 秒', h('input', { className: 'rh-input', type: 'number', min: 0.5, max: 120, step: 'any', value: duration,
                       placeholder: durationDefault != null ? String(durationDefault) : '默认', disabled: formDisabled, onChange: event => { setDuration(event.target.value); markSettings('duration') } })) : null,
                     resolutionFields.has('megapixels') ? field('像素量 / MP', h('input', { className: 'rh-input', type: 'number', min: 0.1, max: 16, step: 'any', value: megapixels,
