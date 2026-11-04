@@ -154,6 +154,8 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
   try { selection = JSON.parse(await readFile(selectionFile, 'utf8')) }
   catch (error) { if (error.code !== 'ENOENT') selection = undefined }
   let baseURL = validateBaseURL(settings?.baseURL ?? config.baseURL ?? DEFAULT_BASE).href.replace(/\/$/, '')
+  // 手机 / termux 上网关可能只绑在局域网地址（回环反而拒绝）；勾选后允许明文局域网地址并带上 Key。
+  let allowPrivateLan = settings?.allowPrivateLan === true
   let autoInsert = settings?.autoInsert === true
   // 生成方式：tool = 模型调用 runninghub_generate；marker = 正文标记，宿主解析后提交。
   // 非工具调用模式不向模型开放生成工具，提示词从正文标记块里取。
@@ -213,7 +215,52 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
   let lastMarkerError = ''
   let lastMarkerWarning = ''
   let queue = Promise.resolve()
-  const serial = operation => { const result = queue.then(operation); queue = result.catch(() => {}); return result }
+  const serial = operation => {
+    serialPending += 1
+    const result = queue.then(operation)
+    queue = result.catch(() => {})
+    return result.finally(() => { serialPending -= 1 })
+  }
+  // 「点保存一直转圈」要看得出卡在哪一段：记录正在跑的调用和刚跑完的耗时。
+  const inflight = new Map()
+  const finished = []
+  let traceSeq = 0
+  let serialPending = 0
+  let configPending = 0
+  function trackStart(label) {
+    const id = ++traceSeq
+    inflight.set(id, { label, startedAt: Date.now() })
+    return id
+  }
+  function trackEnd(id) {
+    const entry = inflight.get(id)
+    if (!entry) return
+    inflight.delete(id)
+    finished.push({ label: entry.label, ms: Date.now() - entry.startedAt })
+    if (finished.length > 20) finished.shift()
+  }
+  // 保存连接设置单独排队：面板每 5 秒的轮询、网关往返、引擎初始化再慢也拖不住它。
+  let configQueue = Promise.resolve()
+  const configureSerial = operation => {
+    configPending += 1
+    const result = configQueue.then(operation)
+    configQueue = result.catch(() => {})
+    return result.finally(() => { configPending -= 1 })
+  }
+  // 宿主凭据服务是本地文件实现；万一在手机上卡住（或该版本没有实现），
+  // 也不能让面板永远停在「保存中…」：到点就给一句明确的话。
+  const credentialTimeoutMs = Number.isSafeInteger(options.credentialTimeoutMs) && options.credentialTimeoutMs > 0 ? options.credentialTimeoutMs : 8000
+  async function withDeadline(task, ms, message) {
+    let timer
+    try {
+      return await Promise.race([
+        Promise.resolve().then(task),
+        new Promise((resolve, reject) => { timer = setTimeout(() => reject(fail(message, 'TIMEOUT')), ms) }),
+      ])
+    } finally { clearTimeout(timer) }
+  }
+  const credentialDeadline = (action) => withDeadline(action, credentialTimeoutMs,
+    `宿主凭据服务 ${credentialTimeoutMs} 毫秒没有响应，Key 没有写入；请重启 DSH 后重试`)
   const clientFactory = options.clientFactory ?? (value => new GatewayClient(value))
   const fetchImpl = options.fetchImpl ?? fetch
   const bindingQueues = new Map()
@@ -385,10 +432,10 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     const credential = await ctx.credentials.resolve(credentialName(baseURL))
     const apiKey = credential?.value || ''
     if (!apiKey) throw fail('请先在 RunningHub 面板保存网关 Key', 'NOT_CONFIGURED')
-    const identity = createHash('sha256').update(baseURL + '\n' + apiKey).digest('hex')
+    const identity = createHash('sha256').update(baseURL + '\n' + apiKey + '\n' + (allowPrivateLan ? 'lan' : 'loopback')).digest('hex')
     if (!engine || identity !== clientIdentity) {
       engine?.dispose()
-      client = clientFactory({ baseURL, apiKey, fetchImpl })
+      client = clientFactory({ baseURL, apiKey, fetchImpl, allowPrivateLan })
       engine = new TaskEngine({ client, store, onMedia, onChange, pollMs: options.pollMs ?? 5000 })
       clientIdentity = identity
       await engine.init()
@@ -1865,7 +1912,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
         pregen = { ...publicPregenState(normalizePregenState(undefined, gameId)), lastError: sanitizeMessage(error.message) }
       }
     }
-    return { configured, baseURL, generationMode, autoInsert, alwaysSendPrompt, videosPerTurn, streamPreclaim,
+    return { configured, baseURL, allowPrivateLan, generationMode, autoInsert, alwaysSendPrompt, videosPerTurn, streamPreclaim,
       markerPipeline: promptDirective.pipeline === true,
       applyDefaults: applyDefaultsPref, bindToTurn: bindToTurnPref,
       workflowSettings: true,
@@ -1878,25 +1925,43 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
       ...(workflowError ? { gatewayError: workflowError } : {}), ...(settingsError ? { settingsError } : {}) }
   }
   async function configure(input) {
-    keys(input, ['action', 'baseURL', 'apiKey'])
-    const nextBase = validateBaseURL(input.baseURL).href.replace(/\/$/, '')
+    keys(input, ['action', 'baseURL', 'apiKey', 'allowPrivateLan'])
+    const nextAllowPrivateLan = input.allowPrivateLan === undefined ? allowPrivateLan : input.allowPrivateLan === true
+    if (input.allowPrivateLan !== undefined && typeof input.allowPrivateLan !== 'boolean') throw fail('allowPrivateLan 必须是布尔值')
+    const nextBase = validateBaseURL(input.baseURL, '', { allowPrivateLan: nextAllowPrivateLan }).href.replace(/\/$/, '')
     if (input.apiKey !== undefined && (typeof input.apiKey !== 'string' || /[\r\n]/.test(input.apiKey) || input.apiKey.length > 4096)) throw fail('网关 Key 格式无效')
     if ((await store.list()).some(job => ACTIVE.has(job.status))) throw fail('仍有运行中或待对账任务，连接设置暂时锁定')
     const supplied = input.apiKey?.trim()
-    const ref = credentialName(nextBase), previous = await ctx.credentials.resolve(ref)
+    const ref = credentialName(nextBase), previous = await credentialDeadline(() => ctx.credentials.resolve(ref))
     if (!supplied && !previous?.value) throw fail('新网关地址需要填写 Key；旧地址的 Key 不会发送到新地址')
     if (supplied && supplied !== previous?.value) {
-      const info = await ctx.credentials.describe?.(ref)
+      const info = await credentialDeadline(() => ctx.credentials.describe?.(ref))
       if (previous?.source === 'env' || info?.source === 'env' || info?.writable === false) throw fail('网关 Key 来自只读凭据，请修改凭据来源')
-      await ctx.credentials.set(ref, supplied)
+      await credentialDeadline(() => ctx.credentials.set(ref, supplied))
     }
-    await atomicJSON(settingsFile, { baseURL: nextBase, autoInsert, alwaysSendPrompt, videosPerTurn, streamPreclaim, applyDefaults: applyDefaultsPref, bindToTurn: bindToTurnPref, generationMode })
+    await atomicJSON(settingsFile, { baseURL: nextBase, allowPrivateLan: nextAllowPrivateLan, autoInsert, alwaysSendPrompt, videosPerTurn, streamPreclaim, applyDefaults: applyDefaultsPref, bindToTurn: bindToTurnPref, generationMode })
     engine?.dispose(); engine = undefined; client = undefined; clientIdentity = undefined
-    baseURL = nextBase; workflows = []; workflowError = ''
+    baseURL = nextBase; allowPrivateLan = nextAllowPrivateLan; workflows = []; workflowError = ''
     selectedModel = ''; model = ''; defaultModel = ''
     resetDirective()
     await saveSelection('')
-    return { configured: true, baseURL, adapter: 'gateway' }
+    return { configured: true, baseURL, allowPrivateLan, adapter: 'gateway' }
+  }
+  // 只做一次带 Key 的工作流列表请求，4 秒上限；不建引擎、不改状态、不进串行锁。
+  async function probeGateway() {
+    const started = Date.now()
+    let apiKey
+    try { apiKey = (await credentialDeadline(() => ctx.credentials.resolve(credentialName(baseURL))))?.value || '' }
+    catch (error) { return { ok: false, error: sanitizeMessage(error?.message || '凭据读取失败'), ms: Date.now() - started, baseURL } }
+    if (!apiKey) return { ok: false, error: '还没有保存网关 Key', ms: Date.now() - started, baseURL }
+    try {
+      const probe = clientFactory({ baseURL, apiKey, fetchImpl, allowPrivateLan, timeoutMs: 4000 })
+      // 探测自己也要有上限：注入的假客户端或挂住的网关不能让这次请求变成无限等待。
+      const list = await withDeadline(() => probe.listWorkflows(), 6000, '网关探测 6 秒没有回应')
+      return { ok: true, workflows: list.length, ms: Date.now() - started, baseURL }
+    } catch (error) {
+      return { ok: false, error: sanitizeMessage(error?.message || '探测失败'), code: error?.code || '', ms: Date.now() - started, baseURL }
+    }
   }
   async function bindingOf(input) {
     if (input.bindToTurn !== undefined && typeof input.bindToTurn !== 'boolean') throw fail('bindToTurn 必须是布尔值')
@@ -1944,7 +2009,30 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     }
     return { gameId, pending: true, afterTurn, anchor }
   }
+  // 手机上没有终端日志：面板卡住时要能直接问出「卡在哪一段」。
+  // diag 不进任何队列、不连网关，所以串行队列被拖住时它照样立刻回答。
+  async function diagnostics() {
+    let configuredKey = 'unknown'
+    try { configuredKey = (await credentialDeadline(() => ctx.credentials.resolve(credentialName(baseURL))))?.value ? 'yes' : 'no' }
+    catch { configuredKey = 'unknown' }
+    return {
+      baseURL, allowPrivateLan, configuredKey, generationMode,
+      node: process.version, platform: process.platform, arch: process.arch,
+      dataDirectory: directory, markerRegex: markerRegexState.ok ? 'ok' : (markerRegexState.reason || 'pending'),
+      engine: engine ? 'ready' : 'idle', workflows: workflows.length, workflowError,
+      serialPending, configPending,
+      inflight: [...inflight.values()].map(entry => ({ label: entry.label, ms: Date.now() - entry.startedAt })),
+      finished: finished.slice(-10),
+    }
+  }
   async function dispatch(input = { action: 'list' }, exec) {
+    if (!object(input)) throw fail('请求格式无效')
+    if (disposed) throw fail('插件已停止', 'DISPOSED')
+    if (input.action === 'diag') { keys(input, ['action']); return diagnostics() }
+    const traceId = trackStart(String(input.action || 'list'))
+    try { return await dispatchInner(input, exec) } finally { trackEnd(traceId) }
+  }
+  async function dispatchInner(input = { action: 'list' }, exec) {
     if (!object(input)) throw fail('请求格式无效')
     if (disposed) throw fail('插件已停止', 'DISPOSED')
     // 提交不进全局串行锁：校验、describe 往返和绑定都要等网关或宿主，
@@ -1952,6 +2040,11 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     if (input.action === 'submit') return submitJob(input, exec)
     // 流式预提交要尽量早发，也不能和面板轮询挤在同一个串行锁里。
     if (input.action === 'preclaim') return preclaimStreamShots(input)
+    // 保存连接设置自走一条队列：网关/引擎再慢也不能把「保存 Key」拖住，
+    // 手机上原先就是这样一直停在「保存中…」。
+    if (input.action === 'configure') return configureSerial(() => configure(input))
+    // 点一下就能知道网关通不通，不列工作流、不建引擎、不进串行锁。
+    if (input.action === 'probe') { keys(input, ['action']); return probeGateway() }
     return serial(async () => {
       if (input.action === 'preferences') {
         keys(input, ['action', 'autoInsert', 'alwaysSendPrompt', 'videosPerTurn', 'streamPreclaim', 'applyDefaults', 'bindToTurn', 'generationMode'])
@@ -1987,7 +2080,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
           applyDefaults: input.applyDefaults === undefined ? applyDefaultsPref : input.applyDefaults,
           bindToTurn: input.bindToTurn === undefined ? bindToTurnPref : input.bindToTurn,
         }
-        await atomicJSON(settingsFile, { baseURL, ...next })
+        await atomicJSON(settingsFile, { baseURL, allowPrivateLan, ...next })
         generationMode = next.generationMode
         autoInsert = next.autoInsert
         alwaysSendPrompt = next.alwaysSendPrompt
@@ -2001,7 +2094,6 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
         try { toolSync() } catch { /* 工具注册失败不阻断设置保存 */ }
         return next
       }
-      if (input.action === 'configure') return configure(input)
       if (input.action === 'list') { keys(input, ['action', 'gameId']); return summary(input.gameId) }
       // 输入框停靠区的轻量轮询：只读本地任务记录，不连网关、不列工作流。
       // 工具提交后几秒内就能显示「生成中」，不用等正文这一轮结算。
@@ -2377,7 +2469,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
       if (req.method !== 'POST') return json(res, 405, { error: '请求方法不支持' })
       json(res, 200, await dispatch(await bodyJSON(req)))
     } catch (error) {
-      const status = { VALIDATION_ERROR: 400, UNSUPPORTED_TYPE: 415, TOO_LARGE: 413, NOT_CONFIGURED: 409, NOT_FOUND: 404, METHOD_NOT_ALLOWED: 405, CONFLICT: 409 }[error.code] ?? 502
+      const status = { VALIDATION_ERROR: 400, UNSUPPORTED_TYPE: 415, TOO_LARGE: 413, NOT_CONFIGURED: 409, NOT_FOUND: 404, METHOD_NOT_ALLOWED: 405, CONFLICT: 409, TIMEOUT: 504 }[error.code] ?? 502
       json(res, status, { error: error instanceof GatewayError ? sanitizeMessage(error.message) : 'RunningHub 宿主操作失败' })
       if (res.headersSent && !res.writableEnded) res.destroy()
     }

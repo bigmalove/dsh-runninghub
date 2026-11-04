@@ -16,6 +16,12 @@ window.__ModuleLoader__.load({
     let tavernUiApi = null
     const own = (object, key) => Object.prototype.hasOwnProperty.call(object || {}, key)
     const message = error => typeof error === 'string' ? error : error?.message || '未知错误'
+    // 探测结果的统一说法：保存和「检查连接」共用，不把原始错误当成成功。
+    const probeNotice = probe => {
+      if (!probe || typeof probe !== 'object') return ''
+      if (probe.ok) return `网关可达：已读到 ${probe.workflows ?? 0} 个工作流（${probe.ms ?? 0}ms）。`
+      return `但网关没连上：${probe.error || '未知原因'}（${probe.ms ?? 0}ms）。地址 ${probe.baseURL || ''}`
+    }
     const statuses = {
       preparing: '准备中', submitting: '提交中', submit_unknown: '提交结果未知',
       queued: '排队中', running: '生成中', downloading: '下载中', ready: '已就绪',
@@ -444,35 +450,56 @@ window.__ModuleLoader__.load({
       return shots
     }
 
+    // 宿主没有响应时界面不能一直停在「保存中…」：25 秒到点就报出来。
+    const REQUEST_TIMEOUT_MS = 25000
     async function request(body, signal, gameId) {
       let response
+      const local = new AbortController()
+      let timedOut = false
+      const timer = setTimeout(() => { timedOut = true; local.abort() }, REQUEST_TIMEOUT_MS)
+      const relay = () => local.abort()
+      if (signal) {
+        if (signal.aborted) local.abort()
+        else signal.addEventListener('abort', relay, { once: true })
+      }
       try {
-        const url = body ? API : API + (gameId ? '?gameId=' + encodeURIComponent(String(gameId)) : '')
-        response = await fetch(url, {
-          method: body ? 'POST' : 'GET', credentials: 'same-origin', cache: 'no-store', signal,
-          ...(body ? { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : {}),
-        })
-      } catch (error) {
-        if (error.name === 'AbortError') throw error
-        const failure = new Error('网络请求失败：' + message(error))
-        failure.uncertain = true
-        throw failure
+        try {
+          const url = body ? API : API + (gameId ? '?gameId=' + encodeURIComponent(String(gameId)) : '')
+          response = await fetch(url, {
+            method: body ? 'POST' : 'GET', credentials: 'same-origin', cache: 'no-store', signal: local.signal,
+            ...(body ? { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : {}),
+          })
+        } catch (error) {
+          if (error.name === 'AbortError' && !timedOut) throw error
+          if (timedOut) {
+            const stalled = new Error(`插件宿主 ${Math.round(REQUEST_TIMEOUT_MS / 1000)} 秒没有响应，请求已放弃（可点“检查连接”看是卡在哪一步）`)
+            stalled.timeout = true
+            throw stalled
+          }
+          const failure = new Error('无法访问插件宿主：' + error.message +
+            '（这说明请求没到 Tavern 的插件路由：先刷新页面，再确认插件已加载）')
+          failure.uncertain = true
+          throw failure
+        }
+        let data
+        try {
+          data = await response.json()
+        } catch (error) {
+          if (error.name === 'AbortError') throw error
+          const failure = new Error(`HTTP ${response.status}：宿主返回的不是 JSON（插件宿主可能没加载成功：${error.message}）`)
+          failure.uncertain = response.ok || response.status >= 500 || response.status === 408
+          throw failure
+        }
+        if (!response.ok) {
+          const failure = new Error(data?.error ? message(data.error) : `HTTP ${response.status}：请求失败`)
+          failure.uncertain = response.status >= 500 || response.status === 408
+          throw failure
+        }
+        return data
+      } finally {
+        clearTimeout(timer)
+        signal?.removeEventListener?.('abort', relay)
       }
-      let data
-      try {
-        data = await response.json()
-      } catch (error) {
-        if (error.name === 'AbortError') throw error
-        const failure = new Error(`HTTP ${response.status}：无法读取 JSON 响应（${message(error)}）`)
-        failure.uncertain = response.ok || response.status >= 500 || response.status === 408
-        throw failure
-      }
-      if (!response.ok) {
-        const failure = new Error(data?.error ? message(data.error) : `HTTP ${response.status}：请求失败`)
-        failure.uncertain = response.status >= 500 || response.status === 408
-        throw failure
-      }
-      return data
     }
 
     // 输入框上方的生成状态：任务一提交就显示「生成中」，不等正文结算。
@@ -916,8 +943,15 @@ window.__ModuleLoader__.load({
       const libraryPickerRef = useRef(null)
       const [summary, setSummary] = useState(null)
       const [baseURL, setBaseURL] = useState(DEFAULT_BASE)
+      const [allowPrivateLan, setAllowPrivateLan] = useState(false)
       const [apiKey, setApiKey] = useState('')
       const [configBusy, setConfigBusy] = useState(false)
+      const [probeBusy, setProbeBusy] = useState(false)
+      const [probeResult, setProbeResult] = useState('')
+      const [diagBusy, setDiagBusy] = useState(false)
+      const [diagText, setDiagText] = useState('')
+      const probeLock = useRef(false)
+      const diagLock = useRef(false)
       const [autoInsertBusy, setAutoInsertBusy] = useState(false)
       const [autoInsertError, setAutoInsertError] = useState('')
       const autoInsertLock = useRef(false)
@@ -1099,6 +1133,7 @@ window.__ModuleLoader__.load({
               throw new Error('宿主状态格式无效：缺少 jobs 或 workflows')
             }
             setSummary({ configured: data.configured, baseURL: data.baseURL,
+              allowPrivateLan: data.allowPrivateLan === true,
               generationMode: data.generationMode === 'marker' ? 'marker' : 'tool',
               autoInsert: data.autoInsert === true, alwaysSendPrompt: data.alwaysSendPrompt !== false,
               videosPerTurn: Number.isInteger(data.videosPerTurn) ? data.videosPerTurn : 3,
@@ -1126,6 +1161,7 @@ window.__ModuleLoader__.load({
             }
             if (!baseInitialized.current) {
               if (!baseDirty.current) setBaseURL(data.baseURL || DEFAULT_BASE)
+              setAllowPrivateLan(data.allowPrivateLan === true)
               baseInitialized.current = true
             }
             setRefreshError('')
@@ -1669,15 +1705,15 @@ window.__ModuleLoader__.load({
         setConfigNotice('')
         const current = controller()
         try {
-          const body = { action: 'configure', baseURL: baseURL.trim() || DEFAULT_BASE }
+          const body = { action: 'configure', baseURL: baseURL.trim() || DEFAULT_BASE, allowPrivateLan }
           if (apiKey.trim()) body.apiKey = apiKey.trim()
           const data = await request(body, current.signal)
           if (!alive.current) return
           setApiKey('')
           if (data?.baseURL) setBaseURL(data.baseURL)
           setSummary(previous => ({ ...(previous || {}), configured: data.configured,
-            baseURL: data.baseURL, adapter: data.adapter }))
-          setConfigNotice('连接设置已保存，Key 输入已清空。')
+            baseURL: data.baseURL, allowPrivateLan: data.allowPrivateLan === true, adapter: data.adapter }))
+          setConfigNotice('连接设置已保存，Key 输入已清空。' + await probeAfterSave(current.signal))
           setConfigVersion(value => value + 1)
           setRefreshVersion(value => value + 1)
         } catch (error) {
@@ -1686,6 +1722,49 @@ window.__ModuleLoader__.load({
           controllers.current.delete(current)
           configLock.current = false
           if (alive.current) setConfigBusy(false)
+        }
+      }
+
+      // 保存成功后补一次探测：把「保存成功」和「网关通不通」分成两句话说。
+      async function probeAfterSave(signal) {
+        try { return probeNotice(await request({ action: 'probe' }, signal)) }
+        catch (error) { return '连通性检查没做完：' + message(error) }
+      }
+
+      // 探测走宿主的 probe：不建引擎、不列工作流，卡住时也能单独确认网关通不通。
+      async function testConnection() {
+        if (probeLock.current) return
+        probeLock.current = true
+        setProbeBusy(true)
+        setProbeResult('')
+        const current = controller()
+        try {
+          const data = await request({ action: 'probe' }, current.signal)
+          if (alive.current) setProbeResult(probeNotice(data))
+        } catch (error) {
+          if (alive.current && error.name !== 'AbortError') setProbeResult('检查失败：' + message(error))
+        } finally {
+          controllers.current.delete(current)
+          probeLock.current = false
+          if (alive.current) setProbeBusy(false)
+        }
+      }
+
+      // 宿主卡在哪一段：把正在跑的调用、队列深度和耗时拉出来给人看。
+      async function loadDiagnostics() {
+        if (diagLock.current) return
+        diagLock.current = true
+        setDiagBusy(true)
+        const current = controller()
+        try {
+          const data = await request({ action: 'diag' }, current.signal)
+          if (alive.current) setDiagText(JSON.stringify(data, null, 2))
+        } catch (error) {
+          if (alive.current) setDiagText(`诊断请求失败：${error.message}`)
+        } finally {
+          diagLock.current = false
+          controllers.current.delete(current)
+          if (alive.current) setDiagBusy(false)
         }
       }
 
@@ -2814,8 +2893,20 @@ window.__ModuleLoader__.load({
                 field('网关 Key', h('input', { type: 'password', className: 'rh-input', autoComplete: 'new-password', value: apiKey,
                   placeholder: summary?.configured ? '已配置，留空保留原 Key' : '输入网关 Key', disabled: locked, onChange: event => setApiKey(event.target.value) })),
                 note('经 Tavern 同源接口访问本地网关。Key 存入宿主凭据服务，不显示已保存的值。'),
-                button(configBusy ? '保存中…' : '保存连接设置', saveConfig, locked), alert(configError),
-                configNotice ? h('div', { className: 'rh-notice', role: 'status' }, configNotice) : null),
+                checkbox('允许局域网明文地址（手机 / termux 排障用）', allowPrivateLan,
+                  value => setAllowPrivateLan(value), locked, 'allow-private-lan'),
+                note('默认只允许 http://127.0.0.1 这类回环地址。手机 termux 上网关若只监听局域网地址（127.0.0.1 反而被拒），勾选后再把 192.168.x.x 填进网关地址：明文 + Key 都发往同一个局域网，不上公网。'),
+                note('同一个地址在手机上连不上、电脑上却通，多半是回环协议族或监听地址不同：先在 termux 里跑 `node bin/doctor.mjs` 看哪个地址应答。'),
+                button(configBusy ? '保存中…' : '保存连接设置', saveConfig, locked),
+                button(probeBusy ? '检测中…' : '测试连接', testConnection, probeBusy, 'probe'),
+                alert(configError),
+                configNotice ? h('div', { className: 'rh-notice', role: 'status' }, configNotice) : null,
+                probeResult ? h('div', { className: 'rh-notice', role: 'status' }, probeResult) : null,
+                h('details', { className: 'rh-fold' }, h('summary', null, '连不上？看宿主诊断'),
+                  h('div', { className: 'rh-fold-content' },
+                    note('诊断不进队列、不连网关：卡住时也能回答「宿主正在等哪一段」。'),
+                    button(diagBusy ? '读取中…' : '读取宿主诊断', loadDiagnostics, diagBusy, 'diag'),
+                    diagText ? h('pre', { className: 'rh-note', style: { whiteSpace: 'pre-wrap', fontSize: '11px', maxHeight: '220px', overflow: 'auto' } }, diagText) : null))),
               note('写在客户端里的设置（分辨率、片长、自定义参数、模型字段、种子、参考素材）与 6888 管理页「单镜生成」是同一份；这里的改动会立即同步，生成也永远以这份为准。')))) : null,
         videoNotices.length ? h('div', { className: 'rh-video-toasts' + (view === 'create' ? ' rh-video-toasts-raised' : ''), 'aria-live': 'polite', 'aria-label': '视频生成完成' }, videoNotices.map(renderVideoNotice)) : null,
         libraryPicker ? h(LibraryPicker, {

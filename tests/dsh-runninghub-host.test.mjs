@@ -223,7 +223,7 @@ function makeAttachments(calls) {
 let tmpRoot = tmpdir()
 const liveHosts = []
 
-async function makeHost({ baseURL = BASE, configured = true, gateway = null, tavernImpl = null, clientFactory = null, pollMs = 5 } = {}) {
+async function makeHost({ baseURL = BASE, configured = true, gateway = null, tavernImpl = null, clientFactory = null, pollMs = 5, credentialsImpl = null, extraOptions = {} } = {}) {
   const dataDirectory = await mkdtemp(join(tmpRoot, 'rh-test-'))
   const calls = { saveImage: [], saveFile: [], getTurnState: [], getTurn: [], credentialsSet: [], effects: [] }
   const credentialStore = new Map()
@@ -240,14 +240,14 @@ async function makeHost({ baseURL = BASE, configured = true, gateway = null, tav
     attach: async () => {},
     remove: async () => false,
   }
-  const credentials = {
+  const credentials = credentialsImpl ?? {
     resolve: async (name) => (credentialStore.has(name) ? { value: credentialStore.get(name), source: 'runtime', writable: true } : undefined),
     set: async (name, value) => { credentialStore.set(name, value); calls.credentialsSet.push([name, value]) },
     describe: async (name) => (credentialStore.has(name) ? { source: 'runtime', writable: true } : undefined),
   }
   const ctx = { attachments, credentials, tavern }
   // 后台配置同步会定时拉工作流列表，测试里关掉，否则会打乱按次断言的 portDirectiveCalls。
-  const options = { pollMs, workflowSyncMs: 0 }
+  const options = { pollMs, workflowSyncMs: 0, ...extraOptions }
   if (gateway) options.fetchImpl = gateway.fetchImpl
   if (clientFactory) options.clientFactory = clientFactory
   const regexLibraryFile = join(dataDirectory, 'tavern-extension-settings.json')
@@ -2338,5 +2338,77 @@ describe('正文标记（非工具调用模式）', () => {
       host.handleTurn({ gameId: 'game-marker', turn: 5, textVersion: 'v1', rawText, text: rawText }),
     ])
     assert.equal((await host.store.list()).length, 1, '同一个 textVersion 只收一个任务')
+  })
+})
+
+// =====================================================================
+// 手机排障：保存设置不能被卡住的网关/串行队列拖住（原先面板一直停在「保存中…」）
+// =====================================================================
+describe('手机排障：保存连接设置不被网关阻塞', () => {
+  const never = () => new Promise(() => {})
+
+  test('轮次请求卡住时 configure 仍然立刻返回', async () => {
+    const { host } = await makeHost({ clientFactory: () => ({ listWorkflows: never }) })
+    // 这条 list 会永远挂住，占住全局串行队列。
+    const stuck = host.dispatch({ action: 'list' })
+    stuck.catch(() => {})
+    await new Promise(resolve => setTimeout(resolve, 20))
+    const result = await Promise.race([
+      host.dispatch({ action: 'configure', baseURL: BASE, apiKey: DEFAULT_API_KEY }),
+      new Promise((resolve) => setTimeout(() => resolve('timeout'), 1500)),
+    ])
+    assert.notEqual(result, 'timeout', 'configure 不能排在卡死的轮询后面')
+    assert.equal(result.baseURL, BASE)
+  })
+
+  test('diag 不进队列：卡住时仍能回答，并指出正在等哪一段', async () => {
+    const { host } = await makeHost({ clientFactory: () => ({ listWorkflows: never }) })
+    host.dispatch({ action: 'list' }).catch(() => {})
+    await new Promise(resolve => setTimeout(resolve, 20))
+    const diag = await Promise.race([
+      host.dispatch({ action: 'diag' }),
+      new Promise((resolve) => setTimeout(() => resolve('timeout'), 1500)),
+    ])
+    assert.notEqual(diag, 'timeout', 'diag 必须绕开串行队列')
+    assert.equal(diag.baseURL, BASE)
+    assert.ok(diag.inflight.some(entry => entry.label === 'list'), '应能看到卡住的 list')
+    assert.ok(diag.serialPending >= 1, '串行队列深度应大于 0')
+  })
+
+  test('probe：网关报网络错误时返回不可达而不是抛异常', async () => {
+    const failing = () => {
+      const error = new Error('网关连接中断（ECONNREFUSED 127.0.0.1:6888）：端口没有进程在监听')
+      error.code = 'NETWORK_ERROR'
+      throw error
+    }
+    const { host } = await makeHost({ clientFactory: () => ({ listWorkflows: async () => failing() }) })
+    const probe = await host.dispatch({ action: 'probe' })
+    assert.equal(probe.ok, false)
+    assert.match(probe.error, /ECONNREFUSED/)
+    assert.equal(probe.baseURL, BASE)
+  })
+
+  test('probe：网关正常时返回工作流数量', async () => {
+    const { host } = await makeHost({ clientFactory: () => ({ listWorkflows: async () => [{ alias: 'a' }, { alias: 'b' }] }) })
+    const probe = await host.dispatch({ action: 'probe' })
+    assert.equal(probe.ok, true)
+    assert.equal(probe.workflows, 2)
+  })
+
+  test('凭据服务卡住时 configure 会在上限内报错，不会永远保存中', async () => {
+    const { host } = await makeHost({
+      configured: true,
+      credentialsImpl: { resolve: never, set: never, describe: async () => undefined },
+      extraOptions: { credentialTimeoutMs: 120 },
+    })
+    const started = Date.now()
+    await assert.rejects(
+      () => host.dispatch({ action: 'configure', baseURL: BASE, apiKey: DEFAULT_API_KEY }),
+      (error) => {
+        assert.match(error.message, /凭据服务/)
+        return true
+      },
+    )
+    assert.ok(Date.now() - started < 1500, '必须在超时上限附近返回')
   })
 })

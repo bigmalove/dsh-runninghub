@@ -1,13 +1,14 @@
 {
   "name": "dsh-runninghub",
-  "version": "0.1.25",
+  "version": "0.1.27",
   "private": true,
   "type": "module",
   "scripts": {
     "test": "node bin/test.mjs",
     "test:runtime": "node bin/test.mjs --runtime",
     "test:all": "node bin/test.mjs --all",
-    "test:ui": "node --test tests/dsh-runninghub-ui.test.mjs"
+    "test:ui": "node --test tests/dsh-runninghub-ui.test.mjs",
+    "doctor": "node bin/doctor.mjs"
   },
   "files": [
     "index.mjs",

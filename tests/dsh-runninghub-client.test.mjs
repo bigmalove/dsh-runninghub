@@ -359,6 +359,61 @@ test('凭据不泄露：validateBaseURL 拒绝 URL 内嵌凭据与私网发送 k
   assert.doesNotThrow(() => validateBaseURL('http://127.0.0.1:6888'))
 })
 
+test('手机排障：局域网明文地址默认拒绝，显式勾选后放行；公网地址始终拒绝', () => {
+  // 默认仍然只信回环：勾选开关之前，私网地址连不带 Key 都不许。
+  assert.throws(() => validateBaseURL('http://192.168.1.23:6888'), GatewayError)
+  // 勾选后：私网 http + Key 可以用（网关只绑局域网网卡时这是唯一通路）。
+  assert.equal(validateBaseURL('http://192.168.1.23:6888', 'k', { allowPrivateLan: true }).hostname, '192.168.1.23')
+  assert.equal(validateBaseURL('http://10.0.0.5:6888', 'k', { allowPrivateLan: true }).port, '6888')
+  // 公网地址即使勾选也不放行；https 不涉及明文限制。
+  assert.throws(() => validateBaseURL('http://8.8.8.8:6888', 'k', { allowPrivateLan: true }), GatewayError)
+  assert.doesNotThrow(() => validateBaseURL('https://example.com:6888'))
+})
+
+test('手机排障：连不上时把底层 errno 带进错误文案', async () => {
+  const refused = async () => {
+    const failure = new Error('fetch failed')
+    failure.cause = Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:6888'), { code: 'ECONNREFUSED' })
+    throw failure
+  }
+  const client = new GatewayClient({ baseURL: 'http://127.0.0.1:6888', apiKey: 'k', fetchImpl: refused, timeoutMs: 500 })
+  await assert.rejects(() => client.listWorkflows(), (error) => {
+    assert.equal(error.code, 'NETWORK_ERROR')
+    assert.match(error.message, /ECONNREFUSED/)
+    assert.match(error.message, /127\.0\.0\.1:6888/)
+    assert.match(error.message, /监听/)
+    return true
+  })
+})
+
+test('手机排障：IPv4 回环拒绝时自动换 ::1 再试一次', async () => {
+  const seen = []
+  const fetchImpl = async (url) => {
+    seen.push(new URL(url).hostname)
+    if (new URL(url).hostname === '127.0.0.1') {
+      const failure = new Error('fetch failed')
+      failure.cause = Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' })
+      throw failure
+    }
+    return makeResponse({ text: JSON.stringify([sampleWorkflow()]) })
+  }
+  const client = new GatewayClient({ baseURL: 'http://127.0.0.1:6888', apiKey: 'k', fetchImpl, timeoutMs: 500 })
+  const workflows = await client.listWorkflows()
+  assert.equal(workflows.length, 1)
+  assert.deepEqual(seen, ['127.0.0.1', '[::1]'])
+})
+
+test('手机排障：HTTP 错误不触发回环族重试（避免把 401 当成网络问题）', async () => {
+  const seen = []
+  const fetchImpl = async (url) => {
+    seen.push(new URL(url).hostname)
+    return makeResponse({ status: 401, text: JSON.stringify({ error: { message: 'bad key' } }) })
+  }
+  const client = new GatewayClient({ baseURL: 'http://127.0.0.1:6888', apiKey: 'k', fetchImpl, timeoutMs: 500 })
+  await assert.rejects(() => client.listWorkflows(), (error) => error.code === 'HTTP_ERROR' && error.status === 401)
+  assert.deepEqual(seen, ['127.0.0.1'])
+})
+
 test('凭据不泄露：请求头携带 Authorization 但仅用于鉴权，调用记录里仍可见（由宿主负责不落盘）', async () => {
   const { client, calls } = createGateway({ workflows: [sampleWorkflow()], apiKey: 'k-123' })
   await client.listWorkflows()
