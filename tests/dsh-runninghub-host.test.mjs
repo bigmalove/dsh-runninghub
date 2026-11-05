@@ -2496,3 +2496,52 @@ describe('面板轮询不再堆积', () => {
     assert.equal(listed.templatePending, true, '应标记模板仍在后台读取')
   })
 })
+
+// =====================================================================
+// 对账：不进摘要、只补变了的那几个（原先 60 多个任务每 5 秒全扫一遍 = 4 秒）
+// =====================================================================
+describe('正文对账增量执行', () => {
+  function tavernWithCounter() {
+    const calls = { list: 0, attach: 0, update: 0 }
+    const tavern = {
+      getTurnState: async () => ({ settled: true, busy: false, turn: 5, textVersion: 'v1' }),
+      getTurn: async ({ gameId, turn }) => ({ gameId, turn, textVersion: 'v1' }),
+      captureGeneration: async ({ gameId }) => ({ gameId, generationId: 'g'.repeat(64) }),
+      resolveGeneration: async () => null,
+      onTurnSettled: () => () => {},
+      list: async () => { calls.list += 1; return [] },
+      update: async () => { calls.update += 1 },
+      attach: async () => { calls.attach += 1 },
+      remove: async () => false,
+    }
+    return { tavern, calls }
+  }
+
+  test('list 动作不再触发对账（宿主 list 调用数为 0）', async () => {
+    const { tavern, calls } = tavernWithCounter()
+    const { host } = await makeHost({
+      tavernImpl: tavern,
+      extraOptions: { reconcileMs: 0 },
+      clientFactory: () => ({ listWorkflows: async () => [{ alias: 'a' }] }),
+    })
+    await host.dispatch({ action: 'list' })
+    assert.equal(calls.list, 0, '摘要不该再跑对账')
+  })
+
+  test('对账只处理需要挂载的任务：第二次运行不再重复调用宿主', async () => {
+    const { tavern, calls } = tavernWithCounter()
+    const { host } = await makeHost({ tavernImpl: tavern, extraOptions: { reconcileMs: 0 } })
+    const job = {
+      id: '00000000-0000-4000-8000-000000000501', requestId: 'req-1', status: 'ready', model: 'wf',
+      binding: { gameId: 'g1', turn: 3, textVersion: 'v1' }, createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z', outputs: [{ kind: 'video', url: '/files/x.mp4' }], completedOutputs: [],
+      attachments: [{ kind: 'video', name: 'x.mp4', attachment: { attachmentId: 'att-1', name: 'x.mp4', bytes: 10 }, url: '/m' }],
+    }
+    await writeFile(join(host.store.directory, job.id + '.json'), JSON.stringify(job))
+    await host.reconcile()
+    const first = calls.list
+    assert.ok(first >= 1, '首轮应尝试挂载')
+    await host.reconcile()
+    assert.equal(calls.list, first, '已挂好的终态任务不该再扫一遍')
+  })
+})

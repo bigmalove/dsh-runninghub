@@ -16,7 +16,7 @@ window.__ModuleLoader__.load({
     let tavernUiApi = null
     const own = (object, key) => Object.prototype.hasOwnProperty.call(object || {}, key)
     // 与 index.mjs 的 PLUGIN_VERSION 对齐；对不上说明宿主侧还是旧代码（测试里有断言）。
-    const CLIENT_VERSION = '0.1.31'
+    const CLIENT_VERSION = '0.1.32'
     const message = error => typeof error === 'string' ? error : error?.message || '未知错误'
     // 探测结果的统一说法：保存和「检查连接」共用，不把原始错误当成成功。
     // 一键复制：手机上很多 WebView/非安全上下文没有 navigator.clipboard，退回 execCommand。
@@ -1210,6 +1210,7 @@ window.__ModuleLoader__.load({
               markerRegexError: data.markerRegexError || '',
               version: data.version || '',
               phaseMs: data.phaseMs || null, templatePending: data.templatePending === true,
+              reconcilePending: data.reconcilePending === true,
               gatewayError: data.gatewayError || '', settingsError: data.settingsError || '',
               engineError: data.engineError || '', storeWarning: data.storeWarning || '',
               reconcileError: data.reconcileError || '' })
@@ -2840,6 +2841,7 @@ window.__ModuleLoader__.load({
           alert(refreshError), alert(summary?.gatewayError), alert(summary?.settingsError ? '客户端默认模型读取失败：' + summary.settingsError : ''),
           alert(summary?.engineError ? '任务引擎没启动：' + summary.engineError + '（工作流仍可读取，提交/重下会失败）' : ''),
           alert(summary?.storeWarning || ''),
+          summary?.reconcilePending ? note('正文对账在后台进行，不占用面板轮询。') : null,
           alert(summary?.reconcileError ? '正文对账失败：' + summary.reconcileError : ''),
           alert(summary?.autoInsert === true && summary?.alwaysSendPrompt === false
             ? '自动插入已开启，但「总是发送提示词模板」关闭：模型不会收到生成说明，工具生成会被拒绝。' : ''),

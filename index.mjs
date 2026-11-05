@@ -38,7 +38,7 @@ import {
 export const name = 'dsh-runninghub'
 export const inject = ['tavern', 'attachments', 'credentials', 'webServer']
 // 面板上要能一眼看出「手机上跑的是哪一版」：宿主与网页各自上报，对不上就是没更新全。
-export const PLUGIN_VERSION = '0.1.31'
+export const PLUGIN_VERSION = '0.1.32'
 export const API = '/api/dsh-runninghub'
 export const MEDIA = API + '/media'
 export const REFERENCE = API + '/reference'
@@ -386,14 +386,37 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     })
   }
   let reconcileQueue = Promise.resolve()
+  // 对账要调宿主 list/attach，一台手机上 60 多个任务逐个走一遍就是 4 秒。
+  // 终态任务挂过一次就不用再扫；每次只补「变了的那几个」，剩下的留给下一轮。
+  const reconciled = new Map()
+  const RECONCILE_BATCH = Number.isSafeInteger(options.reconcileBatch) && options.reconcileBatch > 0 ? options.reconcileBatch : 8
+  let lastReconcileError = ''
+  let reconcileInflight = null
+  function reconcileSignature(job) {
+    return [job.status, (job.attachments || []).length, job.binding?.turn ?? '', job.binding?.textVersion ?? '',
+      job.binding?.pending ? 'p' : '', job.binding?.generationId || '', job.binding?.anchor || ''].join('|')
+  }
   function reconcile() {
     const next = reconcileQueue.catch(() => {}).then(async () => {
       if (disposed) return
       // Submission order, not download completion order, establishes media order.
       const resolutions = new Map()
-      for (const job of (await store.list()).reverse()) await reconcileJob(job, resolutions)
+      const jobs = (await store.list()).reverse()
+      let budget = RECONCILE_BATCH
+      for (const job of jobs) {
+        if (job.binding?.gameId && !insertionErrors.has(job.id) && !ACTIVE.has(job.status)
+          && reconciled.get(job.id) === reconcileSignature(job)) continue
+        if (budget <= 0) break
+        budget -= 1
+        try { await reconcileJob(job, resolutions) } catch (error) { lastReconcileError = sanitizeMessage(error?.message || '对账失败') }
+        if (!insertionErrors.has(job.id) && !ACTIVE.has(job.status)) reconciled.set(job.id, reconcileSignature(job))
+      }
+      if (!insertionErrors.size) lastReconcileError = ''
     })
     reconcileQueue = next
+    const settled = next.catch(() => {})
+    reconcileInflight = settled
+    void settled.finally(() => { if (reconcileInflight === settled) reconcileInflight = null })
     return next
   }
   async function bindMedia(job, media) {
@@ -1948,9 +1971,8 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
       catch (error) { workflowError = sanitizeMessage(error.message) }
     }
     // 对账、预生成这些都属于「附加信息」：它们失败不能把工作流列表一起吞掉。
-    let reconcileError = ''
-    try { await withDeadline(() => reconcile(), SUMMARY_BUDGET_MS, '正文对账超时（后台继续）') }
-    catch (error) { reconcileError = sanitizeMessage(error?.message || '对账失败') }
+    // 对账在后台跑（5 秒定时 + 结算时触发），摘要只报告它的状态，不再等它。
+    const reconcileError = lastReconcileError
     clock.mark('reconcile')
     const directive = promptDirective.model === model ? promptDirective : null
     let pregen
@@ -1970,7 +1992,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
       applyDefaults: applyDefaultsPref, bindToTurn: bindToTurnPref,
       workflowSettings: true,
       adapter: 'gateway', version: PLUGIN_VERSION, model, defaultModel, jobs, workflows,
-      phaseMs: clock.value, templatePending: Boolean(directiveJob),
+      phaseMs: clock.value, templatePending: Boolean(directiveJob), reconcilePending: Boolean(reconcileInflight),
       ...(badTasks.length ? { storeWarning: `跳过 ${badTasks.length} 个读不出来的任务记录：${badTasks.slice(0, 3).join('、')}${badTasks.length > 3 ? ' 等' : ''}` } : {}),
       ...(engineError ? { engineError } : {}),
       ...(reconcileError ? { reconcileError } : {}),
@@ -2076,7 +2098,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
       version: PLUGIN_VERSION, baseURL, allowPrivateLan, configuredKey, generationMode,
       node: process.version, platform: process.platform, arch: process.arch,
       engineError: engineError || '', badTasks: (store.badTasks || []).slice(0, 20),
-      lastSummaryMs: lastPhaseMs, templatePending: Boolean(directiveJob),
+      lastSummaryMs: lastPhaseMs, templatePending: Boolean(directiveJob), reconcilePending: Boolean(reconcileInflight),
       dataDirectory: directory, markerRegex: markerRegexState.ok ? 'ok' : (markerRegexState.reason || 'pending'),
       engine: engine ? 'ready' : 'idle', workflows: workflows.length, workflowError,
       serialPending, configPending,

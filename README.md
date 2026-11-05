@@ -50,6 +50,8 @@ node bin/doctor.mjs --key <网关Key>        # 带 Key 探测，能直接看到 
 
 连不上时面板的状态提示现在会带底层 errno（`ECONNREFUSED` / `ETIMEDOUT` / `ENOTFOUND` / `EPROTO` 等）和一句处理方向，不再只有「网关连接中断」。
 
+**对账为什么也拖慢面板（0.1.32 修掉）**：正文对账要逐条调宿主 `tavern.list` / `attach`，60 多条任务全量扫一遍就是 4 秒。它现在是纯后台：摘要不再触发，按签名增量补，每轮最多 8 条（`reconcileBatch`），面板只显示 `reconcilePending`。
+
 **摘要为什么要 20 秒（0.1.31 修掉）**：面板每 5 秒轮询一次宿主摘要，早期版本会在摘要里**同步**构建提示词模板（`describe` + `/nodes` + LoRA 库 + `portDirective`）。慢机器上一次就 20 秒，轮询在全局队列里越堆越多，连 `jobs` 都被压在后面 17 秒——工作台于是永远拿不到最新列表。现在：
 
 - 模板改为后台任务（按 `alias+revision+mode` 去重），摘要只带 `templatePending`；提交路径仍在 `ensureModel` 里等模板完成
