@@ -15,6 +15,8 @@ window.__ModuleLoader__.load({
     // apply(ctx) 时记下来：停靠区组件要用 ctx.tavernUi.watchReply 读正在生成的正文。
     let tavernUiApi = null
     const own = (object, key) => Object.prototype.hasOwnProperty.call(object || {}, key)
+    // 与 index.mjs 的 PLUGIN_VERSION 对齐；对不上说明宿主侧还是旧代码（测试里有断言）。
+    const CLIENT_VERSION = '0.1.30'
     const message = error => typeof error === 'string' ? error : error?.message || '未知错误'
     // 探测结果的统一说法：保存和「检查连接」共用，不把原始错误当成成功。
     const probeNotice = probe => {
@@ -1114,6 +1116,16 @@ window.__ModuleLoader__.load({
         return () => { cancelAnimationFrame(frame); document.removeEventListener('keydown', keyboard); (previous || settingsButtonRef.current)?.focus?.() }
       }, [settingsOpen])
 
+      // 抽屉打开、宿主却交回 0 个工作流时，顺手探一次网关：
+      // 这样「网关没有工作流」和「宿主没把工作流交给网页」能当场分开。
+      useEffect(() => {
+        if (!settingsOpen) return
+        if (!summary || summary.configured !== true) return
+        if ((summary.workflows || []).length) return
+        if (probeLock.current || probeResult) return
+        void testConnection()
+      }, [settingsOpen, summary?.configured, (summary?.workflows || []).length, probeResult])
+
       // 打开设置抽屉时如果还没拿到宿主状态，主动补一次，别让抽屉一直停在“等待首次响应”。
       useEffect(() => {
         if (!settingsOpen || summary !== null) return
@@ -1170,6 +1182,7 @@ window.__ModuleLoader__.load({
               pregen: data.pregen || null,
               markerError: data.markerError || '', markerWarning: data.markerWarning || '',
               markerRegexError: data.markerRegexError || '',
+              version: data.version || '',
               gatewayError: data.gatewayError || '', settingsError: data.settingsError || '',
               engineError: data.engineError || '', storeWarning: data.storeWarning || '',
               reconcileError: data.reconcileError || '' })
@@ -2307,6 +2320,9 @@ window.__ModuleLoader__.load({
         const failed = settingsStatus === 'error'
         return h('div', { className: 'rh-stack', style: { gap: 9 } },
           h('div', { className: 'rh-settings-status', 'data-state': settingsStatus, role: 'status' }, settingsStatusText()),
+          alert(refreshError ? '读取宿主状态失败：' + refreshError : ''),
+          alert(summary?.gatewayError || ''),
+          summary && !summary.configured ? alert('宿主里还没有网关 Key：先在下方的「网关连接」填地址和 Key 并保存。') : null,
           !loaded ? h('div', { className: 'rh-settings-status', 'data-state': 'dirty', role: 'status' },
             '正在读取宿主状态…' + (refreshError ? '（' + refreshError + '）' : '')) : null,
           h('div', { className: 'rh-settings-actions' },
@@ -2874,7 +2890,7 @@ window.__ModuleLoader__.load({
           h('button', { type: 'button', className: 'rh-backdrop', 'aria-label': '关闭设置遮罩', tabIndex: -1, onClick: () => setSettingsOpen(false) }),
           h('section', { className: 'rh-drawer', role: 'dialog', 'aria-modal': true, 'aria-labelledby': 'rh-settings-title', ref: drawerRef },
             h('div', { className: 'rh-drawer-head' }, h('div', null, h('h3', { id: 'rh-settings-title' }, '工作台设置'),
-              note('工作流、生成默认值与正文联动 · 与 6888 管理页互通')),
+              note('工作流、生成默认值与正文联动 · 与 6888 管理页互通'), note('网页 v' + CLIENT_VERSION + ' · 宿主 ' + (summary?.version || '未知版本'))),
               h('button', { type: 'button', className: 'rh-btn rh-btn-quiet', 'aria-label': '关闭设置', onClick: () => setSettingsOpen(false) }, icon('close'))),
             h('div', { className: 'rh-drawer-content' },
               renderSettingsStatus(),
@@ -2889,6 +2905,9 @@ window.__ModuleLoader__.load({
                   ? note('提示词模板 · ' + summary.templateMode + (summary?.alwaysSendPrompt === false ? ' · 开关关闭，未发送' : ' · 每轮发送'))
                   : null,
                 note('与单镜生成页共用同一个选择；切换后自动载入该工作流的网关设置。'),
+                !aliases.length ? note(summary?.configured
+                  ? '宿主这次返回 0 个工作流。下面的「测试连接」能看到工作流就说明网关没问题，是宿主没把列表交出来——用「读取宿主诊断」看细节。'
+                  : '宿主还没有可用的网关配置。') : null,
                 alert(workflowError)),
               h('div', { className: 'rh-rule' }),
               workflow ? renderGenerationSettings() : note('连接网关并选择工作流后，这里显示可保存的生成设置。'),

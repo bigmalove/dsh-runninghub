@@ -37,6 +37,8 @@ import {
 
 export const name = 'dsh-runninghub'
 export const inject = ['tavern', 'attachments', 'credentials', 'webServer']
+// 面板上要能一眼看出「手机上跑的是哪一版」：宿主与网页各自上报，对不上就是没更新全。
+export const PLUGIN_VERSION = '0.1.30'
 export const API = '/api/dsh-runninghub'
 export const MEDIA = API + '/media'
 export const REFERENCE = API + '/reference'
@@ -1934,7 +1936,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
       markerPipeline: promptDirective.pipeline === true,
       applyDefaults: applyDefaultsPref, bindToTurn: bindToTurnPref,
       workflowSettings: true,
-      adapter: 'gateway', model, defaultModel, jobs, workflows,
+      adapter: 'gateway', version: PLUGIN_VERSION, model, defaultModel, jobs, workflows,
       ...(badTasks.length ? { storeWarning: `跳过 ${badTasks.length} 个读不出来的任务记录：${badTasks.slice(0, 3).join('、')}${badTasks.length > 3 ? ' 等' : ''}` } : {}),
       ...(engineError ? { engineError } : {}),
       ...(reconcileError ? { reconcileError } : {}),
@@ -1979,7 +1981,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
       const probe = clientFactory({ baseURL, apiKey, fetchImpl, allowPrivateLan, timeoutMs: 4000 })
       // 探测自己也要有上限：注入的假客户端或挂住的网关不能让这次请求变成无限等待。
       const list = await withDeadline(() => probe.listWorkflows(), 6000, '网关探测 6 秒没有回应')
-      return { ok: true, workflows: list.length, ms: Date.now() - started, baseURL }
+      return { ok: true, workflows: list.length, aliases: list.slice(0, 5).map((item) => item.alias), ms: Date.now() - started, baseURL }
     } catch (error) {
       return { ok: false, error: sanitizeMessage(error?.message || '探测失败'), code: error?.code || '', ms: Date.now() - started, baseURL }
     }
@@ -2037,7 +2039,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     try { configuredKey = (await credentialDeadline(() => ctx.credentials.resolve(credentialName(baseURL))))?.value ? 'yes' : 'no' }
     catch { configuredKey = 'unknown' }
     return {
-      baseURL, allowPrivateLan, configuredKey, generationMode,
+      version: PLUGIN_VERSION, baseURL, allowPrivateLan, configuredKey, generationMode,
       node: process.version, platform: process.platform, arch: process.arch,
       engineError: engineError || '', badTasks: (store.badTasks || []).slice(0, 20),
       dataDirectory: directory, markerRegex: markerRegexState.ok ? 'ok' : (markerRegexState.reason || 'pending'),

@@ -9,6 +9,7 @@ import path from 'node:path'
 import { join } from 'node:path'
 import { createServer } from 'node:http'
 import { test, describe, afterEach } from 'node:test'
+import { fileURLToPath } from 'node:url'
 
 import { createRunningHubHost, apply, API, LIBRARY, MEDIA, REFERENCE } from '../index.mjs'
 import { shotFingerprint } from '../lib/markers.mjs'
@@ -2435,4 +2436,17 @@ describe('任务记录损坏时仍能读取工作流', () => {
     const listed = await host.dispatch({ action: 'list' })
     assert.equal(listed.storeWarning, undefined)
   })
+})
+
+// =====================================================================
+// 「没有任何变化」最常见的原因就是宿主侧还是旧代码：三处版本必须一致
+// =====================================================================
+test('版本一致性：package.json / index.mjs / client.js 必须同一版本', async () => {
+  const repo = fileURLToPath(new URL('../', import.meta.url))
+  const pkg = JSON.parse(await readFile(join(repo, 'package.json'), 'utf8'))
+  const { PLUGIN_VERSION } = await import('../index.mjs')
+  const clientSource = await readFile(join(repo, 'client.js'), 'utf8')
+  const clientVersion = /const CLIENT_VERSION = '([^']+)'/.exec(clientSource)?.[1]
+  assert.equal(PLUGIN_VERSION, pkg.version, 'index.mjs 的 PLUGIN_VERSION 与 package.json 不一致')
+  assert.equal(clientVersion, pkg.version, 'client.js 的 CLIENT_VERSION 与 package.json 不一致')
 })
