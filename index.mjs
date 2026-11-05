@@ -38,7 +38,7 @@ import {
 export const name = 'dsh-runninghub'
 export const inject = ['tavern', 'attachments', 'credentials', 'webServer']
 // 面板上要能一眼看出「手机上跑的是哪一版」：宿主与网页各自上报，对不上就是没更新全。
-export const PLUGIN_VERSION = '0.1.30'
+export const PLUGIN_VERSION = '0.1.31'
 export const API = '/api/dsh-runninghub'
 export const MEDIA = API + '/media'
 export const REFERENCE = API + '/reference'
@@ -1885,8 +1885,32 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     await unlink(pregenFile(id)).catch(() => {})
   }
 
+  // 面板每 5 秒轮询一次，摘要必须便宜：只带「能画出来」的东西，
+  // 提示词模板、对账、预生成这些重的放到后台或单独限时，别再把轮询拖到 20 秒。
+  const phaseMs = () => {
+    const marks = {}
+    const started = Date.now()
+    return { started, mark(name) { marks[name] = Date.now() - started }, get value() { return { ...marks, total: Date.now() - started } } }
+  }
+  const SUMMARY_BUDGET_MS = Number.isSafeInteger(options.summaryBudgetMs) && options.summaryBudgetMs > 0 ? options.summaryBudgetMs : 4000
+  let directiveJob = null
+  let directiveJobKey = ''
+  let summaryInflight = null
+  let lastPhaseMs = {}
+  function scheduleDirective(active, description) {
+    if (!description) return
+    const key = [description.alias, description.revision || '', templateMode(description)].join('|')
+    if (promptDirective.key === key) return
+    if (directiveJob && directiveJobKey === key) return
+    directiveJobKey = key
+    directiveJob = refreshDirective(active, description)
+      .catch(() => {})
+      .finally(() => { if (directiveJobKey === key) { directiveJob = null; directiveJobKey = '' } })
+  }
   async function summary(gameId) {
+    const clock = phaseMs()
     let configured = Boolean((await ctx.credentials.resolve(credentialName(baseURL)))?.value)
+    clock.mark('credentials')
     let settingsError = ''
     if (!configured) {
       model = ''; workflows = []; resetDirective()
@@ -1894,15 +1918,18 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     if (configured) {
       try {
         const active = await connect()
+        clock.mark('connect')
         workflows = await active.client.listWorkflows()
         workflowsLoadedAt = Date.now()
+        clock.mark('workflows')
         workflowError = ''
         // 默认模型取服务端默认；获取失败不让工作流列表丢失，单独记录同步错误。
         try {
           if (typeof active.client.getSettings === 'function') {
-            defaultModel = (await active.client.getSettings())?.defaultModel ?? ''
+            defaultModel = (await withDeadline(() => active.client.getSettings(), SUMMARY_BUDGET_MS, '默认模型读取超时'))?.defaultModel ?? ''
           }
         } catch (error) { settingsError = sanitizeMessage(error.message) }
+        clock.mark('settings')
         const usable = workflows.filter((w) => !w.broken)
         if (selectedModel && usable.some((w) => w.alias === selectedModel)) model = selectedModel
         else if (defaultModel && usable.some((w) => w.alias === defaultModel)) model = defaultModel
@@ -1913,18 +1940,23 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
           selectedModel = ''
           await saveSelection('')
         }
-        if (model) await refreshDirective(active, usable.find((w) => w.alias === model))
+        // 模板（describe + /nodes + LoRA 库 + portDirective）是整条链上最慢的一段：
+        // 后台拉，按 key 去重，面板下一轮轮询就能看到；提交路径仍会 ensureModel 里 await 到它。
+        if (model) scheduleDirective(active, usable.find((w) => w.alias === model))
+        clock.mark('directive')
       }
       catch (error) { workflowError = sanitizeMessage(error.message) }
     }
     // 对账、预生成这些都属于「附加信息」：它们失败不能把工作流列表一起吞掉。
     let reconcileError = ''
-    try { await reconcile() } catch (error) { reconcileError = sanitizeMessage(error?.message || '对账失败') }
+    try { await withDeadline(() => reconcile(), SUMMARY_BUDGET_MS, '正文对账超时（后台继续）') }
+    catch (error) { reconcileError = sanitizeMessage(error?.message || '对账失败') }
+    clock.mark('reconcile')
     const directive = promptDirective.model === model ? promptDirective : null
     let pregen
     if (typeof gameId === 'string' && gameId) {
       try {
-        const state = await reconcilePregen(gameId)
+        const state = await withDeadline(() => reconcilePregen(gameId), SUMMARY_BUDGET_MS, '预生成状态读取超时')
         pregen = publicPregenState(state)
       } catch (error) {
         pregen = { ...publicPregenState(normalizePregenState(undefined, gameId)), lastError: sanitizeMessage(error.message) }
@@ -1932,11 +1964,13 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     }
     const jobs = clientJobs(await store.list())
     const badTasks = store.badTasks || []
+    lastPhaseMs = clock.value
     return { configured, baseURL, allowPrivateLan, generationMode, autoInsert, alwaysSendPrompt, videosPerTurn, streamPreclaim,
       markerPipeline: promptDirective.pipeline === true,
       applyDefaults: applyDefaultsPref, bindToTurn: bindToTurnPref,
       workflowSettings: true,
       adapter: 'gateway', version: PLUGIN_VERSION, model, defaultModel, jobs, workflows,
+      phaseMs: clock.value, templatePending: Boolean(directiveJob),
       ...(badTasks.length ? { storeWarning: `跳过 ${badTasks.length} 个读不出来的任务记录：${badTasks.slice(0, 3).join('、')}${badTasks.length > 3 ? ' 等' : ''}` } : {}),
       ...(engineError ? { engineError } : {}),
       ...(reconcileError ? { reconcileError } : {}),
@@ -2042,6 +2076,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
       version: PLUGIN_VERSION, baseURL, allowPrivateLan, configuredKey, generationMode,
       node: process.version, platform: process.platform, arch: process.arch,
       engineError: engineError || '', badTasks: (store.badTasks || []).slice(0, 20),
+      lastSummaryMs: lastPhaseMs, templatePending: Boolean(directiveJob),
       dataDirectory: directory, markerRegex: markerRegexState.ok ? 'ok' : (markerRegexState.reason || 'pending'),
       engine: engine ? 'ready' : 'idle', workflows: workflows.length, workflowError,
       serialPending, configPending,
@@ -2069,6 +2104,21 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     if (input.action === 'configure') return configureSerial(() => configure(input))
     // 点一下就能知道网关通不通，不列工作流、不建引擎、不进串行锁。
     if (input.action === 'probe') { keys(input, ['action']); return probeGateway() }
+    // 面板轮询合并：同一时刻只跑一份摘要，后来的调用共用它的结果，
+    // 否则每 5 秒一次轮询会在慢机器上越堆越多（诊断里就是 3 个 list 排队 10~20 秒）。
+    if (input.action === 'list') {
+      keys(input, ['action', 'gameId'])
+      if (summaryInflight) return summaryInflight
+      summaryInflight = serial(() => summary(input.gameId)).finally(() => { summaryInflight = null })
+      return summaryInflight
+    }
+    // 输入框停靠区只读本地任务记录，不该排在摘要后面等网关。
+    if (input.action === 'jobs') {
+      keys(input, ['action', 'gameId'])
+      if (input.gameId !== undefined && (typeof input.gameId !== 'string' || !input.gameId)) throw fail('gameId 必须是当前对话 ID')
+      const all = await store.list()
+      return { jobs: clientJobs(input.gameId ? all.filter(job => job.binding?.gameId === input.gameId) : all) }
+    }
     return serial(async () => {
       if (input.action === 'preferences') {
         keys(input, ['action', 'autoInsert', 'alwaysSendPrompt', 'videosPerTurn', 'streamPreclaim', 'applyDefaults', 'bindToTurn', 'generationMode'])
@@ -2118,15 +2168,8 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
         try { toolSync() } catch { /* 工具注册失败不阻断设置保存 */ }
         return next
       }
-      if (input.action === 'list') { keys(input, ['action', 'gameId']); return summary(input.gameId) }
       // 输入框停靠区的轻量轮询：只读本地任务记录，不连网关、不列工作流。
       // 工具提交后几秒内就能显示「生成中」，不用等正文这一轮结算。
-      if (input.action === 'jobs') {
-        keys(input, ['action', 'gameId'])
-        if (input.gameId !== undefined && (typeof input.gameId !== 'string' || !input.gameId)) throw fail('gameId 必须是当前对话 ID')
-        const all = await store.list()
-        return { jobs: clientJobs(input.gameId ? all.filter(job => job.binding?.gameId === input.gameId) : all) }
-      }
       if (input.action === 'pregen-settings') return pregenSettings(input)
       if (input.action === 'pregen-refill') return pregenRefill(input)
       if (input.action === 'pregen-delete') return pregenDelete(input)

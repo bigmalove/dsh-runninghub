@@ -16,9 +16,33 @@ window.__ModuleLoader__.load({
     let tavernUiApi = null
     const own = (object, key) => Object.prototype.hasOwnProperty.call(object || {}, key)
     // 与 index.mjs 的 PLUGIN_VERSION 对齐；对不上说明宿主侧还是旧代码（测试里有断言）。
-    const CLIENT_VERSION = '0.1.30'
+    const CLIENT_VERSION = '0.1.31'
     const message = error => typeof error === 'string' ? error : error?.message || '未知错误'
     // 探测结果的统一说法：保存和「检查连接」共用，不把原始错误当成成功。
+    // 一键复制：手机上很多 WebView/非安全上下文没有 navigator.clipboard，退回 execCommand。
+    async function copyText(text) {
+      try {
+        if (navigator.clipboard && window.isSecureContext) {
+          await navigator.clipboard.writeText(text)
+          return true
+        }
+      } catch { /* 走下面的兜底 */ }
+      try {
+        const area = document.createElement('textarea')
+        area.value = text
+        area.setAttribute('readonly', '')
+        area.style.position = 'fixed'
+        area.style.top = '-1000px'
+        area.style.opacity = '0'
+        document.body.appendChild(area)
+        area.select()
+        area.setSelectionRange(0, text.length)
+        const ok = document.execCommand('copy')
+        document.body.removeChild(area)
+        return ok
+      } catch { return false }
+    }
+
     const probeNotice = probe => {
       if (!probe || typeof probe !== 'object') return ''
       if (probe.ok) return `网关可达：已读到 ${probe.workflows ?? 0} 个工作流（${probe.ms ?? 0}ms）。`
@@ -974,6 +998,8 @@ window.__ModuleLoader__.load({
       const [probeResult, setProbeResult] = useState('')
       const [diagBusy, setDiagBusy] = useState(false)
       const [diagText, setDiagText] = useState('')
+      const [copyState, setCopyState] = useState('')
+      const diagRaw = useRef(null)
       const probeLock = useRef(false)
       const diagLock = useRef(false)
       const [autoInsertBusy, setAutoInsertBusy] = useState(false)
@@ -1183,6 +1209,7 @@ window.__ModuleLoader__.load({
               markerError: data.markerError || '', markerWarning: data.markerWarning || '',
               markerRegexError: data.markerRegexError || '',
               version: data.version || '',
+              phaseMs: data.phaseMs || null, templatePending: data.templatePending === true,
               gatewayError: data.gatewayError || '', settingsError: data.settingsError || '',
               engineError: data.engineError || '', storeWarning: data.storeWarning || '',
               reconcileError: data.reconcileError || '' })
@@ -1789,6 +1816,45 @@ window.__ModuleLoader__.load({
         }
       }
 
+      function diagnosticBundle(hostDiag) {
+        const payload = {
+          host: hostDiag,
+          panel: {
+            version: CLIENT_VERSION,
+            hostVersion: summary?.version || '',
+            configured: summary?.configured ?? null,
+            workflows: (summary?.workflows || []).length,
+            model: summary?.model || '',
+            gatewayError: summary?.gatewayError || '',
+            engineError: summary?.engineError || '',
+            storeWarning: summary?.storeWarning || '',
+            reconcileError: summary?.reconcileError || '',
+            templateError: summary?.templateError || '',
+            refreshError,
+            probeResult,
+            phaseMs: summary?.phaseMs || null,
+          },
+          userAgent: navigator.userAgent,
+          at: new Date().toISOString(),
+        }
+        return JSON.stringify(payload, null, 2)
+      }
+
+      // 一次点击就把「宿主诊断 + 面板状态」抓下来并复制，不用先读再选再复制。
+      async function copyDiagnostics() {
+        setCopyState('读取中…')
+        const current = controller()
+        try {
+          const hostDiag = await request({ action: 'diag' }, current.signal)
+          diagRaw.current = hostDiag
+          if (alive.current) setDiagText(JSON.stringify(hostDiag, null, 2))
+          const ok = await copyText(diagnosticBundle(hostDiag))
+          if (alive.current) setCopyState(ok ? '已复制，直接粘贴即可' : '浏览器拦了剪贴板：长按下面的文本全选复制')
+        } catch (error) {
+          if (alive.current) setCopyState('读取诊断失败：' + message(error))
+        } finally { controllers.current.delete(current) }
+      }
+
       // 宿主卡在哪一段：把正在跑的调用、队列深度和耗时拉出来给人看。
       async function loadDiagnostics() {
         if (diagLock.current) return
@@ -1797,7 +1863,7 @@ window.__ModuleLoader__.load({
         const current = controller()
         try {
           const data = await request({ action: 'diag' }, current.signal)
-          if (alive.current) setDiagText(JSON.stringify(data, null, 2))
+          if (alive.current) { setDiagText(JSON.stringify(data, null, 2)); diagRaw.current = data; setCopyState('') }
         } catch (error) {
           if (alive.current) setDiagText(`诊断请求失败：${error.message}`)
         } finally {
@@ -2320,6 +2386,8 @@ window.__ModuleLoader__.load({
         const failed = settingsStatus === 'error'
         return h('div', { className: 'rh-stack', style: { gap: 9 } },
           h('div', { className: 'rh-settings-status', 'data-state': settingsStatus, role: 'status' }, settingsStatusText()),
+          summary && Number(summary.phaseMs?.total) > 1500 ? note('宿主摘要偏慢：' + summary.phaseMs.total + 'ms（' +
+            Object.entries(summary.phaseMs).filter(([name]) => name !== 'total').map(([name, ms]) => name + ' ' + ms + 'ms').join(' · ') + '）') : null,
           alert(refreshError ? '读取宿主状态失败：' + refreshError : ''),
           alert(summary?.gatewayError || ''),
           summary && !summary.configured ? alert('宿主里还没有网关 Key：先在下方的「网关连接」填地址和 Key 并保存。') : null,
@@ -2989,7 +3057,9 @@ window.__ModuleLoader__.load({
                   h('div', { className: 'rh-fold-content' },
                     note('诊断不进队列、不连网关：卡住时也能回答「宿主正在等哪一段」。'),
                     button(diagBusy ? '读取中…' : '读取宿主诊断', loadDiagnostics, diagBusy, 'diag'),
-                    diagText ? h('pre', { className: 'rh-note', style: { whiteSpace: 'pre-wrap', fontSize: '11px', maxHeight: '220px', overflow: 'auto' } }, diagText) : null))),
+                    button('一键复制诊断', copyDiagnostics, false, 'copy-diag', 'link'),
+                    copyState ? note(copyState) : null,
+                    diagText ? h('pre', { className: 'rh-note', style: { whiteSpace: 'pre-wrap', fontSize: '11px', maxHeight: '220px', overflow: 'auto', userSelect: 'text' } }, diagText) : null))),
               note('写在客户端里的设置（分辨率、片长、自定义参数、模型字段、种子、参考素材）与 6888 管理页「单镜生成」是同一份；这里的改动会立即同步，生成也永远以这份为准。')))) : null,
         videoNotices.length ? h('div', { className: 'rh-video-toasts' + (view === 'create' ? ' rh-video-toasts-raised' : ''), 'aria-live': 'polite', 'aria-label': '视频生成完成' }, videoNotices.map(renderVideoNotice)) : null,
         libraryPicker ? h(LibraryPicker, {

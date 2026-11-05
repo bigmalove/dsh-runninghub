@@ -2450,3 +2450,49 @@ test('版本一致性：package.json / index.mjs / client.js 必须同一版本'
   assert.equal(PLUGIN_VERSION, pkg.version, 'index.mjs 的 PLUGIN_VERSION 与 package.json 不一致')
   assert.equal(clientVersion, pkg.version, 'client.js 的 CLIENT_VERSION 与 package.json 不一致')
 })
+
+// =====================================================================
+// 面板轮询：合并并发摘要、jobs 不排队、模板不在摘要里阻塞
+// =====================================================================
+describe('面板轮询不再堆积', () => {
+  const never = () => new Promise(() => {})
+
+  test('并发 list 合并成一次执行，结果共用', async () => {
+    let calls = 0
+    const { host } = await makeHost({
+      clientFactory: () => ({
+        listWorkflows: async () => { calls += 1; await new Promise(r => setTimeout(r, 30)); return [{ alias: 'a' }] },
+      }),
+    })
+    const [first, second] = await Promise.all([host.dispatch({ action: 'list' }), host.dispatch({ action: 'list' })])
+    assert.equal(calls, 1, '同一时刻只应跑一份摘要')
+    assert.equal(first, second, '并发调用应共用同一份结果')
+    assert.equal(first.workflows.length, 1)
+  })
+
+  test('摘要卡住时 jobs 仍然立刻返回', async () => {
+    const { host } = await makeHost({ clientFactory: () => ({ listWorkflows: never }) })
+    host.dispatch({ action: 'list' }).catch(() => {})
+    await new Promise(r => setTimeout(r, 20))
+    const started = Date.now()
+    const out = await host.dispatch({ action: 'jobs' })
+    assert.ok(Date.now() - started < 800, 'jobs 只读本地记录，不该排在摘要后面')
+    assert.deepEqual(out.jobs, [])
+  })
+
+  test('提示词模板挂在网关时，摘要不跟着挂（后台继续拉）', async () => {
+    const { host } = await makeHost({
+      clientFactory: () => ({
+        listWorkflows: async () => [{ alias: 'wf-a' }],
+        getSettings: async () => ({ defaultModel: 'wf-a' }),
+        portDirective: never,
+      }),
+    })
+    const started = Date.now()
+    const listed = await host.dispatch({ action: 'list' })
+    assert.ok(Date.now() - started < 1500, '摘要不该等模板构建')
+    assert.equal(listed.workflows.length, 1)
+    assert.ok(listed.phaseMs && typeof listed.phaseMs.total === 'number', '应带上各阶段耗时')
+    assert.equal(listed.templatePending, true, '应标记模板仍在后台读取')
+  })
+})

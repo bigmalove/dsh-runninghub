@@ -50,6 +50,14 @@ node bin/doctor.mjs --key <网关Key>        # 带 Key 探测，能直接看到 
 
 连不上时面板的状态提示现在会带底层 errno（`ECONNREFUSED` / `ETIMEDOUT` / `ENOTFOUND` / `EPROTO` 等）和一句处理方向，不再只有「网关连接中断」。
 
+**摘要为什么要 20 秒（0.1.31 修掉）**：面板每 5 秒轮询一次宿主摘要，早期版本会在摘要里**同步**构建提示词模板（`describe` + `/nodes` + LoRA 库 + `portDirective`）。慢机器上一次就 20 秒，轮询在全局队列里越堆越多，连 `jobs` 都被压在后面 17 秒——工作台于是永远拿不到最新列表。现在：
+
+- 模板改为后台任务（按 `alias+revision+mode` 去重），摘要只带 `templatePending`；提交路径仍在 `ensureModel` 里等模板完成
+- `getSettings` / 正文对账 / 预生成状态各 4 秒上限（`summaryBudgetMs`），超时只记错误不拖摘要
+- 并发 `list` 合并成一次执行；`jobs` 不再进全局队列
+- 摘要带 `phaseMs`，抽屉里超过 1500ms 会列出各段耗时；`diag` 里有 `lastSummaryMs`
+- 「连不上？看宿主诊断」里有 **一键复制诊断**：宿主 `diag` + 面板状态直接进剪贴板（非安全上下文回退 `execCommand`）
+
 ## 要准备什么
 
 - 本机跑着 RunningHub 网关，默认监听 `http://127.0.0.1:6888`。
