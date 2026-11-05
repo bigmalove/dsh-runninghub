@@ -2412,3 +2412,27 @@ describe('手机排障：保存连接设置不被网关阻塞', () => {
     assert.ok(Date.now() - started < 1500, '必须在超时上限附近返回')
   })
 })
+
+// =====================================================================
+// 手机排障：一个坏任务记录不能让「工作台读工作流」整块失败
+// =====================================================================
+describe('任务记录损坏时仍能读取工作流', () => {
+  test('坏记录被跳过并给出 storeWarning，工作流照常返回', async () => {
+    const { host, dataDirectory } = await makeHost({
+      clientFactory: () => ({ listWorkflows: async () => [{ alias: 'wf-a' }, { alias: 'wf-b' }] }),
+    })
+    // 写一个读不出来的任务记录（JSON 半截 = 写盘中断的现场）。
+    await writeFile(join(dataDirectory, 'tasks', '00000000-0000-4000-8000-000000000999.json'), '{"id": "0000')
+    const listed = await host.dispatch({ action: 'list' })
+    assert.equal(listed.workflows.length, 2, '坏记录不能连带工作流一起失败')
+    assert.ok(listed.storeWarning && /00000000-0000-4000-8000-000000000999\.json/.test(listed.storeWarning), '应点名被跳过的文件')
+    const diag = await host.dispatch({ action: 'diag' })
+    assert.ok(diag.badTasks.some(name => /000000000999\.json$/.test(name)), 'diagnostic 应列出坏记录')
+  })
+
+  test('没有坏记录时不出现 storeWarning', async () => {
+    const { host } = await makeHost({ clientFactory: () => ({ listWorkflows: async () => [{ alias: 'wf-a' }] }) })
+    const listed = await host.dispatch({ action: 'list' })
+    assert.equal(listed.storeWarning, undefined)
+  })
+})

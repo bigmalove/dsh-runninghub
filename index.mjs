@@ -184,7 +184,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
   }
   let reconcileTimer
   let workflowSyncTimer
-  let engine, client, clientIdentity, disposed = false, workflows = [], workflowError = ''
+  let engine, client, clientIdentity, disposed = false, workflows = [], workflowError = '', engineError = ''
   // 工作流由面板决定，模型只写提示词。selectedModel 是玩家显式选中的别名；
   // model 是本次实际生效的别名（选中项失效时回落到网关默认/第一个可用项）。
   let selectedModel = typeof selection?.model === 'string' ? selection.model : ''
@@ -433,14 +433,28 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     const apiKey = credential?.value || ''
     if (!apiKey) throw fail('请先在 RunningHub 面板保存网关 Key', 'NOT_CONFIGURED')
     const identity = createHash('sha256').update(baseURL + '\n' + apiKey + '\n' + (allowPrivateLan ? 'lan' : 'loopback')).digest('hex')
-    if (!engine || identity !== clientIdentity) {
+    if ((!engine && !engineError) || identity !== clientIdentity) {
       engine?.dispose()
+      engine = undefined
+      engineError = ''
       client = clientFactory({ baseURL, apiKey, fetchImpl, allowPrivateLan })
-      engine = new TaskEngine({ client, store, onMedia, onChange, pollMs: options.pollMs ?? 5000 })
       clientIdentity = identity
-      await engine.init()
+      const next = new TaskEngine({ client, store, onMedia, onChange, pollMs: options.pollMs ?? 5000 })
+      try {
+        await next.init()
+        engine = next
+      } catch (error) {
+        // 任务记录坏了不该连带工作流一起读不到：客户端照样能用，只单独报引擎不可用。
+        try { next.dispose() } catch { /* 已经半初始化，忽略 */ }
+        engineError = sanitizeMessage(error?.message || '任务引擎启动失败')
+      }
     }
     return { client, engine }
+  }
+  // 依赖任务引擎的操作单独拦一道：报「引擎为什么没起来」，而不是抛 TypeError。
+  function requireEngine() {
+    if (engine) return engine
+    throw new GatewayError('任务记录不可用：' + (engineError || '任务引擎未启动'), { code: 'STORE_ERROR' })
   }
   // 工作流自带的提示词模板模式；没有显式绑定就按管线/视频/图片特征回落。
   function templateMode(description) {
@@ -1138,7 +1152,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     state.entries.push(entry)
     await persistPregen(gameId)
     try {
-      const job = await active.engine.submit(clean, { requestId: entry.requestId })
+      const job = await requireEngine().submit(clean, { requestId: entry.requestId })
       try { await replays.save(job.id, clean) } catch { /* 预生成任务不强制可重放 */ }
       delete entry.submitting
       entry.jobId = job.id
@@ -1758,7 +1772,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
           droppedPreclaims.delete(reuse.id)
           if (active?.engine?.setBinding) {
             try {
-              const adopted = await active.engine.setBinding(reuse.id, {
+              const adopted = await requireEngine().setBinding(reuse.id, {
                 ...bindingBase, anchor, caption: shot.caption || '', pending: true, fingerprint: shot.fingerprint,
               })
               jobs.push(adopted)
@@ -1901,7 +1915,9 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
       }
       catch (error) { workflowError = sanitizeMessage(error.message) }
     }
-    await reconcile()
+    // 对账、预生成这些都属于「附加信息」：它们失败不能把工作流列表一起吞掉。
+    let reconcileError = ''
+    try { await reconcile() } catch (error) { reconcileError = sanitizeMessage(error?.message || '对账失败') }
     const directive = promptDirective.model === model ? promptDirective : null
     let pregen
     if (typeof gameId === 'string' && gameId) {
@@ -1912,11 +1928,16 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
         pregen = { ...publicPregenState(normalizePregenState(undefined, gameId)), lastError: sanitizeMessage(error.message) }
       }
     }
+    const jobs = clientJobs(await store.list())
+    const badTasks = store.badTasks || []
     return { configured, baseURL, allowPrivateLan, generationMode, autoInsert, alwaysSendPrompt, videosPerTurn, streamPreclaim,
       markerPipeline: promptDirective.pipeline === true,
       applyDefaults: applyDefaultsPref, bindToTurn: bindToTurnPref,
       workflowSettings: true,
-      adapter: 'gateway', model, defaultModel, jobs: clientJobs(await store.list()), workflows,
+      adapter: 'gateway', model, defaultModel, jobs, workflows,
+      ...(badTasks.length ? { storeWarning: `跳过 ${badTasks.length} 个读不出来的任务记录：${badTasks.slice(0, 3).join('、')}${badTasks.length > 3 ? ' 等' : ''}` } : {}),
+      ...(engineError ? { engineError } : {}),
+      ...(reconcileError ? { reconcileError } : {}),
       ...(pregen ? { pregen } : {}),
       ...(lastMarkerError ? { markerError: lastMarkerError } : {}),
       ...(lastMarkerWarning ? { markerWarning: lastMarkerWarning } : {}),
@@ -2018,6 +2039,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     return {
       baseURL, allowPrivateLan, configuredKey, generationMode,
       node: process.version, platform: process.platform, arch: process.arch,
+      engineError: engineError || '', badTasks: (store.badTasks || []).slice(0, 20),
       dataDirectory: directory, markerRegex: markerRegexState.ok ? 'ok' : (markerRegexState.reason || 'pending'),
       engine: engine ? 'ready' : 'idle', workflows: workflows.length, workflowError,
       serialPending, configPending,
@@ -2141,7 +2163,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
         try { clean = validateInput(replay, description) }
         catch (error) { throw fail('原任务参数已不适用于当前工作流：' + sanitizeMessage(error.message)) }
         const binding = await bindingOf({ bindToTurn: input.bindToTurn, gameId: input.gameId })
-        const job = await active.engine.submit(clean, { binding, requestId: input.requestId })
+        const job = await requireEngine().submit(clean, { binding, requestId: input.requestId })
         try { await replays.save(job.id, clean); job.replayable = true } catch { /* 任务已提交，快照失败只影响下次重放 */ }
         return job
       }
@@ -2253,7 +2275,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
       }
       if (input.action === 'retry-download') {
         keys(input, ['action', 'id'])
-        return active.engine.retryDownload(input.id)
+        return requireEngine().retryDownload(input.id)
       }
       throw fail('未知 RunningHub 操作')
     })
@@ -2349,7 +2371,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     const job = await serial(async () => {
       const raced = (await store.list()).find(item => item.requestId === input.requestId)
       if (raced) return { ...raced, ...(replays.has(raced.id) ? { replayable: true } : {}) }
-      return active.engine.submit(clean, { binding, requestId: input.requestId,
+      return requireEngine().submit(clean, { binding, requestId: input.requestId,
         ...(shotFingerprintValue ? { fingerprint: shotFingerprintValue } : {}),
         ...(shotGameId ? { markerGameId: shotGameId } : {}) })
     })

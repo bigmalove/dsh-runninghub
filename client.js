@@ -1170,7 +1170,9 @@ window.__ModuleLoader__.load({
               pregen: data.pregen || null,
               markerError: data.markerError || '', markerWarning: data.markerWarning || '',
               markerRegexError: data.markerRegexError || '',
-              gatewayError: data.gatewayError || '', settingsError: data.settingsError || '' })
+              gatewayError: data.gatewayError || '', settingsError: data.settingsError || '',
+              engineError: data.engineError || '', storeWarning: data.storeWarning || '',
+              reconcileError: data.reconcileError || '' })
             // 宿主状态刚到：之前因为拿不到状态而卡住的设置改动，现在可以落地。
             if (settingsDirtyRef.current) scheduleAutoSave(0)
             if (!prefsLoaded.current) {
@@ -2752,6 +2754,9 @@ window.__ModuleLoader__.load({
                 'aria-selected': view === 'history', className: 'rh-tab', onClick: () => setView('history') }, icon('grid', 14), '任务历史', h('span', { className: 'rh-count' }, jobs.length))),
             h('div', { className: 'rh-context' }, icon('link', 12), gameId ? '已关联当前对话' : '独立创作')),
           alert(refreshError), alert(summary?.gatewayError), alert(summary?.settingsError ? '客户端默认模型读取失败：' + summary.settingsError : ''),
+          alert(summary?.engineError ? '任务引擎没启动：' + summary.engineError + '（工作流仍可读取，提交/重下会失败）' : ''),
+          alert(summary?.storeWarning || ''),
+          alert(summary?.reconcileError ? '正文对账失败：' + summary.reconcileError : ''),
           alert(summary?.autoInsert === true && summary?.alwaysSendPrompt === false
             ? '自动插入已开启，但「总是发送提示词模板」关闭：模型不会收到生成说明，工具生成会被拒绝。' : ''),
           alert(summary?.generationMode === 'marker' && summary?.alwaysSendPrompt === false
