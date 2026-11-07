@@ -2528,6 +2528,34 @@ describe('正文对账增量执行', () => {
     assert.equal(calls.list, 0, '摘要不该再跑对账')
   })
 
+  test('未绑定正文的历史任务不占批次，新任务第一轮就能落位', async () => {
+    const { tavern, calls } = tavernWithCounter()
+    const { host } = await makeHost({ tavernImpl: tavern, extraOptions: { reconcileMs: 0, reconcileBatch: 1 } })
+    const base = {
+      status: 'ready', model: 'wf', updatedAt: '2026-01-01T00:00:00.000Z',
+      outputs: [], attachments: [], completedOutputs: [],
+    }
+    await host.store.write({
+      ...base, id: '00000000-0000-4000-8000-000000000600', requestId: 'unresolved-oldest',
+      createdAt: '2025-12-31T00:00:00.000Z', binding: { gameId: 'g-old', pending: true, afterTurn: 0 },
+      attachments: [{ kind: 'image', name: 'old.png', attachment: { attachmentId: 'att-old', mediaType: 'image/png', bytes: 10 }, url: '/m' }],
+    })
+    for (let index = 0; index < 3; index++) await host.store.write({
+      ...base, id: `00000000-0000-4000-8000-00000000060${index + 1}`,
+      requestId: `unbound-${index}`, createdAt: `2026-01-0${index + 1}T00:00:00.000Z`, binding: {},
+    })
+    await host.store.write({
+      ...base, id: '00000000-0000-4000-8000-000000000604', requestId: 'bound-newest',
+      createdAt: '2026-01-04T00:00:00.000Z', binding: { gameId: 'g1', turn: 3, textVersion: 'v1' },
+      outputs: [{ kind: 'image', url: '/files/x.png' }],
+      attachments: [{ kind: 'image', name: 'x.png', attachment: { attachmentId: 'att-new', mediaType: 'image/png', bytes: 10 }, url: '/m' }],
+    })
+
+    await host.reconcile()
+    assert.equal(calls.attach, 1, '未绑定任务不能把新任务挤出每一轮对账批次')
+    assert.equal(calls.list, 1, '第一批只应读取新任务的正文媒体列表')
+  })
+
   test('对账只处理需要挂载的任务：第二次运行不再重复调用宿主', async () => {
     const { tavern, calls } = tavernWithCounter()
     const { host } = await makeHost({ tavernImpl: tavern, extraOptions: { reconcileMs: 0 } })

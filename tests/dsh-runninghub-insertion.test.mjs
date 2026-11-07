@@ -89,6 +89,50 @@ test('自动插入：默认关闭、严格布尔校验、持久化且不写Key',
   assert.equal((await restored.dispatch({ action: 'list' })).autoInsert, true)
 })
 
+test('自动插入：正文版本尚未解析时不把终态媒体误记为已对账', async t => {
+  const f = await setup(t)
+  const id = '00000000-0000-4000-8000-000000000776'
+  await f.host.store.write({
+    id, requestId: 'pending-generation-resolution', status: 'ready', model: 'h3参考',
+    createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+    binding: { gameId: 'game-1', generationId },
+    outputs: [], completedOutputs: [],
+    attachments: [{ kind: 'video', name: 'clip.mp4', mediaType: 'video/mp4',
+      attachment: { attachmentId: 'pending-video', name: 'clip.mp4', bytes: 10 } }],
+  })
+
+  await f.host.reconcile()
+  assert.equal(f.items.length, 0, '正文还没写完时不应落位')
+
+  f.setResolved(binding)
+  await f.host.reconcile()
+  assert.equal(f.items.length, 1, '正文版本解析后必须重试并挂入媒体')
+  assert.equal(f.items[0].kind, 'video')
+  assert.equal(f.items[0].attachment.attachmentId, 'pending-video')
+})
+
+test('自动插入：正文版本键变化后，定位句仍在时迁移到当前版本', async t => {
+  const f = await setup(t, { turnState: { turn: 5, textVersion: 'v2', settled: true, busy: false } })
+  const id = '00000000-0000-4000-8000-000000000775'
+  await writeFile(path.join(f.directory, 'bindings', id + '.json'), JSON.stringify({
+    gameId: 'game-1', turn: 5, textVersion: 'v1', anchor: '正文',
+  }))
+  await f.host.store.write({
+    id, requestId: 'current-version-binding', status: 'ready', model: 'h3参考',
+    createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+    binding: { gameId: 'game-1', turn: 5, textVersion: 'v1', pending: true, anchor: '正文' },
+    outputs: [], completedOutputs: [],
+    attachments: [{ kind: 'image', name: 'current.png', mediaType: 'image/png',
+      attachment: { attachmentId: 'current-image', mediaType: 'image/webp', width: 1, height: 1, bytes: 10 } }],
+  })
+
+  await f.host.reconcile()
+  assert.equal(f.items.length, 1)
+  assert.equal(f.items[0].textVersion, 'v2', '媒体必须挂到 Tavern 当前实际显示的版本')
+  const saved = JSON.parse(await readFile(path.join(f.directory, 'bindings', id + '.json'), 'utf8'))
+  assert.equal(saved.textVersion, 'v2', '后续重试与重启都应沿用已刷新的版本')
+})
+
 test('自动插入：旧任务的附件缺少字节数时补上真实大小，并修复已经挂到正文的空播放器', async t => {
   const f = await setup(t)
   const id = '00000000-0000-4000-8000-000000000777'

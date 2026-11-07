@@ -38,7 +38,7 @@ import {
 export const name = 'dsh-runninghub'
 export const inject = ['tavern', 'attachments', 'credentials', 'webServer']
 // 面板上要能一眼看出「手机上跑的是哪一版」：宿主与网页各自上报，对不上就是没更新全。
-export const PLUGIN_VERSION = '0.1.32'
+export const PLUGIN_VERSION = '0.1.33'
 export const API = '/api/dsh-runninghub'
 export const MEDIA = API + '/media'
 export const REFERENCE = API + '/reference'
@@ -279,8 +279,28 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     // would put the video under the wrong text.
     if (!job.binding?.generationId && !job.binding?.pending) return job.binding
     const file = path.join(linksDirectory, job.id + '.json')
-    try { return JSON.parse(await readFile(file, 'utf8')) }
+    let saved
+    try { saved = JSON.parse(await readFile(file, 'utf8')) }
     catch (error) { if (error.code !== 'ENOENT') throw error }
+    if (saved?.gameId) {
+      const anchor = saved.anchor || job.binding.anchor || ''
+      // 补记、滑动或投影重建可能改变 currentKey。只有原定位句仍逐字存在时才迁移，
+      // 改写后找不到原句的媒体继续留在旧版本，避免挂到不相关正文上。
+      if (anchor && typeof ctx.tavern.getTurn === 'function') {
+        try {
+          const current = await ctx.tavern.getTurn({ gameId: saved.gameId, turn: saved.turn })
+          const text = typeof current?.text === 'string' ? current.text : ''
+          const rawText = typeof current?.rawText === 'string' ? current.rawText : ''
+          if (typeof current?.textVersion === 'string' && current.textVersion
+            && current.textVersion !== saved.textVersion && (text.includes(anchor) || rawText.includes(anchor))) {
+            const refreshed = { ...saved, textVersion: current.textVersion }
+            await atomicJSON(file, refreshed)
+            return refreshed
+          }
+        } catch { /* 当前版本读取失败时沿用已保存的精确绑定 */ }
+      }
+      return saved
+    }
     if (job.binding.pending && !job.binding.generationId) return null
     if (typeof ctx.tavern.resolveGeneration !== 'function') return null
     const generationKey = JSON.stringify([job.binding.gameId, job.binding.generationId])
@@ -320,10 +340,11 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     } catch { return attachment }
   }
   async function insert(job, media, outputIndex = 0, resolutions) {
-    // 流式预提交但这一轮没有对应块的镜头：不在正文里挂任何东西。
-    if (droppedPreclaims.has(job.id)) return
+    // 流式预提交但这一轮没有对应块的镜头：不在正文里挂任何东西，也不需要再对账。
+    if (droppedPreclaims.has(job.id)) return true
     const binding = await resolvedBinding(job, resolutions)
-    if (!binding?.gameId) return
+    // 正文还没结算时只是暂时无法落位，不能让上层把它缓存成「已对账」。
+    if (!binding?.gameId) return false
     const items = await ctx.tavern.list({ gameId: binding.gameId, turn: binding.turn })
     const existing = items.find(item => item.textVersion === binding.textVersion && item.data?.runninghubJob === job.id && item.data?.outputIndex === outputIndex)
     const failed = ['failed', 'submit_unknown', 'download_failed'].includes(job.status)
@@ -339,6 +360,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
         || (attachment && previous?.attachmentId !== attachment.attachmentId)
         || sizeChanged) await ctx.tavern.update(existing.id, changes)
     } else await ctx.tavern.attach({ ...binding, item: { ...changes, data: { runninghubJob: job.id, outputIndex } } })
+    return true
   }
   /**
    * 先图片后视频的管线（首帧、四宫格故事板等）会返回中间图和成片两段产物。
@@ -362,9 +384,16 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     }
   }
   async function reconcileJob(job, resolutions) {
-    if (!job.binding?.gameId || disposed) return
+    if (!job.binding?.gameId || disposed) return { complete: false, attempted: false }
     return bindingSerial(job, async () => {
       try {
+        let complete = true
+        let attempted = false
+        const place = async (media, outputIndex) => {
+          const inserted = await insert(job, media, outputIndex, resolutions)
+          if (inserted) attempted = true
+          else complete = false
+        }
         const attachments = Array.isArray(job.attachments) ? job.attachments : []
         const videos = attachments.map((media, index) => ({ media, index }))
           .filter(entry => entry.media?.kind === 'video')
@@ -374,15 +403,19 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
         const failedFinal = ['failed', 'download_failed', 'submit_unknown'].includes(job.status)
         if (videos.length) {
           // 先确保成片挂上，再清中间图：视频落位失败时至少不会把已经存在的图删掉。
-          for (const entry of videos) await insert(job, entry.media, entry.index, resolutions)
+          for (const entry of videos) await place(entry.media, entry.index)
           await removeIntermediateItems(job, new Set(videos.map(entry => entry.index)), resolutions)
         } else if (attachments.length && !(expectsVideo && !failedFinal)) {
-          for (let index = 0; index < attachments.length; index++) await insert(job, attachments[index], index, resolutions)
+          for (let index = 0; index < attachments.length; index++) await place(attachments[index], index)
         } else if (job.binding.generationId || job.binding.pending) {
-          await insert(job, undefined, 0, resolutions)
+          await place(undefined, 0)
         }
         insertionErrors.delete(job.id)
-      } catch (error) { insertionErrors.set(job.id, sanitizeMessage(error.message)) }
+        return { complete, attempted }
+      } catch (error) {
+        insertionErrors.set(job.id, sanitizeMessage(error.message))
+        return { complete: false, attempted: true }
+      }
     })
   }
   let reconcileQueue = Promise.resolve()
@@ -401,15 +434,23 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
       if (disposed) return
       // Submission order, not download completion order, establishes media order.
       const resolutions = new Map()
-      const jobs = (await store.list()).reverse()
+      // 未绑定正文的任务没有落位工作，不能反复占满批次、饿死后面的新媒体。
+      const jobs = (await store.list()).reverse().filter(job => job.binding?.gameId)
       let budget = RECONCILE_BATCH
       for (const job of jobs) {
         if (job.binding?.gameId && !insertionErrors.has(job.id) && !ACTIVE.has(job.status)
           && reconciled.get(job.id) === reconcileSignature(job)) continue
         if (budget <= 0) break
-        budget -= 1
-        try { await reconcileJob(job, resolutions) } catch (error) { lastReconcileError = sanitizeMessage(error?.message || '对账失败') }
-        if (!insertionErrors.has(job.id) && !ACTIVE.has(job.status)) reconciled.set(job.id, reconcileSignature(job))
+        let result = { complete: false, attempted: false }
+        try { result = await reconcileJob(job, resolutions) }
+        catch (error) { lastReconcileError = sanitizeMessage(error?.message || '对账失败') }
+        // 等待正文版本时不做宿主读写，也不占批次，避免旧等待项挡住后面的新媒体。
+        if (result.attempted) budget -= 1
+        // 只有媒体确实已落位（或明确无需落位）才缓存；正文版本尚未解析时留到下一轮。
+        if (!insertionErrors.has(job.id) && !ACTIVE.has(job.status)) {
+          if (result.complete) reconciled.set(job.id, reconcileSignature(job))
+          else reconciled.delete(job.id)
+        }
       }
       if (!insertionErrors.size) lastReconcileError = ''
     })
