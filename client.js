@@ -16,7 +16,7 @@ window.__ModuleLoader__.load({
     let tavernUiApi = null
     const own = (object, key) => Object.prototype.hasOwnProperty.call(object || {}, key)
     // 与 index.mjs 的 PLUGIN_VERSION 对齐；对不上说明宿主侧还是旧代码（测试里有断言）。
-    const CLIENT_VERSION = '0.1.33'
+    const CLIENT_VERSION = '0.1.34'
     const message = error => typeof error === 'string' ? error : error?.message || '未知错误'
     // 探测结果的统一说法：保存和「检查连接」共用，不把原始错误当成成功。
     // 一键复制：手机上很多 WebView/非安全上下文没有 navigator.clipboard，退回 execCommand。
@@ -320,6 +320,31 @@ window.__ModuleLoader__.load({
 .rh-combo-option:hover{background:var(--rh-brand-soft);color:var(--rh-brand)}
 .rh-combo-option[aria-selected="true"]{background:var(--rh-brand-soft);color:var(--rh-brand);font-weight:650}
 `
+    // 正文里的成片宽度。Tavern 的 .dsh-tavern-illustration 是 flex 列容器 + align-items:flex-start，
+    // 图片又被压了 max-width:min(100%,640px) 和 max-height:70vh(70svh)：手机上这两道限制叠在一起，
+    // 图会被缩成缩略图大小。这里只针对本插件附加的媒体（data-owner 前缀）把容器改成块级、宽度交给
+    // 正文列宽，并去掉按视口高度收的那一道——只影响 RunningHub 自己的图，不碰别人的插图。
+    const CHAT_MEDIA_STYLE_ID = 'dsh-runninghub/chat-media.css'
+    const chatMediaCss = `
+.dsh-tavern-plugin-media[data-owner*="runninghub" i]{display:block;width:auto;max-width:100%;margin:10px 0}
+.dsh-tavern-plugin-media[data-owner*="runninghub" i]>a{display:block;width:100%;max-width:100%}
+.dsh-tavern-plugin-media[data-owner*="runninghub" i] img{display:block;width:100%;height:auto;max-width:100%;max-height:none;object-fit:contain;border-radius:12px}
+.dsh-tavern-plugin-media[data-owner*="runninghub" i] video{display:block;width:100%;max-width:100%;max-height:none;border-radius:12px}
+.dsh-tavern-plugin-media[data-owner*="runninghub" i] figcaption{display:block;margin-top:8px;font-size:12px;color:var(--dsw-alias-label-secondary)}
+`
+    // 只装一次；样式挂在 head 上，正文重渲染不需要重新注入。
+    function installChatMediaCss() {
+      if (typeof document === 'undefined' || !document.head) return
+      const selector = 'style[data-plugin-css="' + CHAT_MEDIA_STYLE_ID + '"]'
+      let style = document.head.querySelector(selector)
+      if (!style) {
+        style = document.createElement('style')
+        style.dataset.plugin = 'dsh-runninghub'
+        style.dataset.pluginCss = CHAT_MEDIA_STYLE_ID
+        document.head.appendChild(style)
+      }
+      if (style.textContent !== chatMediaCss) style.textContent = chatMediaCss
+    }
     const paths = {
       settings: ['M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8', 'm19.4 15 .1.1 1.4 1.1-1.4 2.4-1.7-.7a8 8 0 0 1-2.2 1.3l-.3 1.8h-2.8l-.3-1.8a8 8 0 0 1-2.2-1.3l-1.7.7L6.9 16l1.4-1.1a8 8 0 0 1 0-2.6L6.9 11l1.4-2.4 1.7.7a8 8 0 0 1 2.2-1.3l.3-1.8h2.8l.3 1.8a8 8 0 0 1 2.2 1.3l1.7-.7 1.4 2.4-1.4 1.1a8 8 0 0 1 0 2.9'],
       create: ['m15 4 5 5M4 20l4-1 12-12a2.1 2.1 0 0 0-3-3L5 16l-1 4'],
@@ -3084,6 +3109,8 @@ window.__ModuleLoader__.load({
       apply(ctx) {
         // 停靠区要用 watchReply 读正在生成的正文（流式预提交）。
         tavernUiApi = ctx.tavernUi || null
+        // 正文成片按列宽铺满（覆盖 Tavern 的 640px / 70vh 双上限）。
+        try { installChatMediaCss() } catch (error) { console.warn('[dsh-runninghub] 正文媒体样式注入失败', error) }
         // 正文标记（非工具调用模式）：生成过程中先把整块提示词藏成一个镜头占位，
         // 避免提示词在正文里闪一下；插件会把它写进 Tavern 正则库，结算后从正文显示和提示词里移除。
         if (typeof ctx.tavernUi.registerTextMarker === 'function') {
