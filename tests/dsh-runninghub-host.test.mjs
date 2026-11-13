@@ -2046,6 +2046,81 @@ describe('正文标记（非工具调用模式）', () => {
     assert.equal(summary.markerError, undefined, '已提交成功时不应再报处理失败')
   })
 
+  test('rawText 为空、只有投影后的 text 带标记块时，本轮镜头照常提交', async () => {
+    const rawText = [
+      '林岚推开门，雨水顺着伞沿落下。',
+      '',
+      '[[RH:SHOT]]',
+      '@after',
+      '林岚推开门，雨水顺着伞沿落下。',
+      '@caption',
+      '雨夜入门',
+      '@prompt',
+      '电影感写实照片，林岚站在雨夜的门口。',
+      '[[/RH:SHOT]]',
+    ].join('\n')
+    let submitted = null
+    const gateway = makeGatewayFetch({ kind: 'video', workflows: [{ alias: 'demo', customFields: [], referenceSlots: [], capabilities: {} }],
+      settings: { defaultModel: 'demo' }, portDirectiveText: '【模板】\n写一个写实镜头。',
+      onGenerations: (_url, opts) => { submitted = JSON.parse(opts.body) } })
+    const fake = markerTavern({ rawText })
+    const { host } = await makeHost({ configured: true, gateway, tavernImpl: fake.tavern })
+    await host.dispatch({ action: 'preferences', generationMode: 'marker', autoInsert: true, videosPerTurn: 1 })
+    await host.dispatch({ action: 'select-model', model: 'demo' })
+    // submit_story / 重新生成本轮：宿主给出 rawText 为空、正文只在 text 里的结算载荷。
+    await host.handleTurn({ gameId: 'game-marker', turn: 5, textVersion: 'v1', rawText: '', text: rawText })
+    const start = Date.now()
+    while (Date.now() - start < 3000) {
+      if ((await host.store.list()).length) break
+      await new Promise(r => setTimeout(r, 10))
+    }
+    const job = (await host.store.list())[0]
+    assert.ok(job, '正文只在 text 里时也要提交')
+    assert.equal(job.binding.caption, '雨夜入门')
+    await waitForJob(host, job.id, value => Boolean(value.remoteTaskId))
+    assert.equal(submitted.prompt, '电影感写实照片，林岚站在雨夜的门口。')
+    const summary = await host.dispatch({ action: 'list' })
+    assert.equal(summary.markerSkip, undefined, '提交成功后不该报「没有标记块」')
+  })
+
+  test('投影没跑到（text 里仍有标记块）时，把清理后的正文写回对话', async () => {
+    const rawText = [
+      '[[RH:SHOT]]',
+      '@after',
+      '林岚推开门，雨水顺着伞沿落下。',
+      '@prompt',
+      '电影感写实照片，林岚站在雨夜的门口。',
+      '[[/RH:SHOT]]',
+      '',
+      '林岚推开门，雨水顺着伞沿落下。',
+    ].join('\n')
+    const gateway = makeGatewayFetch({ workflows: [{ alias: 'demo', customFields: [], referenceSlots: [], capabilities: {} }],
+      settings: { defaultModel: 'demo' }, portDirectiveText: '【模板】' })
+    const fake = markerTavern({ rawText })
+    const edits = []
+    fake.tavern.editTurn = async input => { edits.push(input) }
+    const { host } = await makeHost({ configured: true, gateway, tavernImpl: fake.tavern })
+    await host.dispatch({ action: 'preferences', generationMode: 'marker', autoInsert: true, videosPerTurn: 1 })
+    await host.dispatch({ action: 'select-model', model: 'demo' })
+    // 重新生成本轮的实测签名：value.text 里标记块还在，说明正则投影没有生效。
+    await host.handleTurn({ gameId: 'game-marker', turn: 5, textVersion: 'v1', rawText, text: rawText })
+    const start = Date.now()
+    while (Date.now() - start < 3000) {
+      if (edits.length) break
+      await new Promise(r => setTimeout(r, 10))
+    }
+    assert.equal(edits.length, 1, '投影失效时要写回一次')
+    assert.equal(edits[0].textVersion, 'v1')
+    assert.equal(edits[0].text.includes('RH:SHOT'), false, '写回的正文里不能留标记块')
+    assert.match(edits[0].text, /林岚推开门，雨水顺着伞沿落下。/, '正文本身要保留')
+
+    // 投影正常的轮次一个字节都不碰。
+    const clean = '林岚推开门，雨水顺着伞沿落下。'
+    await host.handleTurn({ gameId: 'game-marker', turn: 6, textVersion: 'v2', rawText, text: clean })
+    await new Promise(r => setTimeout(r, 30))
+    assert.equal(edits.length, 1, '投影已把块吃掉时不要再写回正文')
+  })
+
   test('两段式管线：@image + @video 分别落到 custom.image_prompt 与 prompt', async () => {
     const rawText = [
       '她走进门。',

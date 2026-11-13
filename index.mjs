@@ -38,7 +38,7 @@ import {
 export const name = 'dsh-runninghub'
 export const inject = ['tavern', 'attachments', 'credentials', 'webServer']
 // 面板上要能一眼看出「手机上跑的是哪一版」：宿主与网页各自上报，对不上就是没更新全。
-export const PLUGIN_VERSION = '0.1.34'
+export const PLUGIN_VERSION = '0.1.35'
 export const API = '/api/dsh-runninghub'
 export const MEDIA = API + '/media'
 export const REFERENCE = API + '/reference'
@@ -216,6 +216,9 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
   const droppedPreclaims = new Set()
   let lastMarkerError = ''
   let lastMarkerWarning = ''
+  // 这一轮为什么没提交镜头（面板上直接显示，省得只看到「没反应」）。
+  let lastMarkerSkip = ''
+  const markerScrubTimers = new Map()
   let queue = Promise.resolve()
   const serial = operation => {
     serialPending += 1
@@ -1763,13 +1766,52 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     return dropped
   }
 
+  /**
+   * 投影兜底：某些路径（重新生成本轮、正文走 submit_story 折回原文）Tavern 没把正文
+   * 过一遍正则投影，标记块会原样留在对话里，玩家直接看到整段提示词。这里只在
+   * 「解析成功、而且投影后的正文里仍然看得到标记块」时，把去掉标记块的正文写回去；
+   * 投影正常时一个字节都不碰。放进定时器是因为 editTurn 会再触发一次 onTurnSettled，
+   * 不能在本次结算调用栈里同步嵌套。
+   */
+  function scheduleMarkerScrub(binding, value, parsed) {
+    if (typeof ctx.tavern.editTurn !== 'function') return
+    const cleaned = String(parsed.text ?? '')
+    if (!parsed.found || !cleaned.trim() || hasMarkerBlock(cleaned)) return
+    // 只认「投影后仍然带块」这一种签名：value.text 不是字符串时无法判断，不动正文。
+    if (typeof value.text !== 'string' || !hasMarkerBlock(value.text)) return
+    const key = String(binding.gameId) + '\u0000' + String(binding.turn)
+    if (markerScrubTimers.has(key)) return
+    const timer = setTimeout(() => {
+      markerScrubTimers.delete(key)
+      if (disposed) return
+      Promise.resolve()
+        .then(() => ctx.tavern.editTurn({ gameId: binding.gameId, turn: binding.turn, textVersion: binding.textVersion, text: cleaned }))
+        .then(() => { lastMarkerSkip = '' })
+        .catch(error => { lastMarkerWarning = '正文标记没能从对话里移除：' + sanitizeMessage(error?.message || error || '未知原因') })
+    }, 0)
+    timer.unref?.()
+    markerScrubTimers.set(key, timer)
+  }
+
   async function processMarkerTurn(value = {}) {
     if (generationMode !== 'marker' || !autoInsert || !alwaysSendPrompt) return null
     if (typeof ctx.tavern.attach !== 'function') return null
-    if (!value || typeof value.rawText !== 'string' || !hasMarkerBlock(value.rawText)) return null
-    if (typeof value.gameId !== 'string' || !value.gameId) return null
-    if (!Number.isInteger(value.turn) || value.turn < 1) return null
-    if (typeof value.textVersion !== 'string' || !value.textVersion) return null
+    if (!value) return null
+    // 正文来源不只 rawText：宿主在「正文走工具调用（submit_story）」和「重新生成本轮」
+    // 两条路径上都出现过 rawText 为空、只有投影后的 text 的结算载荷。两处都扫一遍，
+    // 有标记块的那份才是这一轮的正文。
+    const sourceText = typeof value.rawText === 'string' && hasMarkerBlock(value.rawText)
+      ? value.rawText
+      : (typeof value.text === 'string' && hasMarkerBlock(value.text) ? value.text : '')
+    if (!sourceText) {
+      lastMarkerSkip = typeof value.rawText === 'string' || typeof value.text === 'string'
+        ? '这一轮正文里没有 [[RH:SHOT]] 标记块，本轮不提交镜头'
+        : '结算载荷里没有正文，本轮不提交镜头'
+      return null
+    }
+    if (typeof value.gameId !== 'string' || !value.gameId) { lastMarkerSkip = '结算载荷缺对话 ID'; return null }
+    if (!Number.isInteger(value.turn) || value.turn < 1) { lastMarkerSkip = '结算载荷缺轮次编号'; return null }
+    if (typeof value.textVersion !== 'string' || !value.textVersion) { lastMarkerSkip = '结算载荷缺正文版本号'; return null }
     const key = value.gameId + '\u0000' + value.turn + '\u0000' + value.textVersion
     if (markerRuns.has(key)) return markerRuns.get(key)
     const run = (async () => {
@@ -1779,12 +1821,14 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
       // 模板没加载时按块里是否同时出现 @image / @video 猜管线，交给网关描述再最终校验。
       const directiveReady = promptDirective.model === model && Boolean(directiveFor('marker'))
       const pipeline = promptDirective.pipeline === true
-        || (!directiveReady && /^[ \t]*@image\b/im.test(value.rawText) && /^[ \t]*@video\b/im.test(value.rawText))
-      const parsed = parseMarkerShots(value.rawText, { pipeline, limit: videosPerTurn })
+        || (!directiveReady && /^[ \t]*@image\b/im.test(sourceText) && /^[ \t]*@video\b/im.test(sourceText))
+      const parsed = parseMarkerShots(sourceText, { pipeline, limit: videosPerTurn })
       if (!parsed.found) return null
       if (!parsed.text.trim()) throw fail('正文标记块之外没有正文，本轮镜头不提交')
-      // 不再 editTurn：标记块由 Tavern 正则库在投影阶段整段移除。正则在
-      // displayText 里隐藏提示词，也在下一轮的提示词投影里移除；跨 HTML 块也能匹配。
+      // 正常路径不改正文：标记块由 Tavern 正则库在投影阶段整段移除（displayText 与
+      // 下一轮的 prompt 投影都过一遍）。但「重新生成本轮」和「正文走 submit_story」
+      // 两条路径出现过投影没跑到的情况，标记块会原样留在对话里，玩家看到整段提示词；
+      // 那种情况下由 scheduleMarkerScrub 兜底把清理后的正文写回去。
       const bindingBase = { gameId: value.gameId, turn: value.turn, textVersion: value.textVersion }
       // 模板和网关都不可用也要把失败原因落下来，不能悄悄吞掉这几个镜头。
       let active = null
@@ -1880,6 +1924,8 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
       // 预提交过、但这一轮没有这个块（模型重写/回退）：不挂到正文上，只留在历史里。
       await dropStalePreclaims({ gameId: value.gameId, claimed }).catch(() => {})
       lastMarkerError = ''
+      // 投影失效时对话里仍然能看到整段提示词：把解析后的正文写回去。
+      scheduleMarkerScrub({ gameId: value.gameId, turn: value.turn, textVersion: value.textVersion }, value, parsed)
       lastMarkerWarning = markerRegexState.ok
         ? ''
         : '正文标记正则没有写入 Tavern 正则库，提示词可能仍会出现在正文和后续提示词里：' + (markerRegexState.reason || '未知原因')
@@ -2040,6 +2086,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
       ...(pregen ? { pregen } : {}),
       ...(lastMarkerError ? { markerError: lastMarkerError } : {}),
       ...(lastMarkerWarning ? { markerWarning: lastMarkerWarning } : {}),
+      ...(lastMarkerSkip ? { markerSkip: lastMarkerSkip } : {}),
       ...(markerRegexState.ok ? {} : { markerRegexError: markerRegexState.reason || '正则库同步失败' }),
       ...(directive ? { templateMode: directive.mode, ...(directive.error ? { templateError: directive.error } : {}) } : {}),
       ...(workflowError ? { gatewayError: workflowError } : {}), ...(settingsError ? { settingsError } : {}) }
@@ -2228,6 +2275,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
         // 正文标记模式不向模型开放生成工具；切回工具调用时再注册回来。
         lastMarkerError = ''
         lastMarkerWarning = ''
+        lastMarkerSkip = ''
         try { toolSync() } catch { /* 工具注册失败不阻断设置保存 */ }
         return next
       }
