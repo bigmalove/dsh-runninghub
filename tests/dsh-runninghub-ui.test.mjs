@@ -1279,6 +1279,9 @@ test('RunningHub 重设计界面：jsdom + React DOM 隔离交互', {
       assert.equal(dockHost.querySelector('.rh-dock').getAttribute('data-open'), 'true', '点小点展开详情')
       await taps(dockHost.querySelector('.rh-dock-dot'))
       assert.equal(dockHost.querySelector('.rh-dock').getAttribute('data-open'), null, '再点一下收起')
+      // 不占位：容器高度 0；气泡默认 display:none，点开才变 block。
+      assert.equal(window.getComputedStyle(dock).height, '0px', '停靠容器零高度，不给正文让位')
+      assert.equal(window.getComputedStyle(dock.querySelector('.rh-dock-pop')).display, 'none', '气泡默认收起')
 
       // 全部就绪：停靠区亮一下结果，随后自己收起。
       state.jobs = state.jobs.map(job => ({ ...job, status: 'ready', attachments: [video] }))

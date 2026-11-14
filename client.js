@@ -604,19 +604,22 @@ window.__ModuleLoader__.load({
       return { active: active.length, ready, failed, stages }
     }
 
-    // 停靠区只做「最小化的小点」：容器高度 0，不占正文/输入框之间的任何一行；
-    // 小点和详情气泡都是绝对定位，压在输入框右上角，正文空间一点不缩。
-    // 想看细节时悬停或点击小点，气泡向上弹出（手机上点一下也能看）。
+    // 停靠区只做「最小化的小点」：容器高度 0，不占正文/输入框之间的任何一行。
+    // 注意 Tavern 的停靠槽是 .dsh-tavern-composer-slot（flex column + overflow-y:auto），
+    // 绝对定位溢出到槽外会直接被裁掉，所以小点和详情气泡都走 position:fixed，
+    // 位置按容器自己的 getBoundingClientRect 现量（输入框高度会随正文行数变），
+    // 既不占位、也不会被槽的滚动裁剪。
     const dockCSS = `
-.rh-dock{position:relative;display:flex;justify-content:flex-end;align-items:flex-end;height:0;margin:0;padding:0;pointer-events:none;z-index:30;color:var(--dsw-alias-label-secondary,#667085);font:12px/1.5 Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
-.rh-dock-dot{pointer-events:auto;position:absolute;right:3px;bottom:7px;width:9px;height:9px;padding:0;border:0;border-radius:50%;background:#175cd3;cursor:pointer;-webkit-tap-highlight-color:transparent;animation:rh-dock-pulse 1.8s ease-out infinite}
+.rh-dock{position:relative;width:100%;height:0;margin:0;padding:0;pointer-events:none;z-index:40;color:var(--dsw-alias-label-secondary,#667085);font:12px/1.5 Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+.rh-dock-sr{position:absolute;width:1px;height:1px;margin:-1px;padding:0;border:0;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+.rh-dock-dot{pointer-events:auto;position:fixed;box-sizing:border-box;width:9px;height:9px;padding:0;border:0;border-radius:50%;background:#175cd3;cursor:pointer;-webkit-tap-highlight-color:transparent;animation:rh-dock-pulse 1.8s ease-out infinite}
 .rh-dock-dot:focus-visible{outline:2px solid #175cd3;outline-offset:3px}
 .rh-dock[data-state="done"] .rh-dock-dot{background:#087a55;animation:none}
 .rh-dock[data-state="failed"] .rh-dock-dot{background:#b42318;animation:none}
-.rh-dock-pop{pointer-events:auto;position:absolute;right:0;bottom:calc(100% + 16px);display:none;box-sizing:border-box;width:max-content;min-width:150px;max-width:min(280px,70vw);padding:8px 11px;border:1px solid var(--dsw-alias-border-l2,rgba(127,127,127,.28));border-radius:10px;background:var(--dsw-alias-bg-layer-2,var(--dsw-alias-bg-layer-1,#fff));box-shadow:0 8px 24px rgba(16,24,40,.16);text-align:left}
-.rh-dock:hover .rh-dock-pop,.rh-dock:focus-within .rh-dock-pop,.rh-dock[data-open="true"] .rh-dock-pop{display:block}
+.rh-dock-pop{pointer-events:auto;position:fixed;display:none;box-sizing:border-box;width:max-content;min-width:150px;max-width:min(340px,82vw);padding:8px 11px;border:1px solid var(--dsw-alias-border-l2,rgba(127,127,127,.28));border-radius:10px;background:var(--dsw-alias-bg-layer-2,var(--dsw-alias-bg-layer-1,#fff));box-shadow:0 8px 24px rgba(16,24,40,.16);text-align:left}
+.rh-dock[data-open="true"] .rh-dock-pop,.rh-dock:focus-within .rh-dock-pop{display:block}
 .rh-dock-copy{display:flex;flex-direction:column;gap:1px}
-.rh-dock-title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-primary,#18212f)}
+.rh-dock-title{overflow-wrap:anywhere;color:var(--dsw-alias-label-primary,#18212f)}
 .rh-dock-title b{font-weight:650}
 .rh-dock-detail{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;color:var(--dsw-alias-label-tertiary,#98a2b3)}
 .rh-dock-bar{display:block;width:100%;height:3px;margin-top:6px;border-radius:3px;background:var(--dsw-alias-border-l2,rgba(127,127,127,.3));overflow:hidden}
@@ -626,7 +629,7 @@ window.__ModuleLoader__.load({
 @media (prefers-reduced-motion:reduce){.rh-dock-dot{animation:none}.rh-dock-bar>span{animation:none;width:100%}}
 /* 手机上小点照样是 9px，气泡窄一点，别顶到屏幕边上。 */
 @media (max-width:600px),(pointer:coarse){
-.rh-dock-pop{max-width:min(240px,78vw);padding:7px 10px}
+.rh-dock-pop{max-width:min(280px,86vw);padding:7px 10px}
 }
 `
 
@@ -651,9 +654,12 @@ window.__ModuleLoader__.load({
       const sessionId = typeof props?.sessionId === 'string' ? props.sessionId : ''
       const [jobs, setJobs] = useState(null)
       const [flash, setFlash] = useState(null)
-      // 小点默认收起，只占一个 9px 的圈；点开才看详情气泡。
+      // 小点默认收起，只露一个 9px 的圈；点开才看详情气泡。
       const [open, setOpen] = useState(false)
+      // 小点是 fixed 浮层：位置从容器自己的 rect 现量，避免任何布局占位。
+      const [anchor, setAnchor] = useState(null)
       const rootRef = useRef(null)
+      const hoverTimer = useRef(null)
       const activeRef = useRef(false)
       const seenActive = useRef(false)
       const flashTimer = useRef(null)
@@ -770,6 +776,33 @@ window.__ModuleLoader__.load({
         return () => document.removeEventListener('pointerdown', onDown, true)
       }, [open])
 
+      // 容器自己量：高度 0 的 div 的 rect.top 就是停靠槽上沿，小点贴它右上方；
+      // 输入框行数一变槽就变高，用 ResizeObserver 跟一下，别把小点留在旧位置。
+      useEffect(() => {
+        if (typeof window === 'undefined') return undefined
+        const measure = () => {
+          const root = rootRef.current
+          if (!root) return
+          const rect = root.getBoundingClientRect()
+          if (!(rect.width > 0) || !Number.isFinite(rect.top)) return
+          const next = { top: Math.round(rect.top), right: Math.round(window.innerWidth - rect.right) }
+          setAnchor(prev => (prev && Math.abs(prev.top - next.top) < 1 && Math.abs(prev.right - next.right) < 1) ? prev : next)
+        }
+        measure()
+        window.addEventListener('resize', measure)
+        let observer = null
+        const host = rootRef.current?.parentElement
+        if (typeof ResizeObserver === 'function' && host) {
+          observer = new ResizeObserver(measure)
+          observer.observe(host)
+        }
+        return () => {
+          window.removeEventListener('resize', measure)
+          if (observer) observer.disconnect()
+          if (hoverTimer.current) { clearTimeout(hoverTimer.current); hoverTimer.current = null }
+        }
+      })
+
       if (!summary.active && !flash) return null
       const failed = flash ? flash.failed : 0
       const ready = flash ? flash.ready : summary.ready
@@ -788,14 +821,26 @@ window.__ModuleLoader__.load({
       }
       const state = summary.active ? 'active' : failed ? 'failed' : 'done'
       const label = 'RunningHub · ' + title + (detail ? '（' + detail + '）' : '') + '，点开看详情'
+      // 位置全在视口坐标系里算：小点贴着输入框右上角，气泡从它的正上方弹出。
+      const dotStyle = anchor ? { top: anchor.top - 18, right: anchor.right + 2 } : { display: 'none' }
+      const popStyle = anchor ? { right: anchor.right, bottom: (typeof window === 'undefined' ? 0 : window.innerHeight) - (anchor.top - 18) } : { display: 'none' }
+      const hoverOpen = () => {
+        if (hoverTimer.current) { clearTimeout(hoverTimer.current); hoverTimer.current = null }
+        setOpen(true)
+      }
+      const hoverClose = () => {
+        if (hoverTimer.current) clearTimeout(hoverTimer.current)
+        hoverTimer.current = setTimeout(() => { hoverTimer.current = null; setOpen(false) }, 160)
+      }
       return h('div', { className: 'rh-dock', ref: rootRef, 'data-state': state,
         'data-open': open ? 'true' : undefined,
         role: 'status', 'aria-live': 'polite', 'aria-label': 'RunningHub 生成状态' },
       h('style', null, dockCSS),
-      h('button', { type: 'button', className: 'rh-dock-dot', title: 'RunningHub · ' + title,
+      h('span', { className: 'rh-dock-sr' }, 'RunningHub · ' + title + (detail ? '（' + detail + '）' : '')),
+      h('button', { type: 'button', className: 'rh-dock-dot', style: dotStyle, title: 'RunningHub · ' + title,
         'aria-label': label, 'aria-expanded': open ? 'true' : 'false',
-        onClick: () => setOpen(value => !value) }),
-      h('div', { className: 'rh-dock-pop' },
+        onClick: () => setOpen(value => !value), onMouseEnter: hoverOpen, onMouseLeave: hoverClose }),
+      h('div', { className: 'rh-dock-pop', style: popStyle, onMouseEnter: hoverOpen, onMouseLeave: hoverClose },
         h('div', { className: 'rh-dock-copy' },
           h('div', { className: 'rh-dock-title' }, h('b', null, 'RunningHub'), ' · ', title),
           detail ? h('div', { className: 'rh-dock-detail' }, detail) : null),
