@@ -38,7 +38,7 @@ import {
 export const name = 'dsh-runninghub'
 export const inject = ['tavern', 'attachments', 'credentials', 'webServer']
 // 面板上要能一眼看出「手机上跑的是哪一版」：宿主与网页各自上报，对不上就是没更新全。
-export const PLUGIN_VERSION = '0.1.35'
+export const PLUGIN_VERSION = '0.1.36'
 export const API = '/api/dsh-runninghub'
 export const MEDIA = API + '/media'
 export const REFERENCE = API + '/reference'

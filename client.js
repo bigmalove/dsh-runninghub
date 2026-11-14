@@ -16,7 +16,7 @@ window.__ModuleLoader__.load({
     let tavernUiApi = null
     const own = (object, key) => Object.prototype.hasOwnProperty.call(object || {}, key)
     // 与 index.mjs 的 PLUGIN_VERSION 对齐；对不上说明宿主侧还是旧代码（测试里有断言）。
-    const CLIENT_VERSION = '0.1.35'
+    const CLIENT_VERSION = '0.1.36'
     const message = error => typeof error === 'string' ? error : error?.message || '未知错误'
     // 探测结果的统一说法：保存和「检查连接」共用，不把原始错误当成成功。
     // 一键复制：手机上很多 WebView/非安全上下文没有 navigator.clipboard，退回 execCommand。
