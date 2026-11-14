@@ -2111,6 +2111,7 @@ describe('正文标记（非工具调用模式）', () => {
     }
     assert.equal(edits.length, 1, '投影失效时要写回一次')
     assert.equal(edits[0].textVersion, 'v1')
+    assert.equal(edits[0].polish, true, '兜底去标记不能改动剧情，必须走 polish: true 以保留候选项与结算状态')
     assert.equal(edits[0].text.includes('RH:SHOT'), false, '写回的正文里不能留标记块')
     assert.match(edits[0].text, /林岚推开门，雨水顺着伞沿落下。/, '正文本身要保留')
 

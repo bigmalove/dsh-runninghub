@@ -1785,7 +1785,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
       markerScrubTimers.delete(key)
       if (disposed) return
       Promise.resolve()
-        .then(() => ctx.tavern.editTurn({ gameId: binding.gameId, turn: binding.turn, textVersion: binding.textVersion, text: cleaned }))
+        .then(() => ctx.tavern.editTurn({ gameId: binding.gameId, turn: binding.turn, textVersion: binding.textVersion, text: cleaned, polish: true }))
         .then(() => { lastMarkerSkip = '' })
         .catch(error => { lastMarkerWarning = '正文标记没能从对话里移除：' + sanitizeMessage(error?.message || error || '未知原因') })
     }, 0)
