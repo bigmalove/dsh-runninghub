@@ -16,7 +16,7 @@ window.__ModuleLoader__.load({
     let tavernUiApi = null
     const own = (object, key) => Object.prototype.hasOwnProperty.call(object || {}, key)
     // 与 index.mjs 的 PLUGIN_VERSION 对齐；对不上说明宿主侧还是旧代码（测试里有断言）。
-    const CLIENT_VERSION = '0.1.36'
+    const CLIENT_VERSION = '0.1.37'
     const message = error => typeof error === 'string' ? error : error?.message || '未知错误'
     // 探测结果的统一说法：保存和「检查连接」共用，不把原始错误当成成功。
     // 一键复制：手机上很多 WebView/非安全上下文没有 navigator.clipboard，退回 execCommand。
@@ -604,20 +604,30 @@ window.__ModuleLoader__.load({
       return { active: active.length, ready, failed, stages }
     }
 
+    // 停靠区只做「最小化的小点」：容器高度 0，不占正文/输入框之间的任何一行；
+    // 小点和详情气泡都是绝对定位，压在输入框右上角，正文空间一点不缩。
+    // 想看细节时悬停或点击小点，气泡向上弹出（手机上点一下也能看）。
     const dockCSS = `
-.rh-dock{display:flex;align-items:center;gap:10px;box-sizing:border-box;margin:0 0 6px;padding:7px 12px;border:1px solid var(--dsw-alias-border-l2,rgba(127,127,127,.28));border-radius:12px;background:var(--dsw-alias-bg-layer-1,rgba(127,127,127,.07));color:var(--dsw-alias-label-secondary,#667085);font:12px/1.5 Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;overflow:hidden}
-.rh-dock-dot{flex:none;width:7px;height:7px;border-radius:50%;background:#175cd3;animation:rh-dock-pulse 1.8s ease-out infinite}
+.rh-dock{position:relative;display:flex;justify-content:flex-end;align-items:flex-end;height:0;margin:0;padding:0;pointer-events:none;z-index:30;color:var(--dsw-alias-label-secondary,#667085);font:12px/1.5 Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+.rh-dock-dot{pointer-events:auto;position:absolute;right:3px;bottom:7px;width:9px;height:9px;padding:0;border:0;border-radius:50%;background:#175cd3;cursor:pointer;-webkit-tap-highlight-color:transparent;animation:rh-dock-pulse 1.8s ease-out infinite}
+.rh-dock-dot:focus-visible{outline:2px solid #175cd3;outline-offset:3px}
 .rh-dock[data-state="done"] .rh-dock-dot{background:#087a55;animation:none}
 .rh-dock[data-state="failed"] .rh-dock-dot{background:#b42318;animation:none}
-.rh-dock-copy{flex:1 1 auto;min-width:0;display:flex;flex-direction:column;gap:1px}
+.rh-dock-pop{pointer-events:auto;position:absolute;right:0;bottom:calc(100% + 16px);display:none;box-sizing:border-box;width:max-content;min-width:150px;max-width:min(280px,70vw);padding:8px 11px;border:1px solid var(--dsw-alias-border-l2,rgba(127,127,127,.28));border-radius:10px;background:var(--dsw-alias-bg-layer-2,var(--dsw-alias-bg-layer-1,#fff));box-shadow:0 8px 24px rgba(16,24,40,.16);text-align:left}
+.rh-dock:hover .rh-dock-pop,.rh-dock:focus-within .rh-dock-pop,.rh-dock[data-open="true"] .rh-dock-pop{display:block}
+.rh-dock-copy{display:flex;flex-direction:column;gap:1px}
 .rh-dock-title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-primary,#18212f)}
 .rh-dock-title b{font-weight:650}
 .rh-dock-detail{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px;color:var(--dsw-alias-label-tertiary,#98a2b3)}
-.rh-dock-bar{flex:none;width:64px;height:3px;border-radius:3px;background:var(--dsw-alias-border-l2,rgba(127,127,127,.3));overflow:hidden}
+.rh-dock-bar{display:block;width:100%;height:3px;margin-top:6px;border-radius:3px;background:var(--dsw-alias-border-l2,rgba(127,127,127,.3));overflow:hidden}
 .rh-dock-bar>span{display:block;width:40%;height:100%;border-radius:3px;background:#175cd3;animation:rh-dock-slide 1.4s ease-in-out infinite}
 @keyframes rh-dock-pulse{0%{box-shadow:0 0 0 0 rgba(23,92,211,.4)}70%{box-shadow:0 0 0 6px rgba(23,92,211,0)}100%{box-shadow:0 0 0 0 rgba(23,92,211,0)}}
 @keyframes rh-dock-slide{0%{transform:translateX(-100%)}100%{transform:translateX(250%)}}
 @media (prefers-reduced-motion:reduce){.rh-dock-dot{animation:none}.rh-dock-bar>span{animation:none;width:100%}}
+/* 手机上小点照样是 9px，气泡窄一点，别顶到屏幕边上。 */
+@media (max-width:600px),(pointer:coarse){
+.rh-dock-pop{max-width:min(240px,78vw);padding:7px 10px}
+}
 `
 
     // 预提交去重表放在闭包里，不是组件里：停靠区和工作室面板可能同时挂一个
@@ -641,6 +651,9 @@ window.__ModuleLoader__.load({
       const sessionId = typeof props?.sessionId === 'string' ? props.sessionId : ''
       const [jobs, setJobs] = useState(null)
       const [flash, setFlash] = useState(null)
+      // 小点默认收起，只占一个 9px 的圈；点开才看详情气泡。
+      const [open, setOpen] = useState(false)
+      const rootRef = useRef(null)
       const activeRef = useRef(false)
       const seenActive = useRef(false)
       const flashTimer = useRef(null)
@@ -745,6 +758,18 @@ window.__ModuleLoader__.load({
       }, [summary.active, summary.ready, summary.failed])
       useEffect(() => () => { if (flashTimer.current) clearTimeout(flashTimer.current) }, [])
 
+      // 点开气泡后点别处就收起：小点是浮层，不该一直挂在输入框上。
+      useEffect(() => {
+        if (!open) return undefined
+        const onDown = event => {
+          const root = rootRef.current
+          if (root && event.target && root.contains(event.target)) return
+          setOpen(false)
+        }
+        document.addEventListener('pointerdown', onDown, true)
+        return () => document.removeEventListener('pointerdown', onDown, true)
+      }, [open])
+
       if (!summary.active && !flash) return null
       const failed = flash ? flash.failed : 0
       const ready = flash ? flash.ready : summary.ready
@@ -761,14 +786,20 @@ window.__ModuleLoader__.load({
         title = ready + ' 段视频已就绪'
         detail = '可到 RunningHub 面板查看'
       }
-      return h('div', { className: 'rh-dock', 'data-state': summary.active ? 'active' : failed ? 'failed' : 'done',
+      const state = summary.active ? 'active' : failed ? 'failed' : 'done'
+      const label = 'RunningHub · ' + title + (detail ? '（' + detail + '）' : '') + '，点开看详情'
+      return h('div', { className: 'rh-dock', ref: rootRef, 'data-state': state,
+        'data-open': open ? 'true' : undefined,
         role: 'status', 'aria-live': 'polite', 'aria-label': 'RunningHub 生成状态' },
       h('style', null, dockCSS),
-      h('span', { className: 'rh-dock-dot', 'aria-hidden': true }),
-      h('div', { className: 'rh-dock-copy' },
-        h('div', { className: 'rh-dock-title' }, h('b', null, 'RunningHub'), ' · ', title),
-        detail ? h('div', { className: 'rh-dock-detail' }, detail) : null),
-      summary.active ? h('span', { className: 'rh-dock-bar', 'aria-hidden': true }, h('span', null)) : null)
+      h('button', { type: 'button', className: 'rh-dock-dot', title: 'RunningHub · ' + title,
+        'aria-label': label, 'aria-expanded': open ? 'true' : 'false',
+        onClick: () => setOpen(value => !value) }),
+      h('div', { className: 'rh-dock-pop' },
+        h('div', { className: 'rh-dock-copy' },
+          h('div', { className: 'rh-dock-title' }, h('b', null, 'RunningHub'), ' · ', title),
+          detail ? h('div', { className: 'rh-dock-detail' }, detail) : null),
+        summary.active ? h('span', { className: 'rh-dock-bar', 'aria-hidden': true }, h('span', null)) : null))
     }
 
     function readBase64(file, signal) {

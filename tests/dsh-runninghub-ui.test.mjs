@@ -1268,6 +1268,18 @@ test('RunningHub 重设计界面：jsdom + React DOM 隔离交互', {
       assert.match(dock.textContent, /排队中 1 · 生成中 1/)
       assert.ok(dockHost.querySelector('.rh-dock-bar'), '生成中才有进度条')
 
+      // 最小化：生成中只留右上角一个小点，详情收进气泡，不占正文那一行。
+      const dot = dock.querySelector('.rh-dock-dot')
+      assert.ok(dot && dot.tagName === 'BUTTON', '生成状态收成一个小圆点（可点）')
+      assert.equal(dot.getAttribute('aria-hidden'), null, '小点是可点控件，不再对读屏隐藏')
+      assert.equal(dock.getAttribute('data-open'), null, '默认收起，气泡不展开')
+      assert.match(dock.querySelector('.rh-dock-pop').textContent, /生成中 2 段/, '详情留在气泡里，默认不显示')
+      const taps = node => act(async () => { node.dispatchEvent(new window.MouseEvent('click', { bubbles: true })) })
+      await taps(dot)
+      assert.equal(dockHost.querySelector('.rh-dock').getAttribute('data-open'), 'true', '点小点展开详情')
+      await taps(dockHost.querySelector('.rh-dock-dot'))
+      assert.equal(dockHost.querySelector('.rh-dock').getAttribute('data-open'), null, '再点一下收起')
+
       // 全部就绪：停靠区亮一下结果，随后自己收起。
       state.jobs = state.jobs.map(job => ({ ...job, status: 'ready', attachments: [video] }))
       await until(() => /已就绪/.test(dockHost.textContent), '完成提示', 700)
