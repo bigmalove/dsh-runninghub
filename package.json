@@ -8,7 +8,8 @@
     "test:runtime": "node bin/test.mjs --runtime",
     "test:all": "node bin/test.mjs --all",
     "test:ui": "node --test tests/dsh-runninghub-ui.test.mjs",
-    "doctor": "node bin/doctor.mjs"
+    "doctor": "node bin/doctor.mjs",
+    "clean:pending": "node bin/clean-stale-pending.mjs"
   },
   "files": [
     "index.mjs",
