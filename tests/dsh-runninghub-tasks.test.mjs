@@ -281,6 +281,31 @@ test('并发同 requestId 一次提交：两并发 submit 返回同一任务且�
 })
 
 // ===========================================================================
+// 跨局复用 requestId
+// ===========================================================================
+test('跨局复用 requestId 不算重试：不同 gameId 各自建单并各发一次网关', async (t) => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'tavern-store-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const store = new TaskStore({ directory: dir })
+  const { client, calls } = makeGatewayClient({ tasks: { __submit__: { task_id: 't1', accepted: 1 }, t1: { status: 'queued', outputs: [] } } })
+  const engine = new TaskEngine({ client, store, onMedia: async () => ({ url: '/api/x' }), pollMs: 15 })
+  t.after(() => engine.dispose())
+  await engine.init()
+
+  const input = { model: 'h3参考', prompt: 'x', custom: { subject: 'cat' } }
+  const a = await engine.submit(input, { binding: { gameId: 'game-A', anchor: '旧局原句' }, requestId: 'rh-turn3-shot1' })
+  const b = await engine.submit(input, { binding: { gameId: 'game-B', anchor: '新局原句' }, requestId: 'rh-turn3-shot1' })
+  assert.notEqual(a.id, b.id, '跨局同 requestId 必须各自建单，不能拿回上一局的任务')
+  assert.equal(a.binding.gameId, 'game-A')
+  assert.equal(b.binding.gameId, 'game-B', '新单必须绑在本局，不能沿用上一局的绑定')
+  await until(() => calls.filter((c) => c.path === '/v1/images/generations').length, (n) => n === 2)
+  const posts = calls.filter((c) => c.path === '/v1/images/generations')
+  assert.equal(posts.length, 2, '两局各发一次网关，不能因为撞名被吞掉一次')
+  assert.equal((await store.read(a.id)).binding.gameId, 'game-A', '旧局记录不能被新局覆盖')
+  assert.equal((await store.read(b.id)).binding.gameId, 'game-B')
+})
+
+// ===========================================================================
 // 恢复只查不重提
 // ===========================================================================
 test('恢复只查不重提：已知 remoteTaskId 的历史任务 init 时只查询状态、不重新提交', async (t) => {

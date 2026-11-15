@@ -38,7 +38,7 @@ import {
 export const name = 'dsh-runninghub'
 export const inject = ['tavern', 'attachments', 'credentials', 'webServer']
 // 面板上要能一眼看出「手机上跑的是哪一版」：宿主与网页各自上报，对不上就是没更新全。
-export const PLUGIN_VERSION = '0.1.40'
+export const PLUGIN_VERSION = '0.1.41'
 export const API = '/api/dsh-runninghub'
 export const MEDIA = API + '/media'
 export const REFERENCE = API + '/reference'
@@ -2447,7 +2447,12 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     validateRequestId(input.requestId)
     // Deduplicate before looking at the now-current turn or schema: an uncertain browser retry
     // must return the original job even if the game moved on since it was accepted.
-    const existing = (await store.list()).find(job => job.requestId === input.requestId)
+    // requestId 只是「同一单重试」的令牌，不是全局唯一键：模型很容易在不同局里复用
+    // rh-turn3-shot1 这种名字。跨局撞名必须当成新单，否则会把上一局的任务原样返回——
+    // 既不建单也不发网关，面板、正文和网关里都看不到这一单。
+    const gameHint = input.gameId ?? exec?.agent?.session?.id ?? ''
+    const sameGame = job => (job.binding?.gameId ?? '') === gameHint
+    const existing = (await store.list()).find(job => job.requestId === input.requestId && sameGame(job))
     if (existing) return { ...existing, ...(replays.has(existing.id) ? { replayable: true } : {}) }
     // 正文标记模式下模型不该再走生成工具；即使旧请求还带着工具也由宿主拒绝。
     if (exec && generationMode === 'marker') {
@@ -2525,7 +2530,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     const shotFingerprintValue = marker && typeof internal.fingerprint === 'string' ? internal.fingerprint : undefined
     const shotGameId = marker && typeof internal.markerGameId === 'string' ? internal.markerGameId : undefined
     const job = await serial(async () => {
-      const raced = (await store.list()).find(item => item.requestId === input.requestId)
+      const raced = (await store.list()).find(item => item.requestId === input.requestId && sameGame(item))
       if (raced) return { ...raced, ...(replays.has(raced.id) ? { replayable: true } : {}) }
       return requireEngine().submit(clean, { binding, requestId: input.requestId,
         ...(shotFingerprintValue ? { fingerprint: shotFingerprintValue } : {}),
