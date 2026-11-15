@@ -38,7 +38,7 @@ import {
 export const name = 'dsh-runninghub'
 export const inject = ['tavern', 'attachments', 'credentials', 'webServer']
 // 面板上要能一眼看出「手机上跑的是哪一版」：宿主与网页各自上报，对不上就是没更新全。
-export const PLUGIN_VERSION = '0.1.38'
+export const PLUGIN_VERSION = '0.1.39'
 export const API = '/api/dsh-runninghub'
 export const MEDIA = API + '/media'
 export const REFERENCE = API + '/reference'
@@ -2166,13 +2166,13 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     }
     let afterTurn = 0
     if (state && Number.isInteger(state.turn)) {
-      // 正在写时，state.turn 可能已经是这一轮（占位正文已存在），也可能是上一轮；
-      // 能读到就说明它已经结算，只需等更晚的轮次。
-      let readable = null
-      if (state.busy) {
-        try { readable = await ctx.tavern.getTurn({ gameId, turn: state.turn }) } catch { readable = null }
-      }
-      afterTurn = readable ? state.turn : Math.max(0, state.turn - (state.busy ? 1 : 0))
+      // 「能读到这一轮」不等于「这一轮已经结算」：正文在流式生成时就已写进存档，
+      // getTurn 照样读得到。旧逻辑据此把 afterTurn 记成本轮号，于是本轮结算时
+      // value.turn > afterTurn 永远不成立，刚生成的媒体要白等一整轮才落位
+      // （玩家看到的就是「图片/视频插不进正文」）。只有宿主明确说这一轮已结算，
+      // 才把它往后挪一轮；宿主没给 settled 时退回「不忙即已结算」。
+      const settledNow = state.settled === true || (state.settled === undefined && state.busy !== true)
+      afterTurn = settledNow ? state.turn : Math.max(0, state.turn - 1)
     }
     return { gameId, pending: true, afterTurn, anchor }
   }

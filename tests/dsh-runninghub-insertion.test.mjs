@@ -156,3 +156,17 @@ test('自动插入：旧任务的附件缺少字节数时补上真实大小，�
   assert.equal(f.items.length, 1)
   assert.equal(f.items[0].attachment.bytes, 2048, '必须写回真实字节数，视频才能播放')
 })
+
+test('自动插入：本轮正文正在写、已经能读到占位正文时，本轮结算就该落位（不再多等一轮）', async t => {
+  const f = await setup(t, { legacyHost: true, turnState: { turn: 5, textVersion: 'v1', settled: false, busy: true } })
+  await f.host.dispatch({ action: 'preferences', autoInsert: true })
+  await f.host.dispatch({ action: 'select-model', model: 'h3参考' })
+  const id = '00000000-0000-4000-8000-000000000778'
+  const job = await f.submit(id, { anchor: '正文' })
+  assert.equal(job.binding.pending, true)
+  assert.equal(job.binding.afterTurn, 4, '第 5 轮还在写：第 5 轮结算时必须落位')
+
+  f.setTurnState({ turn: 5, textVersion: 'v1', settled: true, busy: false })
+  await f.host.handleTurn({ gameId: 'game-1', turn: 5, textVersion: 'v1', text: '正文', rawText: '正文' })
+  assert.equal(f.items.length, 1, '本轮结算就该把刚生成的媒体挂进正文')
+})
