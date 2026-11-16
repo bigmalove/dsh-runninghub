@@ -5,6 +5,7 @@ window.__ModuleLoader__.load({
     const h = React.createElement
     const { useEffect, useRef, useState } = React
     const API = '/api/dsh-runninghub'
+    const WS = API + '/ws'
     const LIBRARY = API + '/library'
     const DEFAULT_BASE = 'http://127.0.0.1:6888'
     const MB = 1024 * 1024
@@ -16,7 +17,7 @@ window.__ModuleLoader__.load({
     let tavernUiApi = null
     const own = (object, key) => Object.prototype.hasOwnProperty.call(object || {}, key)
     // 与 index.mjs 的 PLUGIN_VERSION 对齐；对不上说明宿主侧还是旧代码（测试里有断言）。
-    const CLIENT_VERSION = '0.1.41'
+    const CLIENT_VERSION = '0.1.42'
     const message = error => typeof error === 'string' ? error : error?.message || '未知错误'
     // 探测结果的统一说法：保存和「检查连接」共用，不把原始错误当成成功。
     // 一键复制：手机上很多 WebView/非安全上下文没有 navigator.clipboard，退回 execCommand。
@@ -524,7 +525,127 @@ window.__ModuleLoader__.load({
     }
 
     // 宿主没有响应时界面不能一直停在「保存中…」：25 秒到点就报出来。
+    // 移动端浏览器对同源 HTTP/1.1 最多只给 6 条连接（多开一个 3081 标签页，两条标签的 6 条常驻 EventSource
+    // 就会把连接池占死，连不进队列的 diag 请求也会卡在浏览器 Stalled 队列里满 25 秒）；
+    // 因此常规 JSON 控制请求优先走独立连接池的同源 WebSocket，握手不通时无感回退 HTTP。
     const REQUEST_TIMEOUT_MS = 25000
+    const WS_BODY_LIMIT = 128 * 1024
+    const WS_CONNECT_MS = 1500
+    const WS_COOLDOWN_MS = 8000
+    const IDEMPOTENT_ACTIONS = new Set(['list', 'jobs', 'probe', 'diag', 'describe', 'workflow-settings-get'])
+    let wsActive = null
+    let wsSeq = 0
+    let wsCooldownUntil = 0
+    let lastTransport = 'http'
+
+    function makeAbortError() {
+      const error = new Error('The operation was aborted.')
+      error.name = 'AbortError'
+      return error
+    }
+    function stalledTimeoutError() {
+      const stalled = new Error(
+        `插件宿主 ${Math.round(REQUEST_TIMEOUT_MS / 1000)} 秒没有响应，请求已放弃（手机 Termux 请开启 termux-wake-lock 防后台冻结，并关闭多余的同地址浏览器标签页；也可点“读取宿主诊断”排查）`,
+      )
+      stalled.timeout = true
+      return stalled
+    }
+    function canTryWebSocket(serialized) {
+      if (serialized && serialized.length > WS_BODY_LIMIT) return false
+      if (typeof window === 'undefined' || typeof window.WebSocket !== 'function') return false
+      const loc = window.location
+      if (!loc || (loc.protocol !== 'http:' && loc.protocol !== 'https:') || !loc.host) return false
+      return Date.now() >= wsCooldownUntil
+    }
+    function openWsConnection() {
+      if (wsActive && (wsActive.socket.readyState === 0 || wsActive.socket.readyState === 1)) return wsActive
+      const loc = window.location
+      const socket = new window.WebSocket((loc.protocol === 'https:' ? 'wss://' : 'ws://') + loc.host + WS)
+      let resolveReady, rejectReady
+      const ready = new Promise((resolve, reject) => { resolveReady = resolve; rejectReady = reject })
+      ready.catch(() => {})
+      const conn = { socket, ready, open: false, pending: new Map() }
+      wsActive = conn
+      const connectTimer = setTimeout(() => {
+        if (conn.open) return
+        if (wsActive === conn) wsActive = null
+        wsCooldownUntil = Date.now() + WS_COOLDOWN_MS
+        rejectReady({ wsUnavailable: true })
+        try { socket.close() } catch { /* ignore */ }
+      }, WS_CONNECT_MS)
+      socket.onopen = () => {
+        clearTimeout(connectTimer)
+        conn.open = true
+        wsCooldownUntil = 0
+        resolveReady(conn)
+      }
+      socket.onmessage = event => {
+        let msg
+        try { msg = JSON.parse(String(event.data || '')) } catch { return }
+        if (!msg || (typeof msg.id !== 'number' && typeof msg.id !== 'string')) return
+        const entry = conn.pending.get(msg.id)
+        if (!entry) return
+        conn.pending.delete(msg.id)
+        entry.cleanup()
+        entry.resolve(msg)
+      }
+      const failConn = () => {
+        clearTimeout(connectTimer)
+        if (wsActive === conn) wsActive = null
+        if (!conn.open) {
+          wsCooldownUntil = Date.now() + WS_COOLDOWN_MS
+          rejectReady({ wsUnavailable: true })
+        }
+        for (const [id, entry] of [...conn.pending.entries()]) {
+          conn.pending.delete(id)
+          entry.cleanup()
+          entry.reject({ wsDropped: true })
+        }
+      }
+      socket.onerror = failConn
+      socket.onclose = failConn
+      return conn
+    }
+    async function wsRequest(body, signal, gameId) {
+      if (signal?.aborted) throw makeAbortError()
+      let conn
+      try {
+        const candidate = openWsConnection()
+        if (candidate.open) conn = candidate
+        else {
+          conn = await new Promise((resolve, reject) => {
+            const onAbort = () => reject(makeAbortError())
+            signal?.addEventListener?.('abort', onAbort, { once: true })
+            candidate.ready.then(resolve, reject).finally(() => signal?.removeEventListener?.('abort', onAbort))
+          })
+        }
+      } catch (error) {
+        if (error?.name === 'AbortError') throw error
+        const unavailable = new Error('ws unavailable')
+        unavailable.wsUnavailable = true
+        throw unavailable
+      }
+      if (signal?.aborted) throw makeAbortError()
+      const id = ++wsSeq
+      const payload = JSON.stringify({ id, body: body ?? null, ...(gameId ? { gameId: String(gameId) } : {}) })
+      return await new Promise((resolve, reject) => {
+        const onAbort = () => {
+          conn.pending.delete(id)
+          reject(makeAbortError())
+        }
+        const cleanup = () => signal?.removeEventListener?.('abort', onAbort)
+        signal?.addEventListener?.('abort', onAbort, { once: true })
+        conn.pending.set(id, { resolve, reject, cleanup })
+        try {
+          conn.socket.send(payload)
+        } catch {
+          conn.pending.delete(id)
+          cleanup()
+          reject({ wsUnavailable: true })
+        }
+      })
+    }
+
     async function request(body, signal, gameId) {
       let response
       const local = new AbortController()
@@ -535,20 +656,43 @@ window.__ModuleLoader__.load({
         if (signal.aborted) local.abort()
         else signal.addEventListener('abort', relay, { once: true })
       }
+      const serialized = body ? JSON.stringify(body) : null
+      const idempotent = !body || IDEMPOTENT_ACTIONS.has(body.action)
       try {
+        if (canTryWebSocket(serialized)) {
+          try {
+            const reply = await wsRequest(body, local.signal, gameId)
+            lastTransport = 'ws'
+            if (!reply.ok) {
+              const failure = new Error(reply.error ? message(reply.error) : `HTTP ${reply.status || 502}：请求失败`)
+              failure.uncertain = (reply.status || 502) >= 500 || reply.status === 408
+              throw failure
+            }
+            return reply.data
+          } catch (error) {
+            if (error?.name === 'AbortError' && !timedOut) throw error
+            if (timedOut) throw stalledTimeoutError()
+            if (error?.wsUnavailable || (error?.wsDropped && idempotent)) {
+              // 握手未通（如旧宿主未重启或代理拦升级）或只读请求断连：无感回退 HTTP。
+            } else if (error?.wsDropped) {
+              const uncertain = new Error('与插件宿主的连接中途断开，结果未确认；请勿重复提交，刷新状态对账后再试')
+              uncertain.uncertain = true
+              throw uncertain
+            } else {
+              throw error
+            }
+          }
+        }
         try {
           const url = body ? API : API + (gameId ? '?gameId=' + encodeURIComponent(String(gameId)) : '')
           response = await fetch(url, {
             method: body ? 'POST' : 'GET', credentials: 'same-origin', cache: 'no-store', signal: local.signal,
-            ...(body ? { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : {}),
+            ...(body ? { headers: { 'Content-Type': 'application/json' }, body: serialized } : {}),
           })
+          lastTransport = 'http'
         } catch (error) {
           if (error.name === 'AbortError' && !timedOut) throw error
-          if (timedOut) {
-            const stalled = new Error(`插件宿主 ${Math.round(REQUEST_TIMEOUT_MS / 1000)} 秒没有响应，请求已放弃（可点“检查连接”看是卡在哪一步）`)
-            stalled.timeout = true
-            throw stalled
-          }
+          if (timedOut) throw stalledTimeoutError()
           const failure = new Error('无法访问插件宿主：' + error.message +
             '（这说明请求没到 Tavern 的插件路由：先刷新页面，再确认插件已加载）')
           failure.uncertain = true
@@ -1342,10 +1486,18 @@ window.__ModuleLoader__.load({
           }
         }
         refresh()
-        const timer = setInterval(refresh, 5000)
+        const timer = setInterval(() => {
+          if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return
+          refresh()
+        }, 5000)
+        const onVisible = () => {
+          if (typeof document !== 'undefined' && document.visibilityState === 'visible') refresh()
+        }
+        if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onVisible)
         return () => {
           active = false
           clearInterval(timer)
+          if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onVisible)
           if (current) { current.abort(); controllers.current.delete(current) }
         }
       }, [visible, refreshVersion])
@@ -1602,12 +1754,20 @@ window.__ModuleLoader__.load({
 
       function settingsResolution() {
         const resolution = {}
+        const previous = workflow?.defaults?.resolution || {}
         if (resolutionFields.has('aspect_ratio') && ratio.trim()) resolution.aspect_ratio = ratio.trim()
         if (resolutionFields.has('megapixels') && megapixels.trim()) resolution.megapixels = Number(megapixels)
         if (dimensionsSupported && !resolutionFields.has('aspect_ratio') && (width.trim() || height.trim())) {
           if (!width.trim() || !height.trim()) throw new Error('宽度和高度必须成对填写。')
           resolution.width = Number(width)
           resolution.height = Number(height)
+        }
+        // 保留客户端在 Runow 虚拟工作流上保存的质量档位与默认片长，避免改画幅时被整组覆盖抹掉。
+        if (Object.keys(resolution).length && typeof previous.resolution === 'string' && previous.resolution) {
+          resolution.resolution = previous.resolution
+        }
+        if (typeof previous.duration === 'number' && Number.isFinite(previous.duration)) {
+          resolution.duration = previous.duration
         }
         return Object.keys(resolution).length ? resolution : null
       }
@@ -1924,6 +2084,7 @@ window.__ModuleLoader__.load({
           panel: {
             version: CLIENT_VERSION,
             hostVersion: summary?.version || '',
+            transport: lastTransport,
             configured: summary?.configured ?? null,
             workflows: (summary?.workflows || []).length,
             model: summary?.model || '',
@@ -2655,7 +2816,17 @@ window.__ModuleLoader__.load({
       const mediaJobs = visibleJobs.filter(job => activeStatuses.includes(job.status)
         || (Array.isArray(job.attachments) && job.attachments.some(item => item && ['video', 'image', 'audio'].includes(item.kind) && isMediaUrl(item.url))))
       const failedJobs = visibleJobs.filter(job => !mediaJobs.includes(job))
-      const durationDefault = workflow?.videoDuration?.seconds
+      const durationDefault = (() => {
+        const direct = workflow?.videoDuration?.seconds
+        if (Number.isFinite(direct) && direct > 0) return direct
+        const customSeconds = workflow?.pipeline ? Number(workflow?.defaults?.custom?.video_duration) : NaN
+        if (Number.isFinite(customSeconds) && customSeconds > 0) return customSeconds
+        const resolutionSeconds = !workflow?.pipeline ? Number(workflow?.defaults?.resolution?.duration) : NaN
+        if (Number.isFinite(resolutionSeconds) && resolutionSeconds > 0) return resolutionSeconds
+        const runowSeconds = Number(workflow?.capabilities?.runowVideoSeconds)
+        if (Number.isFinite(runowSeconds) && runowSeconds > 0) return runowSeconds
+        return undefined
+      })()
       const selectedReferences = Object.values(references).filter(entry => entry.file).length
 
       function openPlayer(job, item) {

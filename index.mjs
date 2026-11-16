@@ -38,12 +38,16 @@ import {
 export const name = 'dsh-runninghub'
 export const inject = ['tavern', 'attachments', 'credentials', 'webServer']
 // 面板上要能一眼看出「手机上跑的是哪一版」：宿主与网页各自上报，对不上就是没更新全。
-export const PLUGIN_VERSION = '0.1.41'
+export const PLUGIN_VERSION = '0.1.42'
 export const API = '/api/dsh-runninghub'
 export const MEDIA = API + '/media'
 export const REFERENCE = API + '/reference'
 // 客户端常用图库 / 常用音频库的同源代理：列表与按 ID 取原图/原音频。
 export const LIBRARY = API + '/library'
+// WebSocket 控制通道：绕开移动端浏览器同源 HTTP/1.1 最多 6 条连接的队列（多开标签页 + 多条 SSE 会把 6 槽位占满）。
+export const WS = API + '/ws'
+const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
+const WS_MAX_BYTES = 1024 * 1024
 const DEFAULT_BASE = 'http://127.0.0.1:6888'
 const ACTIVE = new Set(['preparing', 'submitting', 'submit_unknown', 'queued', 'running', 'downloading'])
 const fail = (message, code = 'VALIDATION_ERROR') => new GatewayError(message, { code, rejected: true })
@@ -124,6 +128,35 @@ async function bodyJSON(req) {
     chunks.push(chunk)
   }
   try { return JSON.parse(Buffer.concat(chunks).toString('utf8')) } catch { throw fail('JSON 格式无效') }
+}
+function wsFrame(opcode, data = Buffer.alloc(0)) {
+  const len = data.length
+  let header
+  if (len < 126) {
+    header = Buffer.allocUnsafe(2)
+    header[0] = 0x80 | opcode
+    header[1] = len
+  } else if (len < 65536) {
+    header = Buffer.allocUnsafe(4)
+    header[0] = 0x80 | opcode
+    header[1] = 126
+    header.writeUInt16BE(len, 2)
+  } else {
+    header = Buffer.allocUnsafe(10)
+    header[0] = 0x80 | opcode
+    header[1] = 127
+    header.writeBigUInt64BE(BigInt(len), 2)
+  }
+  return len ? Buffer.concat([header, data]) : header
+}
+function rejectUpgrade(socket, status, text) {
+  try {
+    if (!socket.destroyed && socket.writable) {
+      socket.end(`HTTP/1.1 ${status} ${text}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`)
+      return
+    }
+  } catch { /* ignore */ }
+  socket.destroy()
 }
 
 /** Zero-dependency host bridge. Configuration contains no key; DSH credentials own secrets. */
@@ -255,17 +288,38 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
   // 宿主凭据服务是本地文件实现；万一在手机上卡住（或该版本没有实现），
   // 也不能让面板永远停在「保存中…」：到点就给一句明确的话。
   const credentialTimeoutMs = Number.isSafeInteger(options.credentialTimeoutMs) && options.credentialTimeoutMs > 0 ? options.credentialTimeoutMs : 8000
-  async function withDeadline(task, ms, message) {
+  const deadlineCancelers = new Set()
+  const wsSockets = new Set()
+  async function withDeadline(task, ms, message, controller) {
+    if (disposed) throw fail('插件已停止', 'DISPOSED')
     let timer
+    let cancel
     try {
       return await Promise.race([
-        Promise.resolve().then(task),
-        new Promise((resolve, reject) => { timer = setTimeout(() => reject(fail(message, 'TIMEOUT')), ms) }),
+        Promise.resolve().then(() => task(controller?.signal)),
+        new Promise((resolve, reject) => {
+          cancel = () => {
+            clearTimeout(timer)
+            controller?.abort()
+            reject(fail('插件已停止', 'DISPOSED'))
+          }
+          deadlineCancelers.add(cancel)
+          timer = setTimeout(() => {
+            deadlineCancelers.delete(cancel)
+            controller?.abort()
+            reject(fail(message, 'TIMEOUT'))
+          }, ms)
+        }),
       ])
-    } finally { clearTimeout(timer) }
+    } finally {
+      clearTimeout(timer)
+      if (cancel) deadlineCancelers.delete(cancel)
+    }
   }
   const credentialDeadline = (action) => withDeadline(action, credentialTimeoutMs,
     `宿主凭据服务 ${credentialTimeoutMs} 毫秒没有响应，Key 没有写入；请重启 DSH 后重试`)
+  const SUMMARY_BUDGET_MS = Number.isSafeInteger(options.summaryBudgetMs) && options.summaryBudgetMs > 0 ? options.summaryBudgetMs : 4000
+  const SUMMARY_WORKFLOWS_BUDGET_MS = Number.isSafeInteger(options.workflowBudgetMs) && options.workflowBudgetMs > 0 ? options.workflowBudgetMs : 8000
   const clientFactory = options.clientFactory ?? (value => new GatewayClient(value))
   const fetchImpl = options.fetchImpl ?? fetch
   const bindingQueues = new Map()
@@ -498,7 +552,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
   }
   async function connectOnce() {
     if (disposed) throw fail('插件已停止', 'DISPOSED')
-    const credential = await ctx.credentials.resolve(credentialName(baseURL))
+    const credential = await credentialDeadline(() => ctx.credentials.resolve(credentialName(baseURL)))
     const apiKey = credential?.value || ''
     if (!apiKey) throw fail('请先在 RunningHub 面板保存网关 Key', 'NOT_CONFIGURED')
     const identity = createHash('sha256').update(baseURL + '\n' + apiKey + '\n' + (allowPrivateLan ? 'lan' : 'loopback')).digest('hex')
@@ -714,6 +768,20 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
    * 否则 qwen-multi-h3 这类模板会因为「一条 <imageN> 都没有」直接 400。
    * 只发标签/备注/名称，不发图片内容。
    */
+  function workflowDurationSeconds(description) {
+    const direct = description?.videoDuration?.seconds
+    if (Number.isFinite(direct) && direct > 0) return direct
+    if (description?.pipeline) {
+      const customSeconds = Number(description.defaults?.custom?.video_duration)
+      if (Number.isFinite(customSeconds) && customSeconds > 0) return customSeconds
+    } else {
+      const resolutionSeconds = Number(description?.defaults?.resolution?.duration)
+      if (Number.isFinite(resolutionSeconds) && resolutionSeconds > 0) return resolutionSeconds
+    }
+    const runowSeconds = Number(description?.capabilities?.runowVideoSeconds)
+    if (Number.isFinite(runowSeconds) && runowSeconds > 0) return runowSeconds
+    return undefined
+  }
   function portDirectiveExtras(description) {
     const mode = templateMode(description)
     const qwenTags = /^qwen-multi/.test(mode) || mode === 'qwen-multigrid-h3'
@@ -730,7 +798,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
         audio: references.filter((item) => item.kind === 'audio' && /^<Audio \d+>$/.test(item.tag || '')).length,
       }
     }
-    const seconds = description.videoDuration?.seconds
+    const seconds = workflowDurationSeconds(description)
     if (Number.isFinite(seconds) && seconds > 0) extras.durationSeconds = seconds
     const aspect = description.videoAspect?.ratio || description.defaults?.resolution?.aspect_ratio
     if (typeof aspect === 'string' && aspect && aspect !== 'auto') extras.aspectRatio = aspect
@@ -859,12 +927,12 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
    * 这里定期重读列表，revision 变了就重建模板；失败静默（面板另报连接异常）。
    */
   async function syncWorkflowConfig() {
-    const credential = await ctx.credentials.resolve(credentialName(baseURL))
+    const credential = await credentialDeadline(() => ctx.credentials.resolve(credentialName(baseURL)))
     if (!credential?.value) return
     const active = await connect()
     if (typeof active.client.getSettings === 'function') {
       try {
-        const next = (await active.client.getSettings())?.defaultModel ?? ''
+        const next = (await withDeadline(signal => active.client.getSettings(signal), SUMMARY_BUDGET_MS, '默认模型读取超时', new AbortController()))?.defaultModel ?? ''
         if (next !== defaultModel) defaultModel = next
       } catch { /* 读不到就沿用旧默认 */ }
     }
@@ -2002,7 +2070,6 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     const started = Date.now()
     return { started, mark(name) { marks[name] = Date.now() - started }, get value() { return { ...marks, total: Date.now() - started } } }
   }
-  const SUMMARY_BUDGET_MS = Number.isSafeInteger(options.summaryBudgetMs) && options.summaryBudgetMs > 0 ? options.summaryBudgetMs : 4000
   let directiveJob = null
   let directiveJobKey = ''
   let summaryInflight = null
@@ -2019,7 +2086,12 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
   }
   async function summary(gameId) {
     const clock = phaseMs()
-    let configured = Boolean((await ctx.credentials.resolve(credentialName(baseURL)))?.value)
+    let configured = false
+    try {
+      configured = Boolean((await credentialDeadline(() => ctx.credentials.resolve(credentialName(baseURL))))?.value)
+    } catch (error) {
+      workflowError = sanitizeMessage(error.message)
+    }
     clock.mark('credentials')
     let settingsError = ''
     if (!configured) {
@@ -2029,14 +2101,19 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
       try {
         const active = await connect()
         clock.mark('connect')
-        workflows = await active.client.listWorkflows()
+        workflows = await withDeadline(
+          signal => active.client.listWorkflows(signal),
+          SUMMARY_WORKFLOWS_BUDGET_MS,
+          `工作流列表读取超时（${Math.max(1, Math.round(SUMMARY_WORKFLOWS_BUDGET_MS / 1000))} 秒没有回应）`,
+          new AbortController(),
+        )
         workflowsLoadedAt = Date.now()
         clock.mark('workflows')
         workflowError = ''
         // 默认模型取服务端默认；获取失败不让工作流列表丢失，单独记录同步错误。
         try {
           if (typeof active.client.getSettings === 'function') {
-            defaultModel = (await withDeadline(() => active.client.getSettings(), SUMMARY_BUDGET_MS, '默认模型读取超时'))?.defaultModel ?? ''
+            defaultModel = (await withDeadline(signal => active.client.getSettings(signal), SUMMARY_BUDGET_MS, '默认模型读取超时', new AbortController()))?.defaultModel ?? ''
           }
         } catch (error) { settingsError = sanitizeMessage(error.message) }
         clock.mark('settings')
@@ -2124,7 +2201,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     try {
       const probe = clientFactory({ baseURL, apiKey, fetchImpl, allowPrivateLan, timeoutMs: 4000 })
       // 探测自己也要有上限：注入的假客户端或挂住的网关不能让这次请求变成无限等待。
-      const list = await withDeadline(() => probe.listWorkflows(), 6000, '网关探测 6 秒没有回应')
+      const list = await withDeadline(signal => probe.listWorkflows(signal), 6000, '网关探测 6 秒没有回应', new AbortController())
       return { ok: true, workflows: list.length, aliases: list.slice(0, 5).map((item) => item.alias), ms: Date.now() - started, baseURL }
     } catch (error) {
       return { ok: false, error: sanitizeMessage(error?.message || '探测失败'), code: error?.code || '', ms: Date.now() - started, baseURL }
@@ -2189,7 +2266,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
       lastSummaryMs: lastPhaseMs, templatePending: Boolean(directiveJob), reconcilePending: Boolean(reconcileInflight),
       dataDirectory: directory, markerRegex: markerRegexState.ok ? 'ok' : (markerRegexState.reason || 'pending'),
       engine: engine ? 'ready' : 'idle', workflows: workflows.length, workflowError,
-      serialPending, configPending,
+      serialPending, configPending, wsClients: wsSockets.size,
       inflight: [...inflight.values()].map(entry => ({ label: entry.label, ms: Date.now() - entry.startedAt })),
       finished: finished.slice(-10),
     }
@@ -2399,12 +2476,49 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
           if (input.referenceSlots !== undefined) {
             for (const slot of input.referenceSlots) await active.client.setReferenceSlot(alias, slot.nodeId, slot.enabled)
           }
-          if (input.defaults !== undefined) {
-            const defaults = { ...input.defaults }
-            if (defaults.baseUpdatedAt === undefined && current.defaults?.updatedAt) defaults.baseUpdatedAt = current.defaults.updatedAt
-            await active.client.saveDefaults(alias, defaults)
+          // Runow 虚拟工作流（单镜或管线视频侧）没有单个数值片长节点，PUT /duration 会 400：
+          // 管线走 defaults.custom.video_duration，单镜走 defaults.resolution.duration，与 6888 管理页同一存储。
+          const runowPipelineDuration = !current.videoDuration && Boolean(current.pipeline && (current.customFields || []).some((field) => field.key === 'video_duration'))
+          const runowStandaloneDuration = !current.videoDuration && !current.pipeline && Boolean(current.capabilities?.durationSchema && current.capabilities?.resolutionSchema?.properties?.duration)
+          let mergedDefaults = input.defaults !== undefined ? { ...input.defaults } : undefined
+          if (input.duration !== undefined && (runowPipelineDuration || runowStandaloneDuration)) {
+            const seconds = input.duration.seconds === undefined ? null : input.duration.seconds
+            if (seconds !== null) {
+              const schema = current.capabilities?.durationSchema
+              const min = schema?.minimum ?? schema?.min ?? 4
+              const max = schema?.maximum ?? schema?.max ?? 20
+              if (!Number.isFinite(seconds) || seconds < min || seconds > max) throw fail(`片长必须在 ${min} 到 ${max} 秒之间`)
+            }
+            if (!mergedDefaults) {
+              const curDef = current.defaults || {}
+              mergedDefaults = {
+                presetIds: curDef.presetIds || [],
+                promptSuffix: curDef.promptSuffix || '',
+                resolution: curDef.resolution ?? null,
+                custom: curDef.custom ?? null,
+                ...(current.pipeline ? {} : {
+                  references: (curDef.references || []).map((item) => ({ nodeId: item.nodeId, kind: item.kind, ...(item.note ? { note: item.note } : {}) })),
+                  referencePools: curDef.referencePools || [],
+                }),
+              }
+            }
+            if (runowPipelineDuration) {
+              const nextCustom = { ...(mergedDefaults.custom || {}) }
+              if (seconds === null) delete nextCustom.video_duration
+              else nextCustom.video_duration = seconds
+              mergedDefaults.custom = Object.keys(nextCustom).length ? nextCustom : null
+            } else {
+              const nextResolution = { ...(mergedDefaults.resolution || {}) }
+              if (seconds === null) delete nextResolution.duration
+              else nextResolution.duration = seconds
+              mergedDefaults.resolution = Object.keys(nextResolution).length ? nextResolution : null
+            }
           }
-          if (input.duration !== undefined) {
+          if (mergedDefaults !== undefined) {
+            if (mergedDefaults.baseUpdatedAt === undefined && current.defaults?.updatedAt) mergedDefaults.baseUpdatedAt = current.defaults.updatedAt
+            await active.client.saveDefaults(alias, mergedDefaults)
+          }
+          if (input.duration !== undefined && !runowPipelineDuration && !runowStandaloneDuration) {
             await active.client.saveDuration(alias, current.primarySite, input.duration.seconds === undefined ? null : input.duration.seconds)
           }
           if (input.seeds !== undefined) {
@@ -2657,13 +2771,130 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
       if (res.headersSent && !res.writableEnded) res.destroy()
     }
   }
+  async function handleWsMessage(raw, respond) {
+    let msg
+    try { msg = JSON.parse(raw) } catch { return }
+    if (!object(msg) || (typeof msg.id !== 'number' && typeof msg.id !== 'string')) return
+    const { id } = msg
+    try {
+      let data
+      if (msg.body === null || msg.body === undefined) {
+        const gameId = typeof msg.gameId === 'string' && msg.gameId ? msg.gameId : undefined
+        data = await dispatch({ action: 'list', ...(gameId ? { gameId } : {}) })
+      } else {
+        data = await dispatch(msg.body)
+      }
+      respond({ id, ok: true, status: 200, data })
+    } catch (error) {
+      const status = { VALIDATION_ERROR: 400, UNSUPPORTED_TYPE: 415, TOO_LARGE: 413, NOT_CONFIGURED: 409, NOT_FOUND: 404, METHOD_NOT_ALLOWED: 405, CONFLICT: 409, TIMEOUT: 504 }[error?.code] ?? 502
+      respond({ id, ok: false, status, error: error instanceof GatewayError ? sanitizeMessage(error.message) : 'RunningHub 宿主操作失败' })
+    }
+  }
+  function upgrade(req, socket, head = Buffer.alloc(0)) {
+    if (disposed) return rejectUpgrade(socket, 503, 'Service Unavailable')
+    const connection = typeof ctx.get === 'function' ? ctx.get('connection') : ctx.connection
+    const rejection = typeof connection?.requestRejection === 'function' ? connection.requestRejection(req) : undefined
+    if (rejection !== undefined) return rejectUpgrade(socket, rejection, 'Rejected')
+    if (!sameOrigin(req)) return rejectUpgrade(socket, 403, 'Forbidden')
+    const pathname = new URL(req.url ?? '/', 'http://localhost').pathname
+    if (pathname !== WS) return rejectUpgrade(socket, 404, 'Not Found')
+    const key = typeof req.headers['sec-websocket-key'] === 'string' ? req.headers['sec-websocket-key'].trim() : ''
+    if (String(req.headers.upgrade || '').toLowerCase() !== 'websocket' || !key) {
+      return rejectUpgrade(socket, 400, 'Bad Request')
+    }
+    const accept = createHash('sha1').update(key + WS_GUID).digest('base64')
+    socket.setNoDelay?.(true)
+    socket.write(
+      'HTTP/1.1 101 Switching Protocols\r\n' +
+      'Upgrade: websocket\r\n' +
+      'Connection: Upgrade\r\n' +
+      `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
+    )
+    wsSockets.add(socket)
+    let closed = false
+    let buffer = head?.length ? Buffer.from(head) : Buffer.alloc(0)
+    let fragments = []
+    let fragmentBytes = 0
+    const sendSafe = frame => {
+      if (closed || socket.destroyed || !socket.writable) return
+      try { socket.write(frame) } catch { socket.destroy() }
+    }
+    const failProtocol = () => {
+      if (closed) return
+      closed = true
+      sendSafe(wsFrame(0x8))
+      socket.destroy()
+    }
+    const consume = chunk => {
+      if (closed) return
+      if (chunk?.length) buffer = buffer.length ? Buffer.concat([buffer, chunk]) : Buffer.from(chunk)
+      while (buffer.length >= 2) {
+        const b0 = buffer[0], b1 = buffer[1]
+        const fin = (b0 & 0x80) !== 0
+        const rsv = b0 & 0x70
+        const opcode = b0 & 0x0f
+        const masked = (b1 & 0x80) !== 0
+        if (rsv !== 0 || !masked) { failProtocol(); return }
+        let len = b1 & 0x7f
+        let offset = 2
+        if (len === 126) {
+          if (buffer.length < 4) return
+          len = buffer.readUInt16BE(2)
+          offset = 4
+        } else if (len === 127) {
+          if (buffer.length < 10) return
+          const big = buffer.readBigUInt64BE(2)
+          if (big > BigInt(WS_MAX_BYTES)) { failProtocol(); return }
+          len = Number(big)
+          offset = 10
+        }
+        if (len > WS_MAX_BYTES || (opcode >= 0x8 && (!fin || len > 125))) { failProtocol(); return }
+        if (buffer.length < offset + 4 + len) return
+        const mask = buffer.subarray(offset, offset + 4)
+        const payload = Buffer.allocUnsafe(len)
+        for (let i = 0; i < len; i += 1) payload[i] = buffer[offset + 4 + i] ^ mask[i & 3]
+        buffer = buffer.subarray(offset + 4 + len)
+        if (opcode === 0x8) {
+          closed = true
+          sendSafe(wsFrame(0x8))
+          socket.end()
+          return
+        }
+        if (opcode === 0x9) { sendSafe(wsFrame(0xA, payload)); continue }
+        if (opcode === 0xA) continue
+        if (opcode === 0x1 || opcode === 0x0) {
+          if ((opcode === 0x1 && fragments.length) || (opcode === 0x0 && !fragments.length)) { failProtocol(); return }
+          if (fragmentBytes + len > WS_MAX_BYTES) { failProtocol(); return }
+          fragments.push(payload)
+          fragmentBytes += len
+          if (fin) {
+            const text = (fragments.length === 1 ? fragments[0] : Buffer.concat(fragments, fragmentBytes)).toString('utf8')
+            fragments = []
+            fragmentBytes = 0
+            void handleWsMessage(text, reply => sendSafe(wsFrame(0x1, Buffer.from(JSON.stringify(reply), 'utf8'))))
+          }
+          continue
+        }
+        failProtocol()
+        return
+      }
+    }
+    socket.on('data', consume)
+    socket.once('close', () => { closed = true; wsSockets.delete(socket) })
+    socket.on('error', () => { closed = true; wsSockets.delete(socket); socket.destroy() })
+    if (buffer.length) consume(null)
+  }
   async function resume() {
-    return serial(async () => {
-      if (!(await ctx.credentials.resolve(credentialName(baseURL)))?.value) return
+    // 预热不占全局 serial 串行锁：connect 自有 connectQueue、ensureModel 自有 workflowsLoading，
+    // 否则手机 Termux 上网关未就绪或挂起时，插件启动预热会把面板轮询一并锁死数十秒。
+    let configured = false
+    try { configured = Boolean((await credentialDeadline(() => ctx.credentials.resolve(credentialName(baseURL))))?.value) }
+    catch { return }
+    if (!configured || disposed) return
+    try {
       const active = await connect()
-      // 预热当前工作流的提示词模板，插件加载后第一轮就能直接发送。
-      try { await ensureModel(active) } catch { /* 网关暂时不可用不阻断插件加载 */ }
-    })
+      await ensureModel(active)
+    } catch { /* 网关暂时不可用不阻断插件加载 */ }
   }
   // 模型不需要选工作流，也不需要读 Skill：这里把「面板当前选中的工作流 +
   // 它的完整提示词模板」直接拼进正文提示词。开关关掉时整段都不发。
@@ -2734,6 +2965,12 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     disposed = true
     clearInterval(reconcileTimer)
     clearInterval(workflowSyncTimer)
+    for (const cancel of [...deadlineCancelers]) cancel()
+    deadlineCancelers.clear()
+    for (const socket of [...wsSockets]) {
+      try { socket.destroy() } catch { /* ignore */ }
+    }
+    wsSockets.clear()
     for (const handle of pregenPlanners.values()) handle.controller.abort()
     pregenPlanners.clear()
     markerRuns.clear()
@@ -2753,7 +2990,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
   }
   await initPregen()
   await syncMarkerRegex()
-  return { dispatch, route, store, replays, resume, dispose, reconcile, promptText, promptSections, turnReminder, handleTurn,
+  return { dispatch, route, upgrade, store, replays, resume, dispose, reconcile, promptText, promptSections, turnReminder, handleTurn,
     removeGame: removePregenGame,
     syncMarkerRegex, disableMarkerRegex,
     setToolSync(fn) { toolSync = typeof fn === 'function' ? fn : () => {}; toolSync() },
@@ -2767,6 +3004,9 @@ export async function apply(ctx, config = {}) {
   const host = await createRunningHubHost(ctx, config, { getLLM: () => runtime.llm })
   ctx.effect(() => () => host.dispose())
   for (const route of [API, MEDIA, REFERENCE, LIBRARY]) ctx.effect(() => ctx.webServer.register({ kind: 'exact', path: route, handler: host.route }))
+  if (typeof ctx.webServer.registerUpgrade === 'function') {
+    ctx.effect(() => ctx.webServer.registerUpgrade({ path: WS, handler: host.upgrade }))
+  }
   ctx.tavern.handle('dsh-runninghub/list', () => host.dispatch({ action: 'list' }))
   ctx.tavern.handle('dsh-runninghub/describe', ({ model }) => host.dispatch({ action: 'describe', model }))
   if (ctx.tavern.onTurnSettled) ctx.tavern.onTurnSettled(async turn => {
@@ -2863,5 +3103,9 @@ export async function apply(ctx, config = {}) {
     toolsCtx = scoped
     host.setToolSync(syncRunningHubTools)
   })
-  await host.resume()
+  // 网关本机可达时几百毫秒就能预热完；Termux 上网关未起或被系统后台挂起时最多等 1.5 秒就放行加载，后台继续预热。
+  await Promise.race([
+    host.resume().catch(() => {}),
+    new Promise(resolve => { const timer = setTimeout(resolve, 1500); timer.unref?.() }),
+  ])
 }

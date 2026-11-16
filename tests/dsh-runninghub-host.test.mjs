@@ -11,7 +11,7 @@ import { createServer } from 'node:http'
 import { test, describe, afterEach } from 'node:test'
 import { fileURLToPath } from 'node:url'
 
-import { createRunningHubHost, apply, API, LIBRARY, MEDIA, REFERENCE } from '../index.mjs'
+import { createRunningHubHost, apply, API, LIBRARY, MEDIA, REFERENCE, WS, PLUGIN_VERSION } from '../index.mjs'
 import { shotFingerprint } from '../lib/markers.mjs'
 
 const BASE = 'http://127.0.0.1:6888'
@@ -1333,6 +1333,86 @@ describe('workflow settings: save-settings writes the same gateway defaults as t
     const { host } = await makeHost({ configured: true, gateway })
     assert.deepEqual(await host.dispatch({ action: 'option-groups' }), { groups: [{ id: 'g1', label: '组一', values: ['a', 'b'] }] })
   })
+
+  test('Runow pipeline and standalone workflows pass 20s to port-directive and route duration saves into defaults', async () => {
+    const mossPipeline = {
+      alias: 'MOSS四宫格故事板',
+      primarySite: 'international',
+      defaultEnhanceMode: 'moss-grid-h3',
+      pipeline: {
+        kind: 'grid-storyboard',
+        imageWorkflowAlias: 'MOSS文生图',
+        videoWorkflowAlias: 'h3-rh-ref',
+        gridResolution: { aspect_ratio: '9:16 (Portrait Widescreen)', megapixels: 1 },
+      },
+      customFields: [
+        { key: 'grid_prompt', label: '四宫格图提示词', type: 'text' },
+        { key: 'video_quality', label: '视频质量', type: 'select', options: ['480p', '768p', '1080p'] },
+        { key: 'video_duration', label: '视频时长', type: 'number', min: 4, max: 20 },
+      ],
+      referenceSlots: [],
+      videoDuration: null,
+      runowVideo: true,
+      runowVideoSeconds: 20,
+      durationSchema: { type: 'integer', minimum: 4, maximum: 20, step: 1 },
+      defaults: {
+        updatedAt: 'u-moss',
+        resolution: { aspect_ratio: '9:16 (Portrait Widescreen)', megapixels: 1 },
+        custom: { video_quality: '480p', video_duration: 20 },
+        presetIds: ['cinema-blockbuster'],
+        promptSuffix: 'cinematic',
+      },
+    }
+    const runowStandalone = {
+      alias: 'h3-rh-ref',
+      primarySite: 'international',
+      customFields: [],
+      referenceSlots: [],
+      videoDuration: null,
+      runowVideoSeconds: 10,
+      durationSchema: { type: 'integer', minimum: 4, maximum: 20, step: 1 },
+      resolutionSchema: {
+        type: 'object',
+        properties: {
+          aspect_ratio: { type: 'string' },
+          resolution: { type: 'string', enum: ['480p', '768p', '1080p'] },
+          duration: { type: 'number', minimum: 4, maximum: 20 },
+        },
+      },
+      defaults: {
+        updatedAt: 'u-runow',
+        resolution: { aspect_ratio: '9:16 (Portrait Widescreen)', resolution: '480p', duration: 20 },
+        presetIds: [],
+        promptSuffix: '',
+      },
+    }
+    const gateway = makeGatewayFetch({
+      workflows: [mossPipeline, runowStandalone],
+      settings: { defaultModel: 'MOSS四宫格故事板' },
+      portDirectiveText: '按 20 秒排分镜',
+    })
+    const { host } = await makeHost({ configured: true, gateway })
+    await host.dispatch()
+    assert.equal(gateway.portDirectiveCalls.at(-1)?.alias, 'MOSS四宫格故事板')
+    assert.equal(gateway.portDirectiveCalls.at(-1)?.body.durationSeconds, 20)
+
+    await host.dispatch({ action: 'save-settings', model: 'MOSS四宫格故事板', duration: { seconds: 16 } })
+    assert.equal(gateway.settingsWrites.duration.length, 0, 'Runow 管线不能调 PUT /duration')
+    assert.equal(gateway.settingsWrites.defaults.at(-1)?.custom?.video_duration, 16)
+    assert.equal(gateway.settingsWrites.defaults.at(-1)?.custom?.video_quality, '480p')
+
+    await host.dispatch({ action: 'select-model', model: 'h3-rh-ref' })
+    assert.equal(gateway.portDirectiveCalls.at(-1)?.alias, 'h3-rh-ref')
+    assert.equal(gateway.portDirectiveCalls.at(-1)?.body.durationSeconds, 20)
+
+    await host.dispatch({ action: 'save-settings', model: 'h3-rh-ref', duration: { seconds: 18 } })
+    assert.equal(gateway.settingsWrites.duration.length, 0, 'Runow 单镜不能调 PUT /duration')
+    assert.deepEqual(gateway.settingsWrites.defaults.at(-1)?.resolution, {
+      aspect_ratio: '9:16 (Portrait Widescreen)',
+      resolution: '480p',
+      duration: 18,
+    })
+  })
 })
 
 describe('preferences: alwaysSendPrompt, videosPerTurn, applyDefaults and bindToTurn persist with connection.json', () => {
@@ -2647,5 +2727,245 @@ describe('正文对账增量执行', () => {
     assert.ok(first >= 1, '首轮应尝试挂载')
     await host.reconcile()
     assert.equal(calls.list, first, '已挂好的终态任务不该再扫一遍')
+  })
+})
+
+// =====================================================================
+// 移动端 Termux 连接防死锁：WebSocket 控制通道 + 摘要超时上限 + 非阻塞预热
+// =====================================================================
+describe('移动端 Termux 连接防死锁：WebSocket 通道与网关超时收口', () => {
+  const never = () => new Promise(() => {})
+
+  test('工作流列表挂起时 summary 在 workflowBudgetMs 内返回版本与超时错误，不拖满前端 25 秒', async () => {
+    const { host } = await makeHost({
+      clientFactory: () => ({ listWorkflows: never }),
+      extraOptions: { workflowBudgetMs: 120, reconcileMs: 0, workflowSyncMs: 0 },
+    })
+    const started = Date.now()
+    const listed = await host.dispatch({ action: 'list' })
+    assert.ok(Date.now() - started < 1500, '必须在 workflowBudgetMs 附近返回')
+    assert.equal(listed.version, PLUGIN_VERSION, '网关超时也必须交回宿主版本号，不能让前端一直是未知版本')
+    assert.equal(listed.configured, true)
+    assert.match(listed.gatewayError || '', /工作流列表读取超时/)
+  })
+
+  test('resume 预热挂起时不占全局串行锁，preferences 仍能立即执行', async () => {
+    const { host } = await makeHost({
+      clientFactory: () => ({ listWorkflows: never }),
+      extraOptions: { reconcileMs: 0, workflowSyncMs: 0 },
+    })
+    const warming = host.resume()
+    warming.catch(() => {})
+    await new Promise(r => setTimeout(r, 20))
+    const saved = await Promise.race([
+      host.dispatch({ action: 'preferences', autoInsert: true }),
+      new Promise(r => setTimeout(() => r('timeout'), 800)),
+    ])
+    assert.notEqual(saved, 'timeout', 'resume 不能锁住 serial 队列')
+    assert.equal(saved.autoInsert, true)
+  })
+
+  test('WebSocket 控制通道：6 条常驻 SSE 占满 + list 挂起时，diag/jobs/大包列表仍毫秒返回且跨站升级被拒', async () => {
+    let hangMode = true
+    const bigWorkflows = Array.from({ length: 80 }, (_, index) => ({
+      alias: `wf-large-${index}-${'x'.repeat(900)}`,
+      customFields: [],
+      referenceSlots: [],
+      capabilities: {},
+    }))
+    const { host } = await makeHost({
+      clientFactory: () => ({
+        listWorkflows: () => hangMode ? new Promise(() => {}) : Promise.resolve(bigWorkflows),
+      }),
+      extraOptions: { workflowBudgetMs: 5000, reconcileMs: 0, workflowSyncMs: 0 },
+    })
+    const sseHeld = []
+    const server = createServer((req, res) => {
+      if (req.url?.startsWith('/sse')) {
+        res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' })
+        res.write(': keepalive\n\n')
+        sseHeld.push(res)
+        return
+      }
+      void host.route(req, res)
+    })
+    server.on('upgrade', (req, socket, head) => host.upgrade(req, socket, head))
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+    const port = server.address().port
+    const sseAbort = new AbortController()
+    let ws
+    try {
+      // 模拟移动端两条标签页共 6 条常驻 SSE 连接同时挂着
+      const sseReaders = Array.from({ length: 6 }, () =>
+        fetch(`http://127.0.0.1:${port}/sse`, { signal: sseAbort.signal }).catch(() => {}))
+      for (let i = 0; i < 50 && sseHeld.length < 6; i += 1) await new Promise(r => setTimeout(r, 10))
+      assert.equal(sseHeld.length, 6)
+      void sseReaders
+
+      // 跨站 Origin 的 WebSocket 升级必须被 403 拒绝
+      const crossSiteRejected = await new Promise(resolve => {
+        const bad = new WebSocket(`ws://127.0.0.1:${port}${WS}`, { headers: { Origin: 'https://evil.example' } })
+        bad.onopen = () => { bad.close(); resolve(false) }
+        bad.onerror = () => resolve(true)
+        bad.onclose = () => resolve(true)
+      })
+      assert.equal(crossSiteRejected, true, '跨站 WebSocket 升级必须被拒绝')
+
+      // 同源 WebSocket 连接并复用单条连接并发收发
+      ws = new WebSocket(`ws://127.0.0.1:${port}${WS}`, { headers: { Origin: `http://127.0.0.1:${port}` } })
+      await new Promise((resolve, reject) => {
+        ws.onopen = resolve
+        ws.onerror = reject
+      })
+      const pending = new Map()
+      ws.onmessage = event => {
+        const msg = JSON.parse(String(event.data))
+        pending.get(msg.id)?.(msg)
+        pending.delete(msg.id)
+      }
+      const callWs = (id, body, gameId) => new Promise(resolve => {
+        pending.set(id, resolve)
+        ws.send(JSON.stringify({ id, body, ...(gameId ? { gameId } : {}) }))
+      })
+
+      // 先发一条挂起的 list（模拟 6888 网关无响应），再立刻发 diag 与 jobs：不应被前一条阻塞
+      const slowList = callWs(1, null)
+      await new Promise(r => setTimeout(r, 25))
+      const started = Date.now()
+      const [diagReply, jobsReply] = await Promise.all([
+        callWs(2, { action: 'diag' }),
+        callWs(3, { action: 'jobs' }),
+      ])
+      assert.ok(Date.now() - started < 800, 'WebSocket 上的 diag/jobs 必须立即返回')
+      assert.equal(diagReply.ok, true)
+      assert.equal(diagReply.data.wsClients, 1)
+      assert.ok(diagReply.data.inflight.some(item => item.label === 'list'))
+      assert.equal(jobsReply.ok, true)
+      assert.deepEqual(jobsReply.data.jobs, [])
+      void slowList
+
+      // 验证超过 64KB 的响应帧（RFC 6455 127 长度扩展分支）完整往返
+      hangMode = false
+      host.dispose()
+      const { host: host2 } = await makeHost({
+        clientFactory: () => ({ listWorkflows: async () => bigWorkflows }),
+        extraOptions: { reconcileMs: 0, workflowSyncMs: 0 },
+      })
+      server.removeAllListeners('upgrade')
+      server.on('upgrade', (req, socket, head) => host2.upgrade(req, socket, head))
+      const ws2 = new WebSocket(`ws://127.0.0.1:${port}${WS}`, { headers: { Origin: `http://127.0.0.1:${port}` } })
+      await new Promise((resolve, reject) => { ws2.onopen = resolve; ws2.onerror = reject })
+      const largeReply = await new Promise(resolve => {
+        ws2.onmessage = event => resolve(JSON.parse(String(event.data)))
+        ws2.send(JSON.stringify({ id: 99, body: null }))
+      })
+      assert.equal(largeReply.ok, true)
+      assert.equal(largeReply.data.workflows.length, 80, '>64KB 的工作流摘要须经 64 位帧头完整收到')
+      ws2.close()
+    } finally {
+      ws?.close()
+      sseAbort.abort()
+      for (const res of sseHeld) { try { res.end() } catch { /* ignore */ } }
+      await new Promise(resolve => server.close(resolve))
+    }
+  })
+
+  test('client.js 端到端：同源 HTTP fetch 完全卡死时经 window.WebSocket 正常通信，握手失败时自动回退 HTTP', async () => {
+    const vm = await import('node:vm')
+    const clientCode = await readFile(new URL('../client.js', import.meta.url), 'utf8')
+    const { host } = await makeHost({
+      clientFactory: () => ({ listWorkflows: async () => [{ alias: 'mobile-wf', customFields: [], referenceSlots: [], capabilities: {} }] }),
+      extraOptions: { reconcileMs: 0, workflowSyncMs: 0 },
+    })
+    let allowUpgrade = true
+    const server = createServer((req, res) => void host.route(req, res))
+    server.on('upgrade', (req, socket, head) => {
+      if (!allowUpgrade) { socket.destroy(); return }
+      host.upgrade(req, socket, head)
+    })
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve))
+    const port = server.address().port
+    const openClientSockets = []
+    try {
+      class BrowserOriginWebSocket extends WebSocket {
+        constructor(url) {
+          super(url, { headers: { Origin: `http://127.0.0.1:${port}` } })
+          openClientSockets.push(this)
+        }
+      }
+      const makeClientInstance = customFetch => {
+        let loaded
+        const effects = []
+        const states = []
+        const fakeReact = {
+          createElement: (type, props, ...children) => ({ type, props, children }),
+          useState: init => {
+            const slot = { value: typeof init === 'function' ? init() : init }
+            states.push(slot)
+            return [slot.value, next => { slot.value = typeof next === 'function' ? next(slot.value) : next }]
+          },
+          useRef: init => ({ current: init }),
+          useEffect: fn => { effects.push(fn) },
+        }
+        const fakeWindow = {
+          location: { protocol: 'http:', host: `127.0.0.1:${port}` },
+          WebSocket: BrowserOriginWebSocket,
+          addEventListener() {},
+          removeEventListener() {},
+          __ModuleLoader__: { load(def) { loaded = def } },
+        }
+        vm.runInNewContext(clientCode, {
+          window: fakeWindow,
+          document: { visibilityState: 'visible', addEventListener() {}, removeEventListener() {}, head: { querySelector: () => null, appendChild() {} }, createElement: () => ({ setAttribute() {}, style: {} }) },
+          navigator: { userAgent: 'MobileTest' },
+          fetch: customFetch,
+          AbortController,
+          setTimeout,
+          clearTimeout,
+          setInterval: () => 0,
+          clearInterval: () => {},
+          URL,
+          console,
+        })
+        const mod = loaded.factory(() => fakeReact)
+        let dockRender
+        mod.apply({
+          tavernUi: {
+            registerPanel() {},
+            registerComposerSlot(spec) { dockRender = spec.render },
+          },
+        })
+        const vnode = dockRender({ sessionId: 'game-ws' })
+        vnode.type(vnode.props)
+        const cleanups = effects.map(fn => fn()).filter(Boolean)
+        return { states, cleanup: () => cleanups.forEach(fn => fn()) }
+      }
+
+      // 场景 1：HTTP fetch 完全挂死（模拟 6 个 HTTP/1.1 槽位全满 Stalled），client.js 走 WebSocket 秒回
+      let httpCalls = 0
+      const wsRun = makeClientInstance(() => { httpCalls += 1; return new Promise(() => {}) })
+      for (let i = 0; i < 60 && wsRun.states[0].value === null; i += 1) await new Promise(r => setTimeout(r, 15))
+      assert.equal(httpCalls, 0, 'WebSocket 可用时不占用任何 HTTP 连接')
+      assert.ok(Array.isArray(wsRun.states[0].value), '停靠区已通过 WebSocket 拿到任务列表')
+      wsRun.cleanup()
+
+      // 场景 2：WebSocket 握手不通（如旧宿主尚未重启），自动无感回退 HTTP fetch
+      allowUpgrade = false
+      let fallbackHttpCalls = 0
+      const httpRun = makeClientInstance((url, init) => {
+        fallbackHttpCalls += 1
+        return fetch(`http://127.0.0.1:${port}${url}`, {
+          ...init,
+          headers: { ...(init?.headers || {}), Origin: `http://127.0.0.1:${port}` },
+        })
+      })
+      for (let i = 0; i < 60 && httpRun.states[0].value === null; i += 1) await new Promise(r => setTimeout(r, 15))
+      assert.ok(fallbackHttpCalls >= 1, 'WebSocket 握手失败时必须回退 HTTP')
+      assert.ok(Array.isArray(httpRun.states[0].value), '回退 HTTP 后成功拿到任务列表')
+      httpRun.cleanup()
+    } finally {
+      for (const s of openClientSockets) { try { s.close() } catch { /* ignore */ } }
+      await new Promise(resolve => server.close(resolve))
+    }
   })
 })
