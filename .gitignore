@@ -1,5 +1,8 @@
 node_modules/
 outputs/
+# 本地 agent 工作目录与工作区说明，不进仓库
+.workbuddy/
+AGENTS.md
 .env
 .env.*
 *.log
