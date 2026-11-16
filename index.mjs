@@ -38,13 +38,14 @@ import {
 export const name = 'dsh-runninghub'
 export const inject = ['tavern', 'attachments', 'credentials', 'webServer']
 // 面板上要能一眼看出「手机上跑的是哪一版」：宿主与网页各自上报，对不上就是没更新全。
-export const PLUGIN_VERSION = '0.1.42'
+export const PLUGIN_VERSION = '0.1.43'
 export const API = '/api/dsh-runninghub'
 export const MEDIA = API + '/media'
 export const REFERENCE = API + '/reference'
 // 客户端常用图库 / 常用音频库的同源代理：列表与按 ID 取原图/原音频。
 export const LIBRARY = API + '/library'
-// WebSocket 控制通道：绕开移动端浏览器同源 HTTP/1.1 最多 6 条连接的队列（多开标签页 + 多条 SSE 会把 6 槽位占满）。
+// WebSocket 控制通道：单页 3081 本身就有 3 条常驻 EventSource SSE，同源 HTTP/1.1 只剩 3 个槽位，
+// 极易被多条 <video> 范围流或角色卡外链 static-assets（30 秒超时）占死，导致连 diag 都卡满 25 秒。
 export const WS = API + '/ws'
 const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
 const WS_MAX_BYTES = 1024 * 1024
@@ -2681,8 +2682,10 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
         }
         status = 206
       }
+      // 任务附件（UUID + index）落盘后不可变：允许浏览器私有缓存，避免移动端每次渲染都为多条 <video>
+      // 重新建立无缓存 Range 连接并挂住仅剩的 3 个同源 HTTP/1.1 槽位。
       res.writeHead(status, { 'content-type': item.mediaType, 'content-length': end - start + 1,
-        'accept-ranges': 'bytes', 'cache-control': 'private, no-store', 'x-content-type-options': 'nosniff',
+        'accept-ranges': 'bytes', 'cache-control': 'private, max-age=3600', 'x-content-type-options': 'nosniff',
         ...(status === 206 ? { 'content-range': `bytes ${start}-${end}/${size}` } : {}) })
       if (req.method === 'HEAD') return res.end()
       if (bytes) return res.end(bytes.subarray(start, end + 1))

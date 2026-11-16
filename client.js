@@ -17,7 +17,7 @@ window.__ModuleLoader__.load({
     let tavernUiApi = null
     const own = (object, key) => Object.prototype.hasOwnProperty.call(object || {}, key)
     // 与 index.mjs 的 PLUGIN_VERSION 对齐；对不上说明宿主侧还是旧代码（测试里有断言）。
-    const CLIENT_VERSION = '0.1.42'
+    const CLIENT_VERSION = '0.1.43'
     const message = error => typeof error === 'string' ? error : error?.message || '未知错误'
     // 探测结果的统一说法：保存和「检查连接」共用，不把原始错误当成成功。
     // 一键复制：手机上很多 WebView/非安全上下文没有 navigator.clipboard，退回 execCommand。
@@ -443,15 +443,28 @@ window.__ModuleLoader__.load({
 
     function VideoThumb({ item, className, label, onClick }) {
       const [duration, setDuration] = useState(null)
-      return h('div', { className: 'rh-video-thumb' + (className ? ' ' + className : '') },
-        h('video', {
+      const [inView, setInView] = useState(() => typeof IntersectionObserver !== 'function')
+      const boxRef = useRef(null)
+      useEffect(() => {
+        if (inView || typeof IntersectionObserver !== 'function' || !boxRef.current) return undefined
+        const observer = new IntersectionObserver(entries => {
+          if (entries.some(entry => entry.isIntersecting)) {
+            setInView(true)
+            observer.disconnect()
+          }
+        }, { rootMargin: '120px' })
+        observer.observe(boxRef.current)
+        return () => observer.disconnect()
+      }, [inView])
+      return h('div', { ref: boxRef, className: 'rh-video-thumb' + (className ? ' ' + className : '') },
+        inView ? h('video', {
           src: item.url, preload: 'metadata', muted: true, playsInline: true, controls: false,
           'aria-hidden': true, tabIndex: -1, onError: retryMediaOnce,
           onLoadedMetadata: event => {
             const value = event.currentTarget.duration
             if (Number.isFinite(value) && value > 0) setDuration(value)
           },
-        }),
+        }) : null,
         h('span', { className: 'rh-video-play', 'aria-hidden': true }, icon('play', 12)),
         duration != null ? h('span', { className: 'rh-video-duration' }, formatDuration(duration)) : null,
         h('button', { type: 'button', className: 'rh-video-thumb-hit', onClick, 'aria-label': label, title: label }))
@@ -525,9 +538,9 @@ window.__ModuleLoader__.load({
     }
 
     // 宿主没有响应时界面不能一直停在「保存中…」：25 秒到点就报出来。
-    // 移动端浏览器对同源 HTTP/1.1 最多只给 6 条连接（多开一个 3081 标签页，两条标签的 6 条常驻 EventSource
-    // 就会把连接池占死，连不进队列的 diag 请求也会卡在浏览器 Stalled 队列里满 25 秒）；
-    // 因此常规 JSON 控制请求优先走独立连接池的同源 WebSocket，握手不通时无感回退 HTTP。
+    // 单个 3081 页面已有 3 条常驻 EventSource SSE（hmr / tts / asset-library），同源 HTTP/1.1 仅剩 3 个槽位；
+    // 一旦被多条 <video> 挂起 Range 流或角色卡外链 static-assets（30 秒超时）占满，连不进队列的 diag 也会卡在
+    // 浏览器 Stalled 队列里满 25 秒（等 30~60 秒超时释放后又恢复）。因此控制请求优先走独立连接池的 WebSocket。
     const REQUEST_TIMEOUT_MS = 25000
     const WS_BODY_LIMIT = 128 * 1024
     const WS_CONNECT_MS = 1500
@@ -545,7 +558,7 @@ window.__ModuleLoader__.load({
     }
     function stalledTimeoutError() {
       const stalled = new Error(
-        `插件宿主 ${Math.round(REQUEST_TIMEOUT_MS / 1000)} 秒没有响应，请求已放弃（手机 Termux 请开启 termux-wake-lock 防后台冻结，并关闭多余的同地址浏览器标签页；也可点“读取宿主诊断”排查）`,
+        `插件宿主 ${Math.round(REQUEST_TIMEOUT_MS / 1000)} 秒没有响应，请求已放弃（手机 Termux 请确认已执行 termux-wake-lock 并开启电池“无限制”防后台冻结；也可点“读取宿主诊断”排查）`,
       )
       stalled.timeout = true
       return stalled
@@ -3028,7 +3041,7 @@ window.__ModuleLoader__.load({
         const progress = Number(entry.progress)
         return h('article', { key: entry.id, className: 'rh-pregen-entry' },
           h('div', { className: 'rh-pregen-preview' }, video ?
-            h('video', { className: 'rh-pregen-video', src: video.url, controls: true, preload: 'metadata', playsInline: true,
+            h('video', { className: 'rh-pregen-video', src: video.url, controls: true, preload: 'none', playsInline: true,
               onError: retryMediaOnce }) :
             h('div', { className: 'rh-job-wait' }, icon(entry.status === 'generating' ? 'clock' : 'video', 24),
               h('span', null, pregenStatuses[entry.status] || entry.status),
