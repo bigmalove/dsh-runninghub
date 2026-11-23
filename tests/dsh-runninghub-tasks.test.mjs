@@ -475,3 +475,203 @@ test('凭据不泄露（engine）：submit 的输入（prompt/references base64�
   assert.equal(saved.model, 'h3参考', 'model 可保留')
   assert.equal(saved.custom, undefined, 'custom 不得持久化')
 })
+
+// ===========================================================================
+// 并发下载限流、自动重试与真实错误诊断
+// ===========================================================================
+test('download 自动重试：瞬时网络抖动在 downloadRetries 内自动恢复，绝不重复提交', async (t) => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'tavern-store-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const store = new TaskStore({ directory: dir })
+  await store.init()
+
+  let attempts = 0
+  const media = () => {
+    attempts += 1
+    if (attempts <= 2) return new Error('socket hang up')
+    return pngBytes()
+  }
+  const { client, calls } = makeGatewayClient({
+    tasks: { t1: { status: 'succeeded', outputs: [{ url: '/files/shot.png', name: 'shot.png' }] } },
+    media,
+  })
+  const engine = new TaskEngine({
+    client,
+    store,
+    onMedia: async () => ({ url: '/api/dsh-runninghub/media?p=x', kind: 'image' }),
+    pollMs: 15,
+    downloadRetries: 3,
+    downloadRetryDelayMs: 5,
+  })
+  t.after(() => engine.dispose())
+  await engine.init()
+
+  const job = await engine.submit({ model: 'h3参考', prompt: 'x', custom: { subject: 'cat' } }, { requestId: 'auto-retry' })
+  const ready = await until(() => store.read(job.id), (j) => j && j.status === 'ready')
+  assert.equal(attempts, 3, '前两次瞬时失败应自动重试，第三次成功')
+  assert.equal(ready.attachments.length, 1)
+  assert.equal(calls.filter((c) => c.path === '/v1/images/generations').length, 1, '绝不重复提交')
+})
+
+test('download 诊断与非重试快失败：404 不空转重试，并区分下载/保存阶段与具体原因', async (t) => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'tavern-store-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const store = new TaskStore({ directory: dir })
+  await store.init()
+
+  let downloadCalls = 0
+  const fetchImpl = async (url, options = {}) => {
+    const u = new URL(url)
+    if (u.pathname === '/api/workflows') return makeResponse({ text: JSON.stringify([engineWorkflow()]) })
+    if (u.pathname === '/v1/images/generations') {
+      const body = JSON.parse(options.body || '{}')
+      return makeResponse({ text: JSON.stringify({ task_id: [body.client_request_id === 'req-404' ? 't404' : 'tsave'], accepted: 1 }) })
+    }
+    if (u.pathname === '/v1/tasks/t404') {
+      return makeResponse({ text: JSON.stringify({ status: 'succeeded', outputs: [{ url: '/files/missing.png', name: 'missing.png' }] }) })
+    }
+    if (u.pathname === '/v1/tasks/tsave') {
+      return makeResponse({ text: JSON.stringify({ status: 'succeeded', outputs: [{ url: '/files/ok.png', name: 'ok.png' }] }) })
+    }
+    if (u.pathname === '/files/missing.png') {
+      downloadCalls += 1
+      return makeResponse({ status: 404, text: JSON.stringify({ error: { message: 'file removed' } }) })
+    }
+    if (u.pathname === '/files/ok.png') {
+      return makeResponse({ bytes: pngBytes(), contentType: 'image/png' })
+    }
+    return makeResponse({ status: 404, text: '{}' })
+  }
+  const client = new GatewayClient({ baseURL: 'http://127.0.0.1:6888', fetchImpl, timeoutMs: 2000 })
+  const engine = new TaskEngine({
+    client,
+    store,
+    onMedia: async () => {
+      const err = new Error('Image exceeds the configured byte limit.')
+      err.code = 'IMAGE_TOO_LARGE'
+      throw err
+    },
+    pollMs: 15,
+    downloadRetries: 3,
+    downloadRetryDelayMs: 5,
+  })
+  t.after(() => engine.dispose())
+  await engine.init()
+
+  const job404 = await engine.submit({ model: 'h3参考', prompt: 'x', custom: { subject: 'cat' } }, { requestId: 'req-404' })
+  const failed404 = await until(() => store.read(job404.id), (j) => j && j.status === 'download_failed')
+  assert.equal(downloadCalls, 1, 'HTTP 404 属于不可重试错误，不应空转重试')
+  assert.match(failed404.error, /媒体下载失败/)
+  assert.match(failed404.error, /HTTP 404/)
+
+  const jobSave = await engine.submit({ model: 'h3参考', prompt: 'x', custom: { subject: 'cat' } }, { requestId: 'req-save' })
+  const failedSave = await until(() => store.read(jobSave.id), (j) => j && j.status === 'download_failed')
+  assert.match(failedSave.error, /附件保存失败/)
+  assert.match(failedSave.error, /byte limit/)
+})
+
+test('download 并发限流：多对话同时出片时按 downloadConcurrency 排队，不打爆连接与磁盘', async (t) => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'tavern-store-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const store = new TaskStore({ directory: dir })
+  await store.init()
+
+  let seq = 0
+  let inFlight = 0
+  let peak = 0
+  const fetchImpl = async (url) => {
+    const u = new URL(url)
+    if (u.pathname === '/api/workflows') return makeResponse({ text: JSON.stringify([engineWorkflow()]) })
+    if (u.pathname === '/v1/images/generations') {
+      seq += 1
+      return makeResponse({ text: JSON.stringify({ task_id: [`t${seq}`], accepted: 1 }) })
+    }
+    const m = /^\/v1\/tasks\/(t\d+)$/.exec(u.pathname)
+    if (m) {
+      return makeResponse({ text: JSON.stringify({ status: 'succeeded', outputs: [{ url: `/files/${m[1]}.png`, name: `${m[1]}.png` }] }) })
+    }
+    if (u.pathname.startsWith('/files/')) {
+      inFlight += 1
+      peak = Math.max(peak, inFlight)
+      await new Promise((resolve) => setTimeout(resolve, 25))
+      inFlight -= 1
+      return makeResponse({ bytes: pngBytes(), contentType: 'image/png' })
+    }
+    return makeResponse({ status: 404, text: '{}' })
+  }
+  const client = new GatewayClient({ baseURL: 'http://127.0.0.1:6888', fetchImpl, timeoutMs: 2000 })
+  const engine = new TaskEngine({
+    client,
+    store,
+    onMedia: async () => ({ url: '/api/dsh-runninghub/media?p=x', kind: 'image' }),
+    pollMs: 10,
+    downloadConcurrency: 2,
+  })
+  t.after(() => engine.dispose())
+  await engine.init()
+
+  const jobs = await Promise.all([1, 2, 3, 4].map((n) => engine.submit(
+    { model: 'h3参考', prompt: `p${n}`, custom: { subject: 'cat' } },
+    { requestId: `conc-${n}`, binding: { gameId: `game-${n}` } },
+  )))
+  for (const job of jobs) {
+    await until(() => store.read(job.id), (j) => j && j.status === 'ready')
+  }
+  assert.ok(peak <= 2, `同时在途下载峰值应不超过 2，实测 ${peak}`)
+})
+
+test('网关失败详情保留：snapshot.error 写入 job.error 供排查', async (t) => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'tavern-store-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const store = new TaskStore({ directory: dir })
+  await store.init()
+
+  const { client } = makeGatewayClient({
+    tasks: { t1: { status: 'failed', error: '四宫格与裁片已生成，视频阶段失败：上游超时', outputs: [] } },
+  })
+  const engine = new TaskEngine({ client, store, onMedia: async () => ({ url: '/api/x' }), pollMs: 15 })
+  t.after(() => engine.dispose())
+  await engine.init()
+
+  const job = await engine.submit({ model: 'h3参考', prompt: 'x', custom: { subject: 'cat' } }, { requestId: 'fail-detail' })
+  const failed = await until(() => store.read(job.id), (j) => j && j.status === 'failed')
+  assert.match(failed.error, /网关生成任务失败：四宫格与裁片已生成，视频阶段失败/)
+})
+
+test('retryDownload 同步内存引用：重试完成后再 setBinding 不会把状态写回 download_failed', async (t) => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'tavern-store-'))
+  t.after(() => rm(dir, { recursive: true, force: true }))
+  const store = new TaskStore({ directory: dir })
+  await store.init()
+
+  let downloads = 0
+  const media = () => {
+    downloads += 1
+    if (downloads === 1) return new Error('transient error')
+    return pngBytes()
+  }
+  const { client } = makeGatewayClient({
+    tasks: { t1: { status: 'succeeded', outputs: [{ url: '/files/retry-sync.png' }] } },
+    media,
+  })
+  const engine = new TaskEngine({
+    client,
+    store,
+    onMedia: async () => ({ url: '/api/dsh-runninghub/media?p=x', kind: 'image' }),
+    pollMs: 15,
+  })
+  t.after(() => engine.dispose())
+  await engine.init()
+
+  const job = await engine.submit(
+    { model: 'h3参考', prompt: 'x', custom: { subject: 'cat' } },
+    { requestId: 'retry-sync', binding: { gameId: 'g1', pending: true } },
+  )
+  await until(() => store.read(job.id), (j) => j && j.status === 'download_failed')
+  await engine.retryDownload(job.id)
+  await until(() => store.read(job.id), (j) => j && j.status === 'ready')
+
+  const rebound = await engine.setBinding(job.id, { gameId: 'g1', turn: 2, textVersion: 'v2' })
+  assert.equal(rebound.status, 'ready', 'setBinding 不得把已就绪任务覆盖回 download_failed')
+  assert.equal(rebound.attachments.length, 1)
+})

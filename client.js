@@ -17,7 +17,7 @@ window.__ModuleLoader__.load({
     let tavernUiApi = null
     const own = (object, key) => Object.prototype.hasOwnProperty.call(object || {}, key)
     // 与 index.mjs 的 PLUGIN_VERSION 对齐；对不上说明宿主侧还是旧代码（测试里有断言）。
-    const CLIENT_VERSION = '0.1.43'
+    const CLIENT_VERSION = '0.1.44'
     const message = error => typeof error === 'string' ? error : error?.message || '未知错误'
     // 探测结果的统一说法：保存和「检查连接」共用，不把原始错误当成成功。
     // 一键复制：手机上很多 WebView/非安全上下文没有 navigator.clipboard，退回 execCommand。
@@ -254,7 +254,7 @@ window.__ModuleLoader__.load({
 .rh-fail-title{display:flex;align-items:center;gap:5px;min-width:0}
 .rh-fail-title .rh-status{flex:none;font-size:8.5px}
 .rh-fail-title .rh-job-title{min-width:0;font-size:10.5px;font-weight:600;line-height:1.4;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.rh-fail-error{color:var(--rh-danger);font-size:8.5px;line-height:1.45;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.rh-fail-error{color:var(--rh-danger);font-size:8.5px;line-height:1.45;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 .rh-fail-time,.rh-fail-cost{color:var(--rh-muted);font-size:8px;white-space:nowrap;font-variant-numeric:tabular-nums}
 .rh-fail-actions{display:flex;align-items:center;gap:4px;flex:none}
 .rh-studio .rh-fail-actions .rh-btn{flex:0 0 auto;width:auto!important;height:22px;padding:2px 6px;font-size:8.5px;line-height:1.35;border-radius:6px;gap:3px}
@@ -2855,11 +2855,15 @@ window.__ModuleLoader__.load({
         return [
           alert(job.queryError ? '查询暂时失败，将自动重试。' : '', 'query-' + job.id),
           alert(job.error, 'error-' + job.id),
+          alert(downloadErrors[job.id], 'dl-error-' + job.id),
+          alert(regenerateErrors[job.id], 'regen-error-' + job.id),
           alert(job.insertionError ? '正文插入失败，媒体已保留：' + message(job.insertionError) : '', 'insertion-' + job.id),
           job.status === 'submit_unknown' ? note('先核对任务，请勿重复生成。', 'unknown-' + job.id) : null,
         ]
       }
       function jobPrimaryError(job) {
+        if (downloadErrors[job.id]) return message(downloadErrors[job.id])
+        if (regenerateErrors[job.id]) return message(regenerateErrors[job.id])
         if (job.insertionError) return '正文插入失败：' + message(job.insertionError)
         if (job.queryError) return '查询暂时失败，将自动重试'
         if (job.error) return message(job.error)
@@ -2957,6 +2961,11 @@ window.__ModuleLoader__.load({
       }
       function renderFailedJob(job) {
         const error = jobPrimaryError(job) || '任务失败'
+        const canRetryDownload = job.status === 'download_failed' && Array.isArray(job.outputs) && job.outputs.length > 0
+        const retryBtn = canRetryDownload ? button(retrying[job.id] ? '重试中…' : '重试下载', () => retryDownload(job.id),
+          Boolean(retrying[job.id]), 'retry-' + job.id, 'primary', 'refresh') : null
+        const regenBtn = canRegenerateJob(job) ? button(regenerating[job.id] ? '重新提交中…' : '重新生成', () => regenerate(job),
+          Boolean(regenerating[job.id]), 'regen-' + job.id, 'quiet', 'refresh') : null
         return h('article', { key: job.id, className: 'rh-job rh-fail-row' },
           h('div', { className: 'rh-fail-icon', 'aria-hidden': true }, icon('image', 14)),
           h('div', { className: 'rh-fail-copy' },
@@ -2967,8 +2976,7 @@ window.__ModuleLoader__.load({
             h('div', { className: 'rh-fail-error', title: error }, error)),
           h('time', { className: 'rh-fail-time' }, formatJobTime(job)),
           h('span', { className: 'rh-fail-cost' }, job.costCoins != null ? job.costCoins + ' 币' : '—'),
-          h('div', { className: 'rh-fail-actions' }, canRegenerateJob(job) ? button('重新生成', () => regenerate(job),
-            Boolean(regenerating[job.id]), 'regen-' + job.id, 'quiet', 'refresh') : null),
+          h('div', { className: 'rh-fail-actions' }, retryBtn, regenBtn),
           renderJobDetails(job, 'fail'))
       }
       function renderVideoNotice(notice) {

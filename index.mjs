@@ -38,7 +38,7 @@ import {
 export const name = 'dsh-runninghub'
 export const inject = ['tavern', 'attachments', 'credentials', 'webServer']
 // 面板上要能一眼看出「手机上跑的是哪一版」：宿主与网页各自上报，对不上就是没更新全。
-export const PLUGIN_VERSION = '0.1.43'
+export const PLUGIN_VERSION = '0.1.44'
 export const API = '/api/dsh-runninghub'
 export const MEDIA = API + '/media'
 export const REFERENCE = API + '/reference'
@@ -563,7 +563,13 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
       engineError = ''
       client = clientFactory({ baseURL, apiKey, fetchImpl, allowPrivateLan })
       clientIdentity = identity
-      const next = new TaskEngine({ client, store, onMedia, onChange, pollMs: options.pollMs ?? 5000 })
+      const next = new TaskEngine({
+        client, store, onMedia, onChange,
+        pollMs: options.pollMs ?? 5000,
+        downloadConcurrency: options.downloadConcurrency ?? 2,
+        downloadRetries: options.downloadRetries ?? 3,
+        downloadRetryDelayMs: options.downloadRetryDelayMs ?? 1500,
+      })
       try {
         await next.init()
         engine = next
@@ -1829,7 +1835,10 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
       // 没认领的预提交会一直挂着 pending（卡片上显示「已绑定正文」却永远不落位）。
       if (claimed.has(job.requestId)) continue
       droppedPreclaims.add(job.id)
-      try { await store.write({ ...job, binding: {} }) } catch { /* 内存标记已经拦住落位 */ }
+      try {
+        if (engine?.setBinding) await engine.setBinding(job.id, {})
+        else await store.write({ ...job, binding: {} })
+      } catch { /* 内存标记已经拦住落位 */ }
       dropped += 1
     }
     return dropped

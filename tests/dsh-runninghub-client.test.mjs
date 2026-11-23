@@ -961,3 +961,29 @@ test('splitPortPrompt：模型把标记写在同一行（image###正文###）也
   assert.deepEqual(splitPortPrompt(sameLine, 'first-frame'), { prompt: 'B shot', imagePrompt: 'A shot' })
   assert.throws(() => splitPortPrompt('image###只有生图###', 'first-frame'), /两段提示词/)
 })
+
+test('downloadTimeoutMs：媒体下载单独使用更长超时，不受 JSON 20s 限制掐断', async () => {
+  const fetchImpl = async (url, options = {}) => {
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(resolve, 60)
+      options.signal?.addEventListener('abort', () => {
+        clearTimeout(timer)
+        reject(new DOMException('Aborted', 'AbortError'))
+      }, { once: true })
+    })
+    const u = new URL(url)
+    if (u.pathname.startsWith('/files/')) {
+      return makeResponse({ bytes: pngBytes(), contentType: 'image/png' })
+    }
+    return makeResponse({ text: '[]' })
+  }
+  const client = new GatewayClient({
+    baseURL: 'http://127.0.0.1:6888',
+    fetchImpl,
+    timeoutMs: 25,
+    downloadTimeoutMs: 500,
+  })
+  await assert.rejects(() => client.listWorkflows(), (error) => error instanceof GatewayError && error.code === 'ABORTED')
+  const media = await client.download({ url: '/files/slow.png' })
+  assert.equal(media.mediaType, 'image/png')
+})
