@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { mkdir, readFile, readdir, rename, open, unlink } from 'node:fs/promises'
 import { constants, createReadStream } from 'node:fs'
+import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { homedir } from 'node:os'
 import path from 'node:path'
@@ -38,7 +39,8 @@ import {
 export const name = 'dsh-runninghub'
 export const inject = ['tavern', 'attachments', 'credentials', 'webServer']
 // 面板上要能一眼看出「手机上跑的是哪一版」：宿主与网页各自上报，对不上就是没更新全。
-export const PLUGIN_VERSION = '0.1.44'
+export const PLUGIN_VERSION = '0.1.45'
+export const LINKED_MEDIA_KIND = 'dsh-runninghub/media'
 export const API = '/api/dsh-runninghub'
 export const MEDIA = API + '/media'
 export const REFERENCE = API + '/reference'
@@ -407,17 +409,36 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     const existing = items.find(item => item.textVersion === binding.textVersion && item.data?.runninghubJob === job.id && item.data?.outputIndex === outputIndex)
     const failed = ['failed', 'submit_unknown', 'download_failed'].includes(job.status)
     const attachment = media?.attachment ? await attachmentWithBytes(media.attachment) : undefined
-    const changes = { kind: media?.kind || 'video', status: media ? 'ready' : failed ? 'failed' : 'pending',
-      ...(attachment ? { attachment } : {}), error: media ? '' : failed ? job.error || '生成未完成' : '',
-      anchor: binding.anchor || '', caption: binding.caption || `RunningHub · ${job.model}` }
+    const linked = Boolean(media && !attachment && typeof media.url === 'string' && media.url)
+    const data = linked
+      ? {
+        runninghubJob: job.id,
+        outputIndex,
+        mediaKind: media.kind || 'video',
+        mediaUrl: media.url,
+        ...(media.mediaType ? { mediaType: media.mediaType } : {}),
+        ...(media.name ? { name: media.name } : {}),
+      }
+      : { runninghubJob: job.id, outputIndex }
+    const changes = {
+      kind: linked ? LINKED_MEDIA_KIND : (media?.kind || 'video'),
+      status: media ? 'ready' : failed ? 'failed' : 'pending',
+      ...(attachment ? { attachment } : {}),
+      error: media ? '' : failed ? job.error || '生成未完成' : '',
+      anchor: binding.anchor || '',
+      caption: binding.caption || `RunningHub · ${job.model}`,
+      ...(linked ? { data } : {}),
+    }
     if (existing) {
       const previous = existing.attachment
       const sizeChanged = Boolean(attachment && previous?.attachmentId === attachment.attachmentId
         && Number(previous.bytes) !== attachment.bytes)
+      const linkChanged = Boolean(linked && (existing.kind !== LINKED_MEDIA_KIND || existing.data?.mediaUrl !== media.url))
       if (existing.status !== 'ready'
         || (attachment && previous?.attachmentId !== attachment.attachmentId)
-        || sizeChanged) await ctx.tavern.update(existing.id, changes)
-    } else await ctx.tavern.attach({ ...binding, item: { ...changes, data: { runninghubJob: job.id, outputIndex } } })
+        || sizeChanged
+        || linkChanged) await ctx.tavern.update(existing.id, changes)
+    } else await ctx.tavern.attach({ ...binding, item: { ...changes, data } })
     return true
   }
   /**
@@ -435,8 +456,8 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
       if (item.textVersion !== binding.textVersion || item.data?.runninghubJob !== job.id) continue
       const index = Number(item.data?.outputIndex)
       // 只处理中间图和还没落到实处的占位；视频、音频等其余产物保持原样。
-      const intermediate = item.kind === 'image' || attachments[index]?.kind === 'image'
-        || (!item.attachment && !videoIndexes.has(index))
+      const intermediate = item.kind === 'image' || item.data?.mediaKind === 'image' || attachments[index]?.kind === 'image'
+        || (!item.attachment && !item.data?.mediaUrl && !videoIndexes.has(index))
       if (!intermediate) continue
       try { await ctx.tavern.remove(item.id) } catch { /* 宿主不支持或该项已不存在 */ }
     }
@@ -524,14 +545,29 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
       insertionErrors.set(job.id, sanitizeMessage(error.message))
     })
   }
+  const directLink = options.directLink !== false
   async function onMedia(job, media) {
-    const attachment = media.kind === 'image'
-      ? await ctx.attachments.saveImage({ data: media.data, mediaType: media.mediaType, name: media.name })
-      : await ctx.attachments.saveFile({ data: media.data, name: media.name })
-    // Video refs deliberately have no mediaType: Tavern validates that field as an image.
-    const ref = media.kind === 'image' ? attachment : { attachmentId: attachment.attachmentId, name: attachment.name, bytes: attachment.bytes }
-    const saved = { kind: media.kind, name: media.name, mediaType: media.mediaType, attachment: ref,
-      url: `${MEDIA}?id=${job.id}&index=${job.outputIndex}` }
+    let saved
+    if (media?.linked === true) {
+      // 直链模式：网关已经把成品落在本地文件里，不再二次下载和写入宿主附件库，
+      // 既省一倍存储与图片重编码开销，也彻底绕开 Android 原生 APK 上 dsh-attachment-local 对 /data/user/0 的 EACCES。
+      saved = {
+        kind: media.kind,
+        name: media.name,
+        mediaType: media.mediaType,
+        linked: true,
+        ...(typeof media.path === 'string' && media.path ? { remotePath: media.path } : {}),
+        url: `${MEDIA}?id=${job.id}&index=${job.outputIndex}`,
+      }
+    } else {
+      const attachment = media.kind === 'image'
+        ? await ctx.attachments.saveImage({ data: media.data, mediaType: media.mediaType, name: media.name })
+        : await ctx.attachments.saveFile({ data: media.data, name: media.name })
+      // Video refs deliberately have no mediaType: Tavern validates that field as an image.
+      const ref = media.kind === 'image' ? attachment : { attachmentId: attachment.attachmentId, name: attachment.name, bytes: attachment.bytes }
+      saved = { kind: media.kind, name: media.name, mediaType: media.mediaType, attachment: ref,
+        url: `${MEDIA}?id=${job.id}&index=${job.outputIndex}` }
+    }
     // 同一任务后面还有成片视频时，中间图只留在任务记录里供面板预览，不先挂进正文；
     // 视频最终失败会由对账回退成图片，视频成功则只保留成片。
     const expectsVideo = (Array.isArray(job.outputs) ? job.outputs : []).some(output => output?.kind === 'video')
@@ -569,6 +605,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
         downloadConcurrency: options.downloadConcurrency ?? 2,
         downloadRetries: options.downloadRetries ?? 3,
         downloadRetryDelayMs: options.downloadRetryDelayMs ?? 1500,
+        directLink,
       })
       try {
         await next.init()
@@ -1010,7 +1047,8 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     const attachments = (Array.isArray(job.attachments) ? job.attachments : []).map(item => {
       if (!item || typeof item !== 'object' || !['video', 'image', 'audio'].includes(item.kind)) return undefined
       const saved = { kind: item.kind }
-      for (const key of ['name', 'mediaType', 'url']) if (typeof item[key] === 'string' && item[key]) saved[key] = item[key]
+      for (const key of ['name', 'mediaType', 'url', 'remotePath']) if (typeof item[key] === 'string' && item[key]) saved[key] = item[key]
+      if (item.linked === true) saved.linked = true
       if (item.attachment && typeof item.attachment === 'object' && typeof item.attachment.attachmentId === 'string') saved.attachment = item.attachment
       return saved
     }).filter(Boolean)
@@ -1075,7 +1113,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
         changed = true
         continue
       }
-      const video = entry.attachments?.find(item => item.kind === 'video' && item.attachment)
+      const video = entry.attachments?.find(item => item.kind === 'video' && (item.attachment || item.url))
       if (!video) {
         entry.status = 'failed'
         entry.summary = '失败'
@@ -1109,19 +1147,28 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
         continue
       }
       try {
-        const attachment = await attachmentWithBytes(video.attachment)
+        const linked = !video.attachment && typeof video.url === 'string' && video.url
+        const attachment = video.attachment ? await attachmentWithBytes(video.attachment) : undefined
         await attachPregenItem({
           gameId,
           turn: binding.turn,
           textVersion: binding.textVersion,
           entryId: entry.id,
           item: {
-            kind: 'video',
+            kind: linked ? LINKED_MEDIA_KIND : 'video',
             status: 'ready',
-            attachment,
+            ...(attachment ? { attachment } : {}),
             ...(send.anchor ? { anchor: send.anchor } : {}),
             caption: send.caption || `RunningHub · ${entry.description}`,
-            data: { runninghubPregen: entry.id },
+            data: linked
+              ? {
+                runninghubPregen: entry.id,
+                mediaKind: 'video',
+                mediaUrl: video.url,
+                ...(video.mediaType ? { mediaType: video.mediaType } : {}),
+                ...(video.name ? { name: video.name } : {}),
+              }
+              : { runninghubPregen: entry.id },
           },
         })
         entry.status = 'used'
@@ -1531,15 +1578,24 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     }
     if (anchor !== undefined && (typeof anchor !== 'string' || anchor.length > 500)) throw fail('anchor 必须是最多 500 字的正文原句')
     if (caption !== undefined && (typeof caption !== 'string' || caption.length > 500)) throw fail('caption 必须是最多 500 字')
-    const video = entry.attachments?.find(item => item.kind === 'video' && item.attachment)
+    const video = entry.attachments?.find(item => item.kind === 'video' && (item.attachment || item.url))
     if (!video) throw fail('这条视频还没有可发送的产物')
+    const linked = !video.attachment && typeof video.url === 'string' && video.url
     const item = {
-      kind: 'video',
+      kind: linked ? LINKED_MEDIA_KIND : 'video',
       status: 'ready',
-      attachment: await attachmentWithBytes(video.attachment),
+      ...(video.attachment ? { attachment: await attachmentWithBytes(video.attachment) } : {}),
       ...(anchor ? { anchor } : {}),
       caption: caption || `RunningHub · ${entry.description}`,
-      data: { runninghubPregen: entry.id },
+      data: linked
+        ? {
+          runninghubPregen: entry.id,
+          mediaKind: 'video',
+          mediaUrl: video.url,
+          ...(video.mediaType ? { mediaType: video.mediaType } : {}),
+          ...(video.name ? { name: video.name } : {}),
+        }
+        : { runninghubPregen: entry.id },
     }
     const info = await pregenTurnInfo(gameId)
     let queued = false
@@ -2669,8 +2725,58 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     const id = validateJobId(query.get('id'))
     const raw = query.get('index')
     if (!/^(?:0|[1-9]\d{0,3})$/.test(raw ?? '')) throw fail('附件索引无效')
-    const item = (await store.read(id))?.attachments?.[Number(raw)]
-    if (!item?.attachment || !['video/mp4', 'video/webm', 'image/png', 'image/jpeg', 'image/webp'].includes(item.mediaType)) throw fail('媒体不存在', 'NOT_FOUND')
+    const index = Number(raw)
+    const job = await store.read(id)
+    const item = job?.attachments?.[index]
+    if (!item || !['video/mp4', 'video/webm', 'image/png', 'image/jpeg', 'image/webp'].includes(item.mediaType)) throw fail('媒体不存在', 'NOT_FOUND')
+    // 兼容旧任务（已有宿主附件引用）与新任务（直链本地网关文件流式透传）。
+    if (!item.attachment) {
+      const output = item.remotePath
+        ? { path: item.remotePath, name: item.name, kind: item.kind }
+        : job?.outputs?.[index]
+      if (!output || (!output.path && !output.url)) throw fail('媒体不存在', 'NOT_FOUND')
+      if (req.headers.range) {
+        const match = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range.trim())
+        if (!match || (!match[1] && !match[2])) {
+          res.writeHead(416, { 'content-range': 'bytes */*' })
+          return res.end()
+        }
+      }
+      const active = await connect()
+      const controller = new AbortController()
+      const abort = () => controller.abort()
+      res.on?.('close', abort)
+      let upstream
+      try {
+        upstream = await active.client.streamMedia(output, {
+          method: req.method,
+          range: req.headers.range,
+          signal: controller.signal,
+        })
+        if (upstream.status === 416) {
+          res.writeHead(416, { ...(upstream.contentRange ? { 'content-range': upstream.contentRange } : {}) })
+          return res.end()
+        }
+        res.writeHead(upstream.status, {
+          'content-type': upstream.mediaType || item.mediaType,
+          ...(upstream.contentLength ? { 'content-length': upstream.contentLength } : {}),
+          ...(upstream.contentRange ? { 'content-range': upstream.contentRange } : {}),
+          'accept-ranges': upstream.acceptRanges || 'bytes',
+          'cache-control': 'private, max-age=3600',
+          'x-content-type-options': 'nosniff',
+        })
+        if (req.method === 'HEAD' || !upstream.body) return res.end()
+        try {
+          await pipeline(Readable.fromWeb(upstream.body), res)
+        } catch (error) {
+          if (controller.signal.aborted || error?.code === 'ERR_STREAM_PREMATURE_CLOSE' || error?.code === 'ABORT_ERR') return
+          throw error
+        }
+      } finally {
+        res.off?.('close', abort)
+      }
+      return
+    }
     let bytes, handle, file
     if (item.kind === 'image') bytes = (await ctx.attachments.readImage(item.attachment)).data
     else {

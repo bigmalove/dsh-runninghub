@@ -41,3 +41,61 @@ test('正文媒体样式：apply 时注入一次，且可重复调用不重复�
   assert.match(source, /document\.head\.querySelector\(selector\)/)
   assert.match(source, /if \(style\.textContent !== chatMediaCss\) style\.textContent = chatMediaCss/)
 })
+
+test('直链媒体渲染器：注册 dsh-runninghub/media 并只渲染同源代理地址', async () => {
+  const vm = await import('node:vm')
+  let loaded = null
+  const sandbox = {
+    window: { __ModuleLoader__: { load(spec) { loaded = spec } } },
+    console,
+    URL,
+    setTimeout,
+    clearTimeout,
+  }
+  vm.runInNewContext(source, sandbox)
+  assert.ok(loaded, 'client.js 应调用 __ModuleLoader__.load')
+  const React = {
+    createElement(type, props, ...children) { return { type, props: props || {}, children } },
+    useEffect() {},
+    useRef() { return { current: null } },
+    useState(v) { return [typeof v === 'function' ? v() : v, () => {}] },
+  }
+  const plugin = loaded.factory(name => (name === 'react' ? React : {}))
+  const renderers = new Map()
+  plugin.apply({
+    tavernUi: {
+      registerPanel() {},
+      registerMediaRenderer(kind, render) { renderers.set(kind, render) },
+    },
+  })
+  const render = renderers.get('dsh-runninghub/media')
+  assert.equal(typeof render, 'function', '必须注册 dsh-runninghub/media 渲染器')
+
+  const videoEl = render({
+    item: {
+      status: 'ready',
+      caption: '片尾',
+      data: { mediaKind: 'video', mediaUrl: '/api/dsh-runninghub/media?id=11111111-2222-4333-8444-555555555555&index=0' },
+    },
+  })
+  assert.equal(videoEl.type, 'video')
+  assert.equal(videoEl.props.src, '/api/dsh-runninghub/media?id=11111111-2222-4333-8444-555555555555&index=0')
+
+  const imgEl = render({
+    item: {
+      status: 'ready',
+      caption: '漫画页',
+      data: { mediaKind: 'image', mediaUrl: '/api/dsh-runninghub/media?id=11111111-2222-4333-8444-555555555555&index=0' },
+    },
+  })
+  assert.equal(imgEl.type, 'a')
+  assert.equal(imgEl.children[0].type, 'img')
+
+  const rejected = render({
+    item: {
+      status: 'ready',
+      data: { mediaKind: 'video', mediaUrl: 'http://evil.example/a.mp4' },
+    },
+  })
+  assert.equal(rejected, null, '非同源代理地址必须被拒绝')
+})

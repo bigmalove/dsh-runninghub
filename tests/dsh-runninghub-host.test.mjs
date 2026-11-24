@@ -182,7 +182,34 @@ function makeGatewayFetch({
     }
     if (u.pathname.startsWith('/files/')) {
       const video = u.pathname.endsWith('.mp4')
-      return new Response(video ? MP4_BYTES : PNG_BYTES, { status: 200, headers: { 'content-type': video ? 'video/mp4' : 'image/png' } })
+      const bytes = video ? MP4_BYTES : PNG_BYTES
+      const mime = video ? 'video/mp4' : 'image/png'
+      const rangeHeader = opts.headers?.range || opts.headers?.Range
+      if (rangeHeader) {
+        const match = /^bytes=(\d*)-(\d*)$/.exec(String(rangeHeader))
+        if (!match || (!match[1] && !match[2])) {
+          return new Response(null, { status: 416, headers: { 'content-range': `bytes */${bytes.length}` } })
+        }
+        const start = match[1] ? Number(match[1]) : Math.max(0, bytes.length - Number(match[2]))
+        const end = match[1] && match[2] ? Math.min(bytes.length - 1, Number(match[2])) : bytes.length - 1
+        if (start < 0 || start > end || start >= bytes.length) {
+          return new Response(null, { status: 416, headers: { 'content-range': `bytes */${bytes.length}` } })
+        }
+        const slice = bytes.subarray(start, end + 1)
+        return new Response(opts.method === 'HEAD' ? null : slice, {
+          status: 206,
+          headers: {
+            'content-type': mime,
+            'content-length': String(slice.length),
+            'content-range': `bytes ${start}-${end}/${bytes.length}`,
+            'accept-ranges': 'bytes',
+          },
+        })
+      }
+      return new Response(opts.method === 'HEAD' ? null : bytes, {
+        status: 200,
+        headers: { 'content-type': mime, 'content-length': String(bytes.length), 'accept-ranges': 'bytes' },
+      })
     }
     return new Response(JSON.stringify({ error: 'not found' }), { status: 404 })
   }
@@ -614,10 +641,54 @@ describe('binding: getTurnState + getTurn version pinning', () => {
 })
 
 // =====================================================================
-describe('onMedia: image uses saveImage(with mediaType), video uses saveFile(without mediaType)', () => {
-  test('image download calls saveImage with mediaType', async () => {
+describe('onMedia: 默认直链网关不二次落盘；legacy 模式仍兼容 saveImage/saveFile', () => {
+  test('默认直链模式：不调用 saveImage/saveFile（即使宿主附件库报 EACCES 也正常完成）', async () => {
+    const gateway = makeGatewayFetch({ outputs: ['image', 'video'] })
+    const { host, ctx, calls } = await makeHost({ configured: true, gateway })
+    // 模拟 Android 原生 APK 上 dsh-attachment-local 对 /data/user/0 报 EACCES
+    ctx.attachments.saveImage = async () => { throw Object.assign(new Error("EACCES: permission denied, open '/data/user/0'"), { code: 'EACCES' }) }
+    ctx.attachments.saveFile = async () => { throw Object.assign(new Error("EACCES: permission denied, open '/data/user/0'"), { code: 'EACCES' }) }
+    const job = await host.dispatch({ action: 'submit', requestId: 'req-direct-link', input: { model: 'demo', prompt: 'x' }, bindToTurn: false })
+    const ready = await waitForJob(host, job.id, j => j.status === 'ready')
+    assert.equal(calls.saveImage.length, 0, '直链模式不应调用 saveImage')
+    assert.equal(calls.saveFile.length, 0, '直链模式不应调用 saveFile')
+    assert.equal(ready.attachments.length, 2)
+    assert.equal(ready.attachments[0].linked, true)
+    assert.equal(ready.attachments[1].linked, true)
+    assert.equal(ready.attachments[1].kind, 'video')
+    assert.equal(ready.attachments[1].url, `${MEDIA}?id=${job.id}&index=1`)
+  })
+
+  test('旧版 download_failed 任务在直链模式下点重试下载会立刻链接就绪，不重提不碰附件库', async () => {
+    const gateway = makeGatewayFetch({ kind: 'video' })
+    const { host, ctx } = await makeHost({ configured: true, gateway })
+    ctx.attachments.saveFile = async () => { throw new Error("EACCES: permission denied, open '/data/user/0'") }
+    const stuckId = '11111111-2222-4333-8444-555555555555'
+    await host.store.write({
+      id: stuckId,
+      requestId: 'old-stuck',
+      status: 'download_failed',
+      remoteStatus: 'succeeded',
+      remoteTaskId: 'task-old',
+      model: 'demo',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      outputs: [{ path: 'out/result.mp4', url: `${BASE}/files/out/result.mp4`, kind: 'video', name: 'result.mp4' }],
+      attachments: [],
+      completedOutputs: [],
+      error: "附件保存失败（result.mp4：EACCES: permission denied, open '/data/user/0'），可仅重试下载",
+    })
+    await host.dispatch({ action: 'list' })
+    await host.dispatch({ action: 'retry-download', id: stuckId })
+    const ready = await waitForJob(host, stuckId, j => j.status === 'ready')
+    assert.equal(ready.attachments.length, 1)
+    assert.equal(ready.attachments[0].linked, true)
+    assert.equal(gateway.generations(), 0, '重试链接绝不重新提交网关')
+  })
+
+  test('legacy 模式（directLink: false）：image download calls saveImage with mediaType', async () => {
     const gateway = makeGatewayFetch({ kind: 'image' })
-    const { host, calls } = await makeHost({ configured: true, gateway })
+    const { host, calls } = await makeHost({ configured: true, gateway, extraOptions: { directLink: false } })
     const job = await host.dispatch({ action: 'submit', requestId: 'req-img', input: { model: 'demo', prompt: 'x' }, bindToTurn: false })
     await waitForJob(host, job.id, j => j.status === 'ready')
     assert.equal(calls.saveImage.length, 1, 'image must call saveImage')
@@ -625,9 +696,9 @@ describe('onMedia: image uses saveImage(with mediaType), video uses saveFile(wit
     assert.equal(calls.saveImage[0].mediaType, 'image/png', 'saveImage must receive mediaType')
   })
 
-  test('video download calls saveFile without mediaType', async () => {
+  test('legacy 模式（directLink: false）：video download calls saveFile without mediaType', async () => {
     const gateway = makeGatewayFetch({ kind: 'video' })
-    const { host, calls } = await makeHost({ configured: true, gateway })
+    const { host, calls } = await makeHost({ configured: true, gateway, extraOptions: { directLink: false } })
     const job = await host.dispatch({ action: 'submit', requestId: 'req-vid', input: { model: 'demo', prompt: 'x' }, bindToTurn: false })
     await waitForJob(host, job.id, j => j.status === 'ready')
     assert.equal(calls.saveFile.length, 1, 'video must call saveFile')
@@ -675,8 +746,9 @@ describe('管线任务（先图片后视频）只把成片视频挂进正文', (
     assert.deepEqual(ready.attachments.map(item => item.kind), ['image', 'video'], '任务记录仍保留中间图供面板预览')
     await host.reconcile()
     const attached = fake.items.filter(item => item.data?.runninghubJob === job.id)
-    assert.deepEqual(attached.map(item => [item.kind, item.data.outputIndex]), [['video', 1]],
+    assert.deepEqual(attached.map(item => [item.kind, item.data.mediaKind, item.data.outputIndex]), [['dsh-runninghub/media', 'video', 1]],
       '正文里只应有成片视频，不能同时出现中间图')
+    assert.equal(attached[0].data.mediaUrl, `${MEDIA}?id=${job.id}&index=1`)
   })
 
   test('旧版本已经挂上的中间图会在对账时移除', async () => {
@@ -692,7 +764,7 @@ describe('管线任务（先图片后视频）只把成片视频挂进正文', (
     await host.reconcile()
     assert.equal(fake.items.some(item => item.id === 'legacy-image'), false, '同一任务的中间图必须被移除')
     const remaining = fake.items.filter(item => item.data?.runninghubJob === job.id)
-    assert.deepEqual(remaining.map(item => item.kind), ['video'], '移除中间图后仍保留视频')
+    assert.deepEqual(remaining.map(item => [item.kind, item.data.mediaKind]), [['dsh-runninghub/media', 'video']], '移除中间图后仍保留视频')
   })
 })
 

@@ -17,7 +17,7 @@ window.__ModuleLoader__.load({
     let tavernUiApi = null
     const own = (object, key) => Object.prototype.hasOwnProperty.call(object || {}, key)
     // 与 index.mjs 的 PLUGIN_VERSION 对齐；对不上说明宿主侧还是旧代码（测试里有断言）。
-    const CLIENT_VERSION = '0.1.44'
+    const CLIENT_VERSION = '0.1.45'
     const message = error => typeof error === 'string' ? error : error?.message || '未知错误'
     // 探测结果的统一说法：保存和「检查连接」共用，不把原始错误当成成功。
     // 一键复制：手机上很多 WebView/非安全上下文没有 navigator.clipboard，退回 execCommand。
@@ -3379,6 +3379,31 @@ window.__ModuleLoader__.load({
         tavernUiApi = ctx.tavernUi || null
         // 正文成片按列宽铺满（覆盖 Tavern 的 640px / 70vh 双上限）。
         try { installChatMediaCss() } catch (error) { console.warn('[dsh-runninghub] 正文媒体样式注入失败', error) }
+        // 直链媒体渲染器：成片不二次落盘到宿主附件库，直接经同源 /api/dsh-runninghub/media 代理播放，
+        // 避免移动端重复占盘与 Android 原生 APK 上 dsh-attachment-local 对 /data/user/0 的权限报错。
+        if (typeof ctx.tavernUi.registerMediaRenderer === 'function') {
+          try {
+            ctx.tavernUi.registerMediaRenderer('dsh-runninghub/media', ({ item }) => {
+              if (!item) return null
+              if (item.status === 'pending') {
+                return h('div', { className: 'dsh-tavern-plugin-media-pending', role: 'status' },
+                  typeof item.progress === 'number' ? '生成中… ' + Math.round(item.progress * 100) + '%' : '生成中…')
+              }
+              if (item.status === 'failed') {
+                return h('div', { className: 'dsh-tavern-plugin-media-failed', role: 'status' },
+                  item.error ? '生成失败：' + item.error : '生成失败')
+              }
+              const rawUrl = item.data?.mediaUrl || item.url || ''
+              const url = isMediaUrl(rawUrl) ? rawUrl : ''
+              if (!url) return null
+              if (item.data?.mediaKind === 'image') {
+                return h('a', { href: url, target: '_blank', rel: 'noreferrer', title: '打开图片' },
+                  h('img', { src: url, alt: item.caption || '插图', loading: 'lazy' }))
+              }
+              return h('video', { src: url, controls: true, preload: 'metadata', playsInline: true, onError: retryMediaOnce })
+            })
+          } catch (error) { console.warn('[dsh-runninghub] 直链媒体渲染器注册失败', error) }
+        }
         // 正文标记（非工具调用模式）：生成过程中先把整块提示词藏成一个镜头占位，
         // 避免提示词在正文里闪一下；插件会把它写进 Tavern 正则库，结算后从正文显示和提示词里移除。
         if (typeof ctx.tavernUi.registerTextMarker === 'function') {

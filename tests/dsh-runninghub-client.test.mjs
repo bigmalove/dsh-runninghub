@@ -987,3 +987,37 @@ test('downloadTimeoutMs：媒体下载单独使用更长超时，不受 JSON 20s
   const media = await client.download({ url: '/files/slow.png' })
   assert.equal(media.mediaType, 'image/png')
 })
+
+test('streamMedia：透传 Range/HEAD/鉴权头并拒绝 HTML 伪装响应', async () => {
+  const seen = []
+  const mp4 = new Uint8Array([0, 0, 0, 20, 102, 116, 121, 112, 113, 116, 32, 32, 0, 0, 0, 0])
+  const fetchImpl = async (url, options = {}) => {
+    seen.push({ url, method: options.method, headers: options.headers })
+    const u = new URL(url)
+    if (u.pathname === '/files/u/bad.mp4') {
+      return makeResponse({ text: '<html>oops</html>', contentType: 'text/html' })
+    }
+    if (u.pathname === '/files/u/gone.mp4') {
+      return makeResponse({ status: 404, text: 'not found', contentType: 'text/plain' })
+    }
+    if (options.headers?.range === 'bytes=0-3') {
+      return makeResponse({
+        status: 206,
+        bytes: mp4.subarray(0, 4),
+        contentType: 'video/mp4',
+        headers: { 'content-range': `bytes 0-3/${mp4.length}`, 'accept-ranges': 'bytes' },
+      })
+    }
+    return makeResponse({ bytes: mp4, contentType: 'video/mp4' })
+  }
+  const client = new GatewayClient({ baseURL: 'http://127.0.0.1:6888', apiKey: 'secret-key', fetchImpl, timeoutMs: 2000 })
+  const res = await client.streamMedia({ path: 'u/clip.mp4' }, { method: 'GET', range: 'bytes=0-3' })
+  assert.equal(res.status, 206)
+  assert.equal(res.mediaType, 'video/mp4')
+  assert.equal(seen[0].headers.authorization, 'Bearer secret-key')
+  assert.equal(seen[0].headers.range, 'bytes=0-3')
+  await res.body?.cancel().catch(() => {})
+
+  await assert.rejects(() => client.streamMedia({ path: 'u/bad.mp4' }), (error) => error instanceof GatewayError && error.code === 'INVALID_MEDIA')
+  await assert.rejects(() => client.streamMedia({ path: 'u/gone.mp4' }), (error) => error instanceof GatewayError && error.code === 'NOT_FOUND')
+})
