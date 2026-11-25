@@ -17,7 +17,7 @@ window.__ModuleLoader__.load({
     let tavernUiApi = null
     const own = (object, key) => Object.prototype.hasOwnProperty.call(object || {}, key)
     // 与 index.mjs 的 PLUGIN_VERSION 对齐；对不上说明宿主侧还是旧代码（测试里有断言）。
-    const CLIENT_VERSION = '0.1.45'
+    const CLIENT_VERSION = '0.1.46'
     const message = error => typeof error === 'string' ? error : error?.message || '未知错误'
     // 探测结果的统一说法：保存和「检查连接」共用，不把原始错误当成成功。
     // 一键复制：手机上很多 WebView/非安全上下文没有 navigator.clipboard，退回 execCommand。
@@ -332,7 +332,211 @@ window.__ModuleLoader__.load({
 .dsh-tavern-plugin-media[data-owner*="runninghub" i] img{display:block;width:100%;height:auto;max-width:100%;max-height:none;object-fit:contain;border-radius:12px}
 .dsh-tavern-plugin-media[data-owner*="runninghub" i] video{display:block;width:100%;max-width:100%;max-height:none;border-radius:12px}
 .dsh-tavern-plugin-media[data-owner*="runninghub" i] figcaption{display:block;margin-top:8px;font-size:12px;color:var(--dsw-alias-label-secondary)}
+.dsh-tavern-illustration[data-kind="dsh-runninghub/media"]{display:block;align-self:stretch;width:auto;max-width:100%}
+.dsh-tavern-illustration[data-kind="dsh-runninghub/media"] img{display:block;width:100%;height:auto;max-width:100%;max-height:none;object-fit:contain}
+.rh-chat-image-box{display:block;align-self:stretch;width:100%;max-width:100%}
+img.rh-chat-image{display:block;width:100%!important;height:auto!important;max-width:100%!important;max-height:none!important;object-fit:contain;border-radius:12px;cursor:zoom-in;-webkit-touch-callout:none}
+.rh-image-viewer::backdrop{background:rgba(0,0,0,.92)}
 `
+    // 原生 APK 的 WebView 里，宿主插图容器的样式和桌面端不完全一样，光靠样式表撑不开宽度：
+    // 图片挂载后从 img 往上走到插图容器为止，把这几层逐个改成「拉伸 + 100% 列宽」，
+    // 行内 !important 优先级最高，宿主再怎么写 max-width/max-height 都压不住。
+    const MEDIA_HOST = '.dsh-tavern-illustration, .dsh-tavern-plugin-media, figure'
+    function stretchChatImage(img) {
+      if (!img || !img.style) return
+      const force = (style, name, value) => { try { style.setProperty(name, value, 'important') } catch {} }
+      force(img.style, 'width', '100%')
+      force(img.style, 'max-width', '100%')
+      force(img.style, 'height', 'auto')
+      force(img.style, 'max-height', 'none')
+      const host = typeof img.closest === 'function' ? img.closest(MEDIA_HOST) : null
+      let current = img.parentElement
+      for (let depth = 0; current && depth < 6; depth++) {
+        force(current.style, 'align-self', 'stretch')
+        force(current.style, 'width', '100%')
+        force(current.style, 'max-width', '100%')
+        force(current.style, 'max-height', 'none')
+        force(current.style, 'box-sizing', 'border-box')
+        // 没找到宿主容器时只动直接父级，不往正文结构里乱改。
+        if (!host || current === host) break
+        current = current.parentElement
+      }
+    }
+    // 正文插图：等宽铺满；点开后是插件自己的全屏查看器（适应屏幕、双指缩放、双击放大、拖动），
+    // 不再走 <a target=_blank>——APK 里那会以原始像素打开且不能缩放。
+    function ChatImage({ url, caption }) {
+      const imgRef = useRef(null)
+      const [open, setOpen] = useState(false)
+      useEffect(() => { stretchChatImage(imgRef.current) })
+      return h('div', { className: 'rh-chat-image-box' },
+        h('img', {
+          ref: imgRef, className: 'rh-chat-image', src: url, alt: caption || '插图', loading: 'lazy', decoding: 'async',
+          title: '点击查看大图（双指缩放 / 双击放大）', draggable: false,
+          style: { display: 'block', width: '100%', maxWidth: '100%', height: 'auto', maxHeight: 'none', objectFit: 'contain', borderRadius: 12, cursor: 'zoom-in' },
+          onClick: event => {
+            event.preventDefault()
+            event.stopPropagation()
+            // 新宿主（tavernUi 第 11 版）有酒馆自己的大图查看器，和点开酒馆插图是同一个界面；旧宿主退回插件自带的查看器。
+            if (typeof tavernUiApi?.openImage === 'function') {
+              try { tavernUiApi.openImage({ src: url, alt: caption || '插图' }); return } catch (error) { console.warn('[dsh-runninghub] 酒馆大图查看器打开失败，改用插件自带查看器', error) }
+            }
+            setOpen(true)
+          },
+        }),
+        open ? h(ImageViewer, { url, caption, onClose: () => setOpen(false) }) : null)
+    }
+    const VIEWER_MAX_SCALE = 8
+    function ImageViewer({ url, caption, onClose }) {
+      const dialogRef = useRef(null)
+      const stageRef = useRef(null)
+      const imgRef = useRef(null)
+      const [view, setView] = useState({ scale: 1, x: 0, y: 0 })
+      const [gesturing, setGesturing] = useState(false)
+      const viewRef = useRef(view)
+      viewRef.current = view
+      const pointers = useRef(new Map())
+      const gesture = useRef(null)
+      const lastTap = useRef({ at: 0, x: 0, y: 0 })
+      const closeRef = useRef(onClose)
+      closeRef.current = onClose
+
+      // 把平移限制在图片边缘以内：放大后能看到四角，但不会把图拖出屏幕。
+      function clampView(next) {
+        const scale = Math.max(1, Math.min(VIEWER_MAX_SCALE, next.scale))
+        const stage = stageRef.current
+        const img = imgRef.current
+        if (!stage || !img || scale <= 1) return { scale, x: 0, y: 0 }
+        const maxX = Math.max(0, (img.offsetWidth * scale - stage.clientWidth) / 2)
+        const maxY = Math.max(0, (img.offsetHeight * scale - stage.clientHeight) / 2)
+        return { scale, x: Math.max(-maxX, Math.min(maxX, next.x)), y: Math.max(-maxY, Math.min(maxY, next.y)) }
+      }
+      // 以屏幕上某点为中心缩放（手指/光标下的那一点保持不动）。
+      function zoomAround(base, nextScale, clientX, clientY, shiftX = 0, shiftY = 0) {
+        const rect = stageRef.current?.getBoundingClientRect()
+        const scale = Math.max(1, Math.min(VIEWER_MAX_SCALE, nextScale))
+        if (!rect) return clampView({ scale, x: base.x, y: base.y })
+        const px = clientX - (rect.left + rect.width / 2)
+        const py = clientY - (rect.top + rect.height / 2)
+        const ratio = scale / base.scale
+        return clampView({ scale, x: px - (px - base.x) * ratio + shiftX, y: py - (py - base.y) * ratio + shiftY })
+      }
+
+      useEffect(() => {
+        const dialog = dialogRef.current
+        if (!dialog) return undefined
+        if (typeof dialog.showModal === 'function') {
+          try { if (!dialog.open) dialog.showModal() } catch { dialog.setAttribute('open', '') }
+        } else dialog.setAttribute('open', '')
+        // React 的 wheel 是被动监听，不能 preventDefault；这里挂原生监听。
+        const stage = stageRef.current
+        const onWheel = event => {
+          event.preventDefault()
+          const base = viewRef.current
+          setView(zoomAround(base, base.scale * (event.deltaY < 0 ? 1.15 : 1 / 1.15), event.clientX, event.clientY))
+        }
+        stage?.addEventListener('wheel', onWheel, { passive: false })
+        return () => {
+          stage?.removeEventListener('wheel', onWheel)
+          try { if (dialog.open) dialog.close() } catch {}
+        }
+      }, [])
+
+      function startGesture() {
+        const list = [...pointers.current.values()]
+        const base = viewRef.current
+        if (list.length >= 2) {
+          const [a, b] = list
+          gesture.current = { type: 'pinch', dist: Math.hypot(a.x - b.x, a.y - b.y) || 1,
+            midX: (a.x + b.x) / 2, midY: (a.y + b.y) / 2, base, moved: true }
+        } else if (list.length === 1) {
+          gesture.current = { type: 'pan', startX: list[0].x, startY: list[0].y, base, moved: gesture.current?.type === 'pinch' }
+        } else gesture.current = null
+      }
+      function onPointerDown(event) {
+        event.stopPropagation()
+        if (event.button != null && event.button > 0) return
+        try { event.currentTarget.setPointerCapture(event.pointerId) } catch {}
+        pointers.current.set(event.pointerId, { x: event.clientX, y: event.clientY })
+        setGesturing(true)
+        startGesture()
+      }
+      function onPointerMove(event) {
+        if (!pointers.current.has(event.pointerId)) return
+        pointers.current.set(event.pointerId, { x: event.clientX, y: event.clientY })
+        const g = gesture.current
+        if (!g) return
+        if (g.type === 'pinch') {
+          const [a, b] = [...pointers.current.values()]
+          if (!a || !b) return
+          const dist = Math.hypot(a.x - b.x, a.y - b.y) || 1
+          const midX = (a.x + b.x) / 2
+          const midY = (a.y + b.y) / 2
+          setView(zoomAround(g.base, g.base.scale * dist / g.dist, g.midX, g.midY, midX - g.midX, midY - g.midY))
+          return
+        }
+        const dx = event.clientX - g.startX
+        const dy = event.clientY - g.startY
+        if (Math.abs(dx) > 6 || Math.abs(dy) > 6) g.moved = true
+        if (g.base.scale > 1) setView(clampView({ scale: g.base.scale, x: g.base.x + dx, y: g.base.y + dy }))
+      }
+      function onPointerUp(event) {
+        if (!pointers.current.has(event.pointerId)) return
+        const g = gesture.current
+        pointers.current.delete(event.pointerId)
+        if (pointers.current.size) { startGesture(); return }
+        gesture.current = null
+        setGesturing(false)
+        if (!g || g.type !== 'pan' || g.moved || event.type === 'pointercancel') return
+        const now = Date.now()
+        const prev = lastTap.current
+        if (now - prev.at < 320 && Math.hypot(event.clientX - prev.x, event.clientY - prev.y) < 30) {
+          lastTap.current = { at: 0, x: 0, y: 0 }
+          const base = viewRef.current
+          setView(base.scale > 1 ? { scale: 1, x: 0, y: 0 } : zoomAround(base, 2.5, event.clientX, event.clientY))
+          return
+        }
+        lastTap.current = { at: now, x: event.clientX, y: event.clientY }
+        // 未放大时点图片以外的黑底直接关闭；点图片本身留给双击放大。
+        if (viewRef.current.scale <= 1 && event.target !== imgRef.current) closeRef.current()
+      }
+
+      const stop = event => event.stopPropagation()
+      const hint = (caption ? caption + ' · ' : '') + (view.scale > 1 ? Math.round(view.scale * 100) + '% · 双击还原' : '双指缩放 · 双击放大 · 点黑底关闭')
+      return h('dialog', {
+        ref: dialogRef, className: 'rh-image-viewer', 'aria-label': '查看图片',
+        onCancel: event => { event.preventDefault(); onClose() },
+        onClick: stop, onPointerDown: stop, onTouchStart: stop,
+        style: { position: 'fixed', inset: 0, width: '100vw', height: '100dvh', maxWidth: 'none', maxHeight: 'none', margin: 0, padding: 0,
+          border: 0, background: 'rgba(0,0,0,.94)', color: '#e9f0f9', overflow: 'hidden', boxSizing: 'border-box' },
+      },
+        h('div', {
+          ref: stageRef,
+          onPointerDown, onPointerMove, onPointerUp, onPointerCancel: onPointerUp,
+          style: { position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center',
+            overflow: 'hidden', touchAction: 'none', userSelect: 'none', WebkitUserSelect: 'none', cursor: view.scale > 1 ? 'grab' : 'zoom-in' },
+        },
+          h('img', {
+            ref: imgRef, src: url, alt: caption || '插图', draggable: false,
+            onDragStart: event => event.preventDefault(),
+            style: { display: 'block', maxWidth: '100%', maxHeight: '100%', width: 'auto', height: 'auto', objectFit: 'contain',
+              transform: 'translate(' + view.x + 'px,' + view.y + 'px) scale(' + view.scale + ')', transformOrigin: 'center center',
+              transition: gesturing ? 'none' : 'transform .15s ease-out', willChange: 'transform', pointerEvents: 'auto',
+              WebkitTouchCallout: 'none' },
+          })),
+        h('button', {
+          type: 'button', 'aria-label': '关闭', title: '关闭',
+          onPointerDown: stop,
+          onClick: event => { event.stopPropagation(); onClose() },
+          style: { position: 'absolute', top: 'max(12px, env(safe-area-inset-top))', right: 12, zIndex: 2, width: 40, height: 40,
+            display: 'grid', placeItems: 'center', padding: 0, border: '1px solid rgba(255,255,255,.25)', borderRadius: 999,
+            background: 'rgba(20,24,32,.7)', color: '#fff', cursor: 'pointer' },
+        }, icon('close', 18)),
+        h('div', {
+          style: { position: 'absolute', left: 12, right: 12, bottom: 'max(12px, env(safe-area-inset-bottom))', zIndex: 2,
+            textAlign: 'center', fontSize: 12, color: 'rgba(233,240,249,.75)', pointerEvents: 'none',
+            overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+        }, hint))
+    }
     // 只装一次；样式挂在 head 上，正文重渲染不需要重新注入。
     function installChatMediaCss() {
       if (typeof document === 'undefined' || !document.head) return
@@ -3397,8 +3601,7 @@ window.__ModuleLoader__.load({
               const url = isMediaUrl(rawUrl) ? rawUrl : ''
               if (!url) return null
               if (item.data?.mediaKind === 'image') {
-                return h('a', { href: url, target: '_blank', rel: 'noreferrer', title: '打开图片' },
-                  h('img', { src: url, alt: item.caption || '插图', loading: 'lazy' }))
+                return h(ChatImage, { url, caption: item.caption || '' })
               }
               return h('video', { src: url, controls: true, preload: 'metadata', playsInline: true, onError: retryMediaOnce })
             })

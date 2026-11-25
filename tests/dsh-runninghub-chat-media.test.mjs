@@ -88,8 +88,11 @@ test('直链媒体渲染器：注册 dsh-runninghub/media 并只渲染同源代�
       data: { mediaKind: 'image', mediaUrl: '/api/dsh-runninghub/media?id=11111111-2222-4333-8444-555555555555&index=0' },
     },
   })
-  assert.equal(imgEl.type, 'a')
-  assert.equal(imgEl.children[0].type, 'img')
+  // 图片不再包 <a target=_blank>（APK 里会以原图像素打开且不能缩放），改由插件自己的查看器打开。
+  assert.equal(typeof imgEl.type, 'function', '图片应交给 ChatImage 组件渲染')
+  assert.equal(imgEl.type.name, 'ChatImage')
+  assert.equal(imgEl.props.url, '/api/dsh-runninghub/media?id=11111111-2222-4333-8444-555555555555&index=0')
+  assert.equal(imgEl.props.caption, '漫画页')
 
   const rejected = render({
     item: {
@@ -98,4 +101,20 @@ test('直链媒体渲染器：注册 dsh-runninghub/media 并只渲染同源代�
     },
   })
   assert.equal(rejected, null, '非同源代理地址必须被拒绝')
+})
+
+test('正文图片：等宽铺满，点开是可双指缩放的全屏查看器', () => {
+  assert.match(source, /function ChatImage\(/)
+  assert.match(source, /function ImageViewer\(/)
+  assert.match(source, /function stretchChatImage\(/)
+  assert.match(source, /img\.rh-chat-image\{[^}]*width:100%!important/)
+  assert.match(source, /touchAction: 'none'/, '查看器舞台要接管手势，才能双指缩放')
+  assert.match(source, /type: 'pinch'/)
+  assert.doesNotMatch(source, /h\('a', \{ href: url, target: '_blank'[^\n]*\n\s*h\('img', \{ src: url, alt: item\.caption/, '正文图片不能再用新窗口打开原图')
+})
+
+test('正文图片：新宿主优先用酒馆自己的大图查看器（tavernUi.openImage），旧宿主退回插件自带查看器', () => {
+  assert.match(source, /typeof tavernUiApi\?\.openImage === 'function'/)
+  assert.match(source, /tavernUiApi\.openImage\(\{ src: url, alt: caption \|\| '插图' \}\)/)
+  assert.match(source, /setOpen\(true\)/)
 })
