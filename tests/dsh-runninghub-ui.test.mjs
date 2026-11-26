@@ -124,6 +124,7 @@ test('RunningHub 重设计界面：jsdom + React DOM 隔离交互', {
   const state = {
     configured: true,
     generationMode: 'tool',
+    insertPosition: 'inline',
     autoInsert: false,
     alwaysSendPrompt: true,
     videosPerTurn: 3,
@@ -237,7 +238,7 @@ test('RunningHub 重设计界面：jsdom + React DOM 隔离交互', {
     }
     if (options.signal?.aborted) throw new window.DOMException('夹具请求已取消', 'AbortError')
     if (method === 'GET') {
-      return response({ configured: state.configured, generationMode: state.generationMode, autoInsert: state.autoInsert,
+      return response({ configured: state.configured, generationMode: state.generationMode, insertPosition: state.insertPosition, autoInsert: state.autoInsert,
         alwaysSendPrompt: state.alwaysSendPrompt !== false, videosPerTurn: state.videosPerTurn,
         streamPreclaim: state.streamPreclaim === true,
         applyDefaults: state.applyDefaults !== false, bindToTurn: state.bindToTurn !== false, workflowSettings: true, baseURL: state.baseURL,
@@ -260,7 +261,8 @@ test('RunningHub 重设计界面：jsdom + React DOM 隔离交互', {
         const keys = ['autoInsert', 'alwaysSendPrompt', 'streamPreclaim', 'applyDefaults', 'bindToTurn'].filter(key => body[key] !== undefined)
         const hasVideos = body.videosPerTurn !== undefined
         const hasMode = body.generationMode !== undefined
-        assert.ok(keys.length || hasVideos || hasMode, 'preferences 至少带一个设置')
+        const hasInsertPosition = body.insertPosition !== undefined
+        assert.ok(keys.length || hasVideos || hasMode || hasInsertPosition, 'preferences 至少带一个设置')
         for (const key of keys) {
           assert.equal(typeof body[key], 'boolean')
           state[key] = body[key]
@@ -273,7 +275,11 @@ test('RunningHub 重设计界面：jsdom + React DOM 隔离交互', {
           assert.ok(['tool', 'marker'].includes(body.generationMode))
           state.generationMode = body.generationMode
         }
-        return response({ generationMode: state.generationMode, autoInsert: state.autoInsert, alwaysSendPrompt: state.alwaysSendPrompt,
+        if (hasInsertPosition) {
+          assert.ok(['inline', 'end'].includes(body.insertPosition))
+          state.insertPosition = body.insertPosition
+        }
+        return response({ generationMode: state.generationMode, insertPosition: state.insertPosition, autoInsert: state.autoInsert, alwaysSendPrompt: state.alwaysSendPrompt,
           videosPerTurn: state.videosPerTurn, streamPreclaim: state.streamPreclaim === true,
           applyDefaults: state.applyDefaults, bindToTurn: state.bindToTurn })
       }
@@ -563,6 +569,21 @@ test('RunningHub 重设计界面：jsdom + React DOM 隔离交互', {
     assert.deepEqual(actionCalls('preferences').at(-1).body, { action: 'preferences', generationMode: 'marker' })
     assert.match(drawer.textContent, /正文标记模式/)
     assert.match(drawer.textContent, /\[\[RH:SHOT\]\]/)
+    await click(query('button[aria-label="关闭设置"]', drawer))
+  })
+
+  await t.test('视频插入位置切到每轮生成尾部并保存', async () => {
+    await click(button('设置'))
+    const drawer = query('[role="dialog"]')
+    const node = field('视频插入位置', drawer)
+    assert.equal(node.value, 'inline')
+    await change(() => {
+      node.value = 'end'
+      node.dispatchEvent(new window.Event('change', { bubbles: true }))
+    })
+    await until(() => state.insertPosition === 'end', '视频插入位置保存')
+    assert.deepEqual(actionCalls('preferences').at(-1).body, { action: 'preferences', insertPosition: 'end' })
+    assert.match(drawer.textContent, /所有视频统一附在本轮正文末尾/)
     await click(query('button[aria-label="关闭设置"]', drawer))
   })
 

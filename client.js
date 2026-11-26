@@ -17,7 +17,7 @@ window.__ModuleLoader__.load({
     let tavernUiApi = null
     const own = (object, key) => Object.prototype.hasOwnProperty.call(object || {}, key)
     // 与 index.mjs 的 PLUGIN_VERSION 对齐；对不上说明宿主侧还是旧代码（测试里有断言）。
-    const CLIENT_VERSION = '0.1.46'
+    const CLIENT_VERSION = '0.1.47'
     const message = error => typeof error === 'string' ? error : error?.message || '未知错误'
     // 探测结果的统一说法：保存和「检查连接」共用，不把原始错误当成成功。
     // 一键复制：手机上很多 WebView/非安全上下文没有 navigator.clipboard，退回 execCommand。
@@ -1498,6 +1498,7 @@ img.rh-chat-image{display:block;width:100%!important;height:auto!important;max-w
       libraryPickerRef.current = libraryPicker
       const [bindToTurn, setBindToTurn] = useState(true)
       const [generationMode, setGenerationMode] = useState('tool')
+      const [insertPosition, setInsertPosition] = useState('inline')
       const [alwaysSendPrompt, setAlwaysSendPrompt] = useState(true)
       const [videosPerTurn, setVideosPerTurn] = useState(3)
       const [videosPerTurnDraft, setVideosPerTurnDraft] = useState('3')
@@ -1659,6 +1660,7 @@ img.rh-chat-image{display:block;width:100%!important;height:auto!important;max-w
             setSummary({ configured: data.configured, baseURL: data.baseURL,
               allowPrivateLan: data.allowPrivateLan === true,
               generationMode: data.generationMode === 'marker' ? 'marker' : 'tool',
+              insertPosition: data.insertPosition === 'end' ? 'end' : 'inline',
               autoInsert: data.autoInsert === true, alwaysSendPrompt: data.alwaysSendPrompt !== false,
               videosPerTurn: Number.isInteger(data.videosPerTurn) ? data.videosPerTurn : 3,
               streamPreclaim: data.streamPreclaim === true,
@@ -1682,6 +1684,7 @@ img.rh-chat-image{display:block;width:100%!important;height:auto!important;max-w
               prefsLoaded.current = true
               setBindToTurn(data.bindToTurn !== false)
               setGenerationMode(data.generationMode === 'marker' ? 'marker' : 'tool')
+              setInsertPosition(data.insertPosition === 'end' ? 'end' : 'inline')
               setAlwaysSendPrompt(data.alwaysSendPrompt !== false)
               const videos = Number.isInteger(data.videosPerTurn) ? data.videosPerTurn : 3
               setVideosPerTurn(videos)
@@ -1880,6 +1883,7 @@ img.rh-chat-image{display:block;width:100%!important;height:auto!important;max-w
           if (!alive.current) return data
           setSummary(previous => ({ ...(previous || {}),
             ...(data?.generationMode === 'marker' || data?.generationMode === 'tool' ? { generationMode: data.generationMode } : {}),
+            ...(data?.insertPosition === 'end' || data?.insertPosition === 'inline' ? { insertPosition: data.insertPosition } : {}),
             ...(typeof data?.autoInsert === 'boolean' ? { autoInsert: data.autoInsert } : {}),
             ...(typeof data?.alwaysSendPrompt === 'boolean' ? { alwaysSendPrompt: data.alwaysSendPrompt } : {}),
             ...(Number.isInteger(data?.videosPerTurn) ? { videosPerTurn: data.videosPerTurn } : {}),
@@ -1921,6 +1925,16 @@ img.rh-chat-image{display:block;width:100%!important;height:auto!important;max-w
         try { await savePreference({ generationMode: value }) }
         catch {
           if (alive.current) setGenerationMode(previous)
+        }
+      }
+
+      async function changeInsertPosition(value) {
+        const previous = insertPosition
+        setInsertPosition(value)
+        setPreferenceError('')
+        try { await savePreference({ insertPosition: value }) }
+        catch {
+          if (alive.current) setInsertPosition(previous)
         }
       }
 
@@ -3487,17 +3501,23 @@ img.rh-chat-image{display:block;width:100%!important;height:auto!important;max-w
                 h('option', { value: 'tool' }, '工具调用（runninghub_generate）'),
                 h('option', { value: 'marker' }, '正文标记（非工具调用）'))),
                 note(generationMode === 'marker'
-                  ? '正文标记模式：不注册任何 RunningHub 工具（含 describe / status），模型把镜头提示词写在正文末尾的 [[RH:SHOT]] 块里，插件会自动把标记块写进 Tavern 正则库，从正文显示和后续提示词里移除，并把成片插回 @after 指定的句子之后。'
+                  ? (insertPosition === 'end'
+                    ? '正文标记模式：不注册任何 RunningHub 工具（含 describe / status），模型把镜头提示词写在正文前面的 [[RH:SHOT]] 块里，插件会自动把标记块写进 Tavern 正则库，从正文显示和后续提示词里移除，并把成片统一附在本轮正文末尾。'
+                    : '正文标记模式：不注册任何 RunningHub 工具（含 describe / status），模型把镜头提示词写在正文前面的 [[RH:SHOT]] 块里，插件会自动把标记块写进 Tavern 正则库，从正文显示和后续提示词里移除，并把成片插回 @after 指定的句子之后。')
                   : '工具调用模式：模型在同一条回复里调用 runninghub_generate 提交；需要模型支持工具调用。'),
                 generationMode === 'marker' ? h('details', { className: 'rh-fold' },
                   h('summary', null, '正文标记格式'),
                   h('div', { className: 'rh-fold-content' },
                     h('pre', { style: { margin: 0, padding: '10px 12px', borderRadius: 8, background: 'var(--rh-soft)', color: 'var(--rh-ink)', fontSize: 11, lineHeight: 1.65, whiteSpace: 'pre-wrap', overflowX: 'auto' } },
-                      '[[RH:SHOT]]\n@after\n正文里紧挨插入位置的一句原句\n@caption\n可选，短镜头名\n@prompt\n单段工作流的提示词\n[[/RH:SHOT]]'),
+                      insertPosition === 'end'
+                        ? '[[RH:SHOT]]\n@caption\n可选，短镜头名\n@prompt\n单段工作流的提示词\n[[/RH:SHOT]]'
+                        : '[[RH:SHOT]]\n@after\n正文里紧挨插入位置的一句原句\n@caption\n可选，短镜头名\n@prompt\n单段工作流的提示词\n[[/RH:SHOT]]'),
                     note('两段式管线（Qwen 多图生图 → 图生视频）把 @prompt 换成 @image 与 @video，两段都写。多个镜头就重复多个块，块统一放在正文最前面（先块、后正文）。'),
                     note('启用插件时会把这条标记清理规则自动加入 Tavern 全局正则库，名称「RunningHub · 移除正文标记块（自动管理）」。即使块里出现 <Picture N> / <Subject N>、或标记块跨进 HTML，也会在正文显示和提示词投影时整段移除。'),
                     note('原始存档正文里仍保留标记，可在 Tavern 正则库查看或停用；正文区和发送给模型的提示词里不会出现。'),
-                    note('@after 必须逐字引用本轮正文原句；省略则附在正文末尾。标记块不会进入后续上下文。'))) : null,
+                    note(insertPosition === 'end'
+                      ? '当前设置为「在每轮生成尾部插入」，无需填写 @after，成片统一附在本轮正文末尾。标记块不会进入后续上下文。'
+                      : '@after 必须逐字引用本轮正文原句；省略则附在正文末尾。标记块不会进入后续上下文。'))) : null,
                 generationMode === 'marker' && summary?.alwaysSendPrompt === false
                   ? alert('正文标记模式需要「总是发送当前工作流的提示词模板」：模型看不到标记格式就不会输出镜头。') : null,
                 generationMode === 'marker' && summary?.autoInsert !== true
@@ -3505,7 +3525,16 @@ img.rh-chat-image{display:block;width:100%!important;height:auto!important;max-w
                 h('label', { className: 'rh-toggle-row' }, h('span', null, '视频完成后自动插入对应正文'),
                   h('span', { className: 'rh-switch' }, h('input', { type: 'checkbox', checked: summary?.autoInsert === true,
                     disabled: autoInsertBusy || !summary, onChange: event => saveAutoInsert(event.target.checked) }), h('span', { className: 'rh-switch-track', 'aria-hidden': true }))),
-                note('开启后每回合都会自动生成视频，不需要玩家额外说“生成视频”；视频在后台生成，完成后补到原句或正文末尾。绑定提交时的版本，不随重生成串位。'),
+                note(insertPosition === 'end'
+                  ? '开启后每回合都会自动生成视频，不需要玩家额外说“生成视频”；视频在后台生成，完成后统一附在本轮正文末尾。绑定提交时的版本，不随重生成串位。'
+                  : '开启后每回合都会自动生成视频，不需要玩家额外说“生成视频”；视频在后台生成，完成后补到原句或正文末尾。绑定提交时的版本，不随重生成串位。'),
+                field('视频插入位置', h('select', { className: 'rh-input', 'aria-label': '视频插入位置', value: insertPosition,
+                  disabled: locked || preferenceBusy, onChange: event => changeInsertPosition(event.target.value) },
+                h('option', { value: 'inline' }, '在剧情正文间插入（按定位句）'),
+                h('option', { value: 'end' }, '在每轮生成尾部插入'))),
+                note(insertPosition === 'end'
+                  ? '所有视频统一附在本轮正文末尾，不在剧情正文中间穿插；提示词也会同步告知模型不再输出定位句。已提交的任务仍按原约定插入。'
+                  : '按模型给出的定位句（@after / anchor）把视频插到对应剧情段落后面；定位句省略或匹配不到时自动回落到本轮末尾。'),
                 field('每回合生成视频段数', h('input', { className: 'rh-input', type: 'number', min: 1, max: 10, step: 1,
                   value: videosPerTurnDraft, disabled: locked || preferenceBusy,
                   onChange: event => { setVideosPerTurnDraft(event.target.value); if (preferenceError) setPreferenceError('') },

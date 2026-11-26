@@ -39,7 +39,7 @@ import {
 export const name = 'dsh-runninghub'
 export const inject = ['tavern', 'attachments', 'credentials', 'webServer']
 // 面板上要能一眼看出「手机上跑的是哪一版」：宿主与网页各自上报，对不上就是没更新全。
-export const PLUGIN_VERSION = '0.1.46'
+export const PLUGIN_VERSION = '0.1.47'
 export const LINKED_MEDIA_KIND = 'dsh-runninghub/media'
 export const API = '/api/dsh-runninghub'
 export const MEDIA = API + '/media'
@@ -198,6 +198,8 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
   // 生成方式：tool = 模型调用 runninghub_generate；marker = 正文标记，宿主解析后提交。
   // 非工具调用模式不向模型开放生成工具，提示词从正文标记块里取。
   let generationMode = settings?.generationMode === 'marker' ? 'marker' : 'tool'
+  // 插入位置：inline = 按定位句（anchor / @after）插在剧情正文之间；end = 统一附在每轮正文末尾。
+  let insertPosition = settings?.insertPosition === 'end' ? 'end' : 'inline'
   // 默认开启：选中工作流后，插件每轮直接把完整模板发进正文提示词，不再让模型读 Skill。
   let alwaysSendPrompt = settings?.alwaysSendPrompt !== false
   // 流式预提交：正文还在逐字生成时，浏览器侧先把写完的标记块交给宿主提交，不等结算。
@@ -1578,6 +1580,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     }
     if (anchor !== undefined && (typeof anchor !== 'string' || anchor.length > 500)) throw fail('anchor 必须是最多 500 字的正文原句')
     if (caption !== undefined && (typeof caption !== 'string' || caption.length > 500)) throw fail('caption 必须是最多 500 字')
+    const effectiveAnchor = insertPosition === 'end' ? '' : (anchor || '')
     const video = entry.attachments?.find(item => item.kind === 'video' && (item.attachment || item.url))
     if (!video) throw fail('这条视频还没有可发送的产物')
     const linked = !video.attachment && typeof video.url === 'string' && video.url
@@ -1585,7 +1588,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
       kind: linked ? LINKED_MEDIA_KIND : 'video',
       status: 'ready',
       ...(video.attachment ? { attachment: await attachmentWithBytes(video.attachment) } : {}),
-      ...(anchor ? { anchor } : {}),
+      ...(effectiveAnchor ? { anchor: effectiveAnchor } : {}),
       caption: caption || `RunningHub · ${entry.description}`,
       data: linked
         ? {
@@ -1607,7 +1610,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
       state.sends.push({
         entryId: entry.id,
         generationId: generation.generationId,
-        ...(anchor ? { anchor } : {}),
+        ...(effectiveAnchor ? { anchor: effectiveAnchor } : {}),
         ...(caption ? { caption } : {}),
         createdAt: new Date().toISOString(),
       })
@@ -1620,7 +1623,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
         entryId: entry.id,
         pending: true,
         afterTurn,
-        ...(anchor ? { anchor } : {}),
+        ...(effectiveAnchor ? { anchor: effectiveAnchor } : {}),
         ...(caption ? { caption } : {}),
         createdAt: new Date().toISOString(),
       })
@@ -1862,7 +1865,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
             // watchReply，和宿主结算的轮次编号可能不是同一套计数，不能用来对齐。
             gameId: input.gameId, pending: true, preclaim: true, fingerprint: shot.fingerprint,
             afterTurn: Math.max(0, input.turn - 1),
-            anchor: typeof shot.raw.anchor === 'string' ? shot.raw.anchor.slice(0, 500) : '',
+            anchor: insertPosition === 'end' ? '' : (typeof shot.raw.anchor === 'string' ? shot.raw.anchor.slice(0, 500) : ''),
             caption: typeof shot.raw.caption === 'string' ? shot.raw.caption.slice(0, 200) : '',
           },
         })
@@ -1987,7 +1990,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
       // 等待窗口只给第一次「查不到」的那一下：预提交的请求会把整批镜头一次发过来，
       // 它到了之后后面的镜头直接命中登记，不会一段一段地等。
       for (const shot of parsed.shots) {
-        const anchor = shot.anchor || ''
+        const anchor = insertPosition === 'end' ? '' : (shot.anchor || '')
         let own = ownClaims.get(shot.fingerprint) ?? null
         if (shot.error) {
           closeShotClaim(own, null)
@@ -2116,7 +2119,9 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
         lines.push(`- #${index + 1} [${entry.status === 'ready' ? '就绪' : '生成中'}] ${entry.description}${entry.status === 'ready' ? `（pool_id: ${entry.id}）` : '（还不能发）'}`)
       })
     }
-    lines.push('发视频前先看这里：有一条与当前剧情、人物状态、衣着、地点相符的，就调用 runninghub_send_pregenerated（pool_id 填它的 id；可用 anchor 指定插在哪句正文之后）；没有贴合的就照常调用 runninghub_generate。不要为了用池子改剧情，不要把不符的硬发；一条只能发一次，生成中的暂时不能发。用掉的后台会自动补。')
+    lines.push(insertPosition === 'end'
+      ? '发视频前先看这里：有一条与当前剧情、人物状态、衣着、地点相符的，就调用 runninghub_send_pregenerated（pool_id 填它的 id；视频统一附在本轮正文末尾，不要传 anchor）；没有贴合的就照常调用 runninghub_generate。不要为了用池子改剧情，不要把不符的硬发；一条只能发一次，生成中的暂时不能发。用掉的后台会自动补。'
+      : '发视频前先看这里：有一条与当前剧情、人物状态、衣着、地点相符的，就调用 runninghub_send_pregenerated（pool_id 填它的 id；可用 anchor 指定插在哪句正文之后）；没有贴合的就照常调用 runninghub_generate。不要为了用池子改剧情，不要把不符的硬发；一条只能发一次，生成中的暂时不能发。用掉的后台会自动补。')
     return lines.join('\n')
   }
 
@@ -2217,7 +2222,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     const jobs = clientJobs(await store.list())
     const badTasks = store.badTasks || []
     lastPhaseMs = clock.value
-    return { configured, baseURL, allowPrivateLan, generationMode, autoInsert, alwaysSendPrompt, videosPerTurn, streamPreclaim,
+    return { configured, baseURL, allowPrivateLan, generationMode, insertPosition, autoInsert, alwaysSendPrompt, videosPerTurn, streamPreclaim,
       markerPipeline: promptDirective.pipeline === true,
       applyDefaults: applyDefaultsPref, bindToTurn: bindToTurnPref,
       workflowSettings: true,
@@ -2249,7 +2254,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
       if (previous?.source === 'env' || info?.source === 'env' || info?.writable === false) throw fail('网关 Key 来自只读凭据，请修改凭据来源')
       await credentialDeadline(() => ctx.credentials.set(ref, supplied))
     }
-    await atomicJSON(settingsFile, { baseURL: nextBase, allowPrivateLan: nextAllowPrivateLan, autoInsert, alwaysSendPrompt, videosPerTurn, streamPreclaim, applyDefaults: applyDefaultsPref, bindToTurn: bindToTurnPref, generationMode })
+    await atomicJSON(settingsFile, { baseURL: nextBase, allowPrivateLan: nextAllowPrivateLan, autoInsert, alwaysSendPrompt, videosPerTurn, streamPreclaim, applyDefaults: applyDefaultsPref, bindToTurn: bindToTurnPref, generationMode, insertPosition })
     engine?.dispose(); engine = undefined; client = undefined; clientIdentity = undefined
     baseURL = nextBase; allowPrivateLan = nextAllowPrivateLan; workflows = []; workflowError = ''
     selectedModel = ''; model = ''; defaultModel = ''
@@ -2326,7 +2331,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     try { configuredKey = (await credentialDeadline(() => ctx.credentials.resolve(credentialName(baseURL))))?.value ? 'yes' : 'no' }
     catch { configuredKey = 'unknown' }
     return {
-      version: PLUGIN_VERSION, baseURL, allowPrivateLan, configuredKey, generationMode,
+      version: PLUGIN_VERSION, baseURL, allowPrivateLan, configuredKey, generationMode, insertPosition,
       node: process.version, platform: process.platform, arch: process.arch,
       engineError: engineError || '', badTasks: (store.badTasks || []).slice(0, 20),
       lastSummaryMs: lastPhaseMs, templatePending: Boolean(directiveJob), reconcilePending: Boolean(reconcileInflight),
@@ -2374,10 +2379,10 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     }
     return serial(async () => {
       if (input.action === 'preferences') {
-        keys(input, ['action', 'autoInsert', 'alwaysSendPrompt', 'videosPerTurn', 'streamPreclaim', 'applyDefaults', 'bindToTurn', 'generationMode'])
+        keys(input, ['action', 'autoInsert', 'alwaysSendPrompt', 'videosPerTurn', 'streamPreclaim', 'applyDefaults', 'bindToTurn', 'generationMode', 'insertPosition'])
         if (input.autoInsert === undefined && input.alwaysSendPrompt === undefined
           && input.videosPerTurn === undefined && input.streamPreclaim === undefined
-          && input.generationMode === undefined
+          && input.generationMode === undefined && input.insertPosition === undefined
           && input.applyDefaults === undefined && input.bindToTurn === undefined) throw fail('没有要保存的偏好')
         for (const key of ['autoInsert', 'alwaysSendPrompt', 'streamPreclaim', 'applyDefaults', 'bindToTurn']) {
           if (input[key] !== undefined && typeof input[key] !== 'boolean') throw fail(key + ' 必须是布尔值')
@@ -2388,6 +2393,9 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
         }
         if (input.generationMode !== undefined && input.generationMode !== 'tool' && input.generationMode !== 'marker') {
           throw fail('生成方式只能是 tool 或 marker')
+        }
+        if (input.insertPosition !== undefined && input.insertPosition !== 'inline' && input.insertPosition !== 'end') {
+          throw fail('视频插入位置只能是 inline 或 end')
         }
         const nextMode = input.generationMode === undefined ? generationMode : input.generationMode
         if (nextMode === 'marker') {
@@ -2400,6 +2408,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
         }
         const next = {
           generationMode: nextMode,
+          insertPosition: input.insertPosition === undefined ? insertPosition : input.insertPosition,
           autoInsert: input.autoInsert === undefined ? autoInsert : input.autoInsert,
           alwaysSendPrompt: input.alwaysSendPrompt === undefined ? alwaysSendPrompt : input.alwaysSendPrompt,
           videosPerTurn: input.videosPerTurn === undefined ? videosPerTurn : input.videosPerTurn,
@@ -2409,6 +2418,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
         }
         await atomicJSON(settingsFile, { baseURL, allowPrivateLan, ...next })
         generationMode = next.generationMode
+        insertPosition = next.insertPosition
         autoInsert = next.autoInsert
         alwaysSendPrompt = next.alwaysSendPrompt
         videosPerTurn = next.videosPerTurn
@@ -2702,7 +2712,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     } else if (autoInsert && sessionId) {
       exec.signal?.throwIfAborted()
       if (input.gameId && input.gameId !== sessionId) throw fail('game_id 与当前工具调用会话不一致')
-      binding = await autoInsertBinding(sessionId, input.anchor || '')
+      binding = await autoInsertBinding(sessionId, insertPosition === 'end' ? '' : (input.anchor || ''))
       exec.signal?.throwIfAborted()
     } else binding = await bindingOf(input)
     // 短临界区：并发提交时 describe 已经并行做完，这里只串行「再查一次重 + 建任务」，
@@ -3029,9 +3039,12 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     } else if (promptDirective.model !== model || !directive) {
       parts.push(`当前工作流的提示词模板不可用${promptDirective.error ? '（' + promptDirective.error + '）' : ''}，本回合${channel === 'marker' ? '不要写 [[RH:SHOT]] 标记块' : '不要调用 runninghub_generate'}；正文照常写。`)
     } else if (channel === 'marker') {
+      const atEnd = insertPosition === 'end'
       if (autoInsert) {
-        parts.push(`本回合生成 ${videosPerTurn} 个镜头。先在思考里定稿完整的本轮正文，从上一轮结束后的下一个动作开始，不要重播上一轮已经写过的画面；然后在回复最前面写 ${videosPerTurn} 个标记块（不要多也不要少），紧接其后才是本轮正文——标记块先写、正文后写，这样镜头能在正文写到一半时就提交出去。上一轮和历史正文不能作为本轮视频内容。标记块会被宿主移除，正文才是玩家看到的剧情。`)
-        parts.push(markerPromptSpec({ pipeline: promptDirective.pipeline, count: videosPerTurn }))
+        parts.push(atEnd
+          ? `本回合生成 ${videosPerTurn} 个镜头。所有视频统一附在本轮正文末尾，不需要写 @after。先在思考里规划好本轮正文，从上一轮结束后的下一个动作开始，不要重播上一轮已经写过的画面；然后在回复最前面写 ${videosPerTurn} 个标记块（不要多也不要少），紧接其后才是本轮正文——标记块先写、正文后写，这样镜头能在正文写到一半时就提交出去。上一轮和历史正文不能作为本轮视频内容。标记块会被宿主移除，正文才是玩家看到的剧情。`
+          : `本回合生成 ${videosPerTurn} 个镜头。先在思考里定稿完整的本轮正文，从上一轮结束后的下一个动作开始，不要重播上一轮已经写过的画面；然后在回复最前面写 ${videosPerTurn} 个标记块（不要多也不要少），紧接其后才是本轮正文——标记块先写、正文后写，这样镜头能在正文写到一半时就提交出去。上一轮和历史正文不能作为本轮视频内容。标记块会被宿主移除，正文才是玩家看到的剧情。`)
+        parts.push(markerPromptSpec({ pipeline: promptDirective.pipeline, count: videosPerTurn, insertPosition }))
       }
       parts.push(directive)
       if (promptDirective.mode === 'h3-ref2va' || promptDirective.mode === 'h3-hybrid') {
@@ -3039,14 +3052,19 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
       }
       parts.push([
         autoInsert
-          ? '严格按上面的标记格式：块开始 [[RH:SHOT]]、块结束 [[/RH:SHOT]]，字段单独占一行；@after 逐字引用后面的正文原句，省略则附在正文末尾。'
+          ? (atEnd
+            ? '严格按上面的标记格式：块开始 [[RH:SHOT]]、块结束 [[/RH:SHOT]]，字段单独占一行；所有视频统一附在本轮正文末尾，不要写 @after。'
+            : '严格按上面的标记格式：块开始 [[RH:SHOT]]、块结束 [[/RH:SHOT]]，字段单独占一行；@after 逐字引用后面的正文原句，省略则附在正文末尾。')
           : '本回合不要生成镜头，也不要写 [[RH:SHOT]] 标记块；正文照常写。',
         '不要调用 runninghub_generate、runninghub_send_pregenerated 或其它 RunningHub 工具；Tavern 要求用 submit_story 时，把正文和标记块一起放进 content。',
         ...(autoInsert ? ['标记块写在正文前面：先块、后正文；块外不要写提示词说明、摘要或“正文：”之类的引导语。'] : []),
       ].join('\n\n'))
     } else {
+      const atEnd = insertPosition === 'end'
       if (autoInsert) {
-        parts.push(`本回合生成 ${videosPerTurn} 段视频。严格按顺序：1) 先在思考里定稿完整的本轮正文，从上一轮结束后的下一个动作开始，不要重播上一轮已经写过的画面；2) 只从这份本轮正文里挑 ${videosPerTurn} 个最精彩的瞬间写视频提示词，上一轮和历史正文不能作为本轮视频内容；3) 每条视频的 anchor 必须逐字引用本轮正文里的原句；4) 在同一条回复里先调用 runninghub_generate 提交 ${videosPerTurn} 段（不要多也不要少），紧接着在同一条回复里调用 submit_story，把同一份完整正文放进 content；submit_story 必须是这条回复的最后一个工具调用。不要只提交视频、等工具结果再补正文——那样正文会丢，视频也白生成；anchor 只是定位句，不能代替正文。`)
+        parts.push(atEnd
+          ? `本回合生成 ${videosPerTurn} 段视频。严格按顺序：1) 先在思考里定稿完整的本轮正文，从上一轮结束后的下一个动作开始，不要重播上一轮已经写过的画面；2) 只从这份本轮正文里挑 ${videosPerTurn} 个最精彩的瞬间写视频提示词，上一轮和历史正文不能作为本轮视频内容；3) 本轮视频统一附在本轮正文末尾，调用 runninghub_generate 时不要传 anchor；4) 在同一条回复里先调用 runninghub_generate 提交 ${videosPerTurn} 段（不要多也不要少），紧接着在同一条回复里调用 submit_story，把同一份完整正文放进 content；submit_story 必须是这条回复的最后一个工具调用。不要只提交视频、等工具结果再补正文——那样正文会丢，视频也白生成。`
+          : `本回合生成 ${videosPerTurn} 段视频。严格按顺序：1) 先在思考里定稿完整的本轮正文，从上一轮结束后的下一个动作开始，不要重播上一轮已经写过的画面；2) 只从这份本轮正文里挑 ${videosPerTurn} 个最精彩的瞬间写视频提示词，上一轮和历史正文不能作为本轮视频内容；3) 每条视频的 anchor 必须逐字引用本轮正文里的原句；4) 在同一条回复里先调用 runninghub_generate 提交 ${videosPerTurn} 段（不要多也不要少），紧接着在同一条回复里调用 submit_story，把同一份完整正文放进 content；submit_story 必须是这条回复的最后一个工具调用。不要只提交视频、等工具结果再补正文——那样正文会丢，视频也白生成；anchor 只是定位句，不能代替正文。`)
       }
       parts.push(directive)
       if (promptDirective.mode === 'h3-ref2va' || promptDirective.mode === 'h3-hybrid') {
@@ -3056,7 +3074,9 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
         parts.push([
           'runninghub_generate：prompt 放视频段；管线工作流把生图段放 image_prompt。不要包 image### / video### 标记，不要传 model；每段用独立 request_id。',
           '工具报格式错误就按提示改一次；仍失败就只提交正文，不要中断本轮。',
-          'anchor 填正文原句可把视频插在它后面，省略则附在正文末尾。提交后立即返回，不要轮询等待。',
+          atEnd
+            ? '所有视频会统一附在本轮正文末尾，不要传 anchor。提交后立即返回，不要轮询等待。'
+            : 'anchor 填正文原句可把视频插在它后面，省略则附在正文末尾。提交后立即返回，不要轮询等待。',
         ].join('\n\n'))
       }
     }
@@ -3074,10 +3094,15 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     if (!alwaysSendPrompt || !autoInsert || !model) return ''
     if (promptDirective.model !== model || !directiveFor(generationMode)) return ''
     const lead = typeof input === 'string' && input.trim() ? `本轮玩家指引：${input.trim().slice(0, 500)}。` : ''
+    const atEnd = insertPosition === 'end'
     if (generationMode === 'marker') {
-      return `【RunningHub】${lead}先按这条指引在思考里定稿本轮正文；然后在回复最前面按格式写 ${videosPerTurn} 个 [[RH:SHOT]] 标记块（@after 逐字引用后面正文的原句），写完块再开始正文。不要调用 RunningHub 生成工具。宿主会移除标记块，并把成片插在 @after 那句之后。不要用上一轮画面，块外不要重复提示词。`
+      return atEnd
+        ? `【RunningHub】${lead}先按这条指引规划本轮正文；然后在回复最前面按格式写 ${videosPerTurn} 个 [[RH:SHOT]] 标记块（不要写 @after，所有视频统一附在本轮正文末尾），写完块再开始正文。不要调用 RunningHub 生成工具。宿主会移除标记块，并把成片附在本轮正文末尾。不要用上一轮画面，块外不要重复提示词。`
+        : `【RunningHub】${lead}先按这条指引在思考里定稿本轮正文；然后在回复最前面按格式写 ${videosPerTurn} 个 [[RH:SHOT]] 标记块（@after 逐字引用后面正文的原句），写完块再开始正文。不要调用 RunningHub 生成工具。宿主会移除标记块，并把成片插在 @after 那句之后。不要用上一轮画面，块外不要重复提示词。`
     }
-    return `【RunningHub】${lead}先按这条指引定稿本轮正文，再从正文里挑 ${videosPerTurn} 个瞬间写视频提示词（anchor 用正文原句）；然后在同一条回复里调用 runninghub_generate 提交 ${videosPerTurn} 段，并紧接着调用 submit_story 提交完整正文（最后一个工具调用）。不要等工具结果再补正文，也不要用上一轮画面。`
+    return atEnd
+      ? `【RunningHub】${lead}先按这条指引定稿本轮正文，再从正文里挑 ${videosPerTurn} 个瞬间写视频提示词（不要传 anchor，所有视频统一附在本轮正文末尾）；然后在同一条回复里调用 runninghub_generate 提交 ${videosPerTurn} 段，并紧接着调用 submit_story 提交完整正文（最后一个工具调用）。不要等工具结果再补正文，也不要用上一轮画面。`
+      : `【RunningHub】${lead}先按这条指引定稿本轮正文，再从正文里挑 ${videosPerTurn} 个瞬间写视频提示词（anchor 用正文原句）；然后在同一条回复里调用 runninghub_generate 提交 ${videosPerTurn} 段，并紧接着调用 submit_story 提交完整正文（最后一个工具调用）。不要等工具结果再补正文，也不要用上一轮画面。`
   }
   function dispose() {
     disposed = true
@@ -3112,7 +3137,8 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     removeGame: removePregenGame,
     syncMarkerRegex, disableMarkerRegex,
     setToolSync(fn) { toolSync = typeof fn === 'function' ? fn : () => {}; toolSync() },
-    get generationMode() { return generationMode }, get autoInsert() { return autoInsert },
+    get generationMode() { return generationMode }, get insertPosition() { return insertPosition },
+    get autoInsert() { return autoInsert },
     get alwaysSendPrompt() { return alwaysSendPrompt }, get videosPerTurn() { return videosPerTurn },
     get streamPreclaim() { return streamPreclaim } }
 }

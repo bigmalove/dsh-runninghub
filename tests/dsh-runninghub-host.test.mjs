@@ -1492,26 +1492,71 @@ describe('preferences: alwaysSendPrompt, videosPerTurn, applyDefaults and bindTo
     const gateway = makeGatewayFetch({ workflows: [{ alias: 'demo', customFields: [], referenceSlots: [], capabilities: {} }] })
     const { host, dataDirectory, ctx } = await makeHost({ configured: true, gateway })
     assert.deepEqual(await host.dispatch({ action: 'preferences', alwaysSendPrompt: false, videosPerTurn: 6, applyDefaults: false, bindToTurn: false }),
-      { generationMode: 'tool', autoInsert: false, alwaysSendPrompt: false, videosPerTurn: 6, streamPreclaim: false, applyDefaults: false, bindToTurn: false })
+      { generationMode: 'tool', insertPosition: 'inline', autoInsert: false, alwaysSendPrompt: false, videosPerTurn: 6, streamPreclaim: false, applyDefaults: false, bindToTurn: false })
     await assert.rejects(host.dispatch({ action: 'preferences', applyDefaults: 'false' }), /布尔/)
     await assert.rejects(host.dispatch({ action: 'preferences', alwaysSendPrompt: 'false' }), /布尔/)
     await assert.rejects(host.dispatch({ action: 'preferences', videosPerTurn: 0 }), /1–10 的整数/)
+    await assert.rejects(host.dispatch({ action: 'preferences', insertPosition: 'middle' }), /inline 或 end/)
     const listed = await host.dispatch({ action: 'list' })
+    assert.equal(listed.insertPosition, 'inline')
     assert.equal(listed.alwaysSendPrompt, false)
     assert.equal(listed.videosPerTurn, 6)
     assert.equal(listed.streamPreclaim, false, '流式预提交默认关闭')
     assert.equal(listed.applyDefaults, false)
     assert.equal(listed.bindToTurn, false)
+    await host.dispatch({ action: 'preferences', insertPosition: 'end' })
     host.dispose()
     const restored = await createRunningHubHost(ctx,
       { dataDirectory, baseURL: BASE }, { fetchImpl: gateway.fetchImpl, pollMs: 5 })
     try {
       const state = await restored.dispatch({ action: 'list' })
+      assert.equal(state.insertPosition, 'end')
       assert.equal(state.alwaysSendPrompt, false)
       assert.equal(state.videosPerTurn, 6)
       assert.equal(state.applyDefaults, false)
       assert.equal(state.bindToTurn, false)
     } finally { restored.dispose() }
+  })
+
+  test('insertPosition 切换工具调用与正文标记的提示词和每轮提醒，并在尾部模式忽略标记 @after', async () => {
+    const gateway = makeGatewayFetch({
+      workflows: [{ alias: 'demo', customFields: [], referenceSlots: [], capabilities: {} }],
+      portDirectiveText: '【模板正文】\n按规则写镜头提示词。',
+    })
+    const attached = []
+    const tavernImpl = {
+      getTurnState: async () => ({ settled: true, busy: false, turn: 1, textVersion: 'v1' }),
+      getTurn: async ({ gameId, turn }) => ({ gameId, turn, textVersion: 'v1', text: '雨夜正文。' }),
+      captureGeneration: async ({ gameId }) => ({ gameId, generationId: 'g'.repeat(64) }),
+      resolveGeneration: async () => null,
+      onTurnSettled: () => () => {},
+      list: async () => attached,
+      update: async () => {},
+      attach: async spec => { attached.push(spec) },
+      remove: async () => false,
+    }
+    const { host, regexLibraryFile } = await makeHost({ configured: true, gateway, tavernImpl })
+    await writeFile(regexLibraryFile, JSON.stringify({ regex: [] }))
+    await host.dispatch({ action: 'list' })
+    await host.dispatch({ action: 'select-model', model: 'demo' })
+    await host.dispatch({ action: 'preferences', autoInsert: true, insertPosition: 'end', videosPerTurn: 2 })
+    assert.equal(host.insertPosition, 'end')
+    assert.match(host.promptText(), /统一附在本轮正文末尾，调用 runninghub_generate 时不要传 anchor/)
+    assert.match(host.turnReminder('继续'), /不要传 anchor，所有视频统一附在本轮正文末尾/)
+
+    await host.dispatch({ action: 'preferences', generationMode: 'marker' })
+    assert.match(host.promptText(), /不要写 @after/)
+    assert.match(host.turnReminder('继续'), /不要写 @after，所有视频统一附在本轮正文末尾/)
+    await host.handleTurn({
+      gameId: 'g-end', turn: 1, textVersion: 'v1', text: '雨夜正文。',
+      rawText: '[[RH:SHOT]]\n@after\n雨夜正文。\n@prompt\n镜头一\n[[/RH:SHOT]]\n雨夜正文。',
+    })
+    const jobs = await host.store.list()
+    assert.equal(jobs.length, 1)
+    assert.equal(jobs[0].binding.anchor, '', '尾部模式下即使模型写了 @after，任务绑定 anchor 也必须为空')
+    assert.equal(await waitForAttach({ calls: { attaches: attached } }, () => true), true)
+    assert.equal(attached[0].item.anchor, '', '尾部模式下即使模型写了 @after，落位 anchor 也必须为空')
+    host.dispose()
   })
 })
 
