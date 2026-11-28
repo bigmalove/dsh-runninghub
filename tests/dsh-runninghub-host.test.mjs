@@ -1492,7 +1492,7 @@ describe('preferences: alwaysSendPrompt, videosPerTurn, applyDefaults and bindTo
     const gateway = makeGatewayFetch({ workflows: [{ alias: 'demo', customFields: [], referenceSlots: [], capabilities: {} }] })
     const { host, dataDirectory, ctx } = await makeHost({ configured: true, gateway })
     assert.deepEqual(await host.dispatch({ action: 'preferences', alwaysSendPrompt: false, videosPerTurn: 6, applyDefaults: false, bindToTurn: false }),
-      { generationMode: 'tool', insertPosition: 'inline', autoInsert: false, alwaysSendPrompt: false, videosPerTurn: 6, streamPreclaim: false, applyDefaults: false, bindToTurn: false })
+      { enabled: true, generationMode: 'tool', insertPosition: 'inline', autoInsert: false, alwaysSendPrompt: false, videosPerTurn: 6, streamPreclaim: false, applyDefaults: false, bindToTurn: false })
     await assert.rejects(host.dispatch({ action: 'preferences', applyDefaults: 'false' }), /布尔/)
     await assert.rejects(host.dispatch({ action: 'preferences', alwaysSendPrompt: 'false' }), /布尔/)
     await assert.rejects(host.dispatch({ action: 'preferences', videosPerTurn: 0 }), /1–10 的整数/)
@@ -3084,5 +3084,224 @@ describe('移动端 Termux 连接防死锁：WebSocket 通道与网关超时收�
       for (const s of openClientSockets) { try { s.close() } catch { /* ignore */ } }
       await new Promise(resolve => server.close(resolve))
     }
+  })
+})
+
+// =====================================================================
+// 插件总开关：关闭时暂停全部对话联动与新提交，保留子设置与历史播放
+// =====================================================================
+describe('插件总开关 enabled：关闭时暂停全部联动与新提交，保留子设置与历史播放', () => {
+  test('默认开启，支持布尔校验、写入 connection.json 与重启恢复；configure 不重置 enabled', async () => {
+    let workflowCalls = 0
+    const { host, dataDirectory, ctx } = await makeHost({
+      configured: true,
+      clientFactory: () => ({
+        listWorkflows: async () => { workflowCalls += 1; return [{ alias: 'demo', customFields: [], referenceSlots: [], capabilities: {} }] },
+        getSettings: async () => ({ defaultModel: 'demo' }),
+        portDirective: async (_alias, mode) => ({ text: `template:${mode}`, mode }),
+      }),
+    })
+    assert.equal(host.enabled, true)
+    assert.equal((await host.dispatch({ action: 'list' })).enabled, true)
+    await assert.rejects(host.dispatch({ action: 'preferences', enabled: 'false' }), /布尔/)
+
+    await host.dispatch({ action: 'preferences', autoInsert: true, videosPerTurn: 5, insertPosition: 'end', alwaysSendPrompt: false })
+    const closed = await host.dispatch({ action: 'preferences', enabled: false })
+    assert.equal(closed.enabled, false)
+    assert.equal(host.enabled, false)
+    assert.equal(closed.autoInsert, true)
+    assert.equal(closed.videosPerTurn, 5)
+    assert.equal(closed.insertPosition, 'end')
+    assert.equal(closed.alwaysSendPrompt, false)
+
+    // configure 保存新网关配置时不能把已关闭的总开关重置回 true。
+    await host.dispatch({ action: 'configure', baseURL: NEW_BASE, apiKey: 'new-key' })
+    const conn = JSON.parse(await readFile(join(dataDirectory, 'connection.json'), 'utf8'))
+    assert.equal(conn.enabled, false)
+
+    // 关闭状态下的 list 不请求网关、不产生 gatewayError，且上报 enabled: false。
+    const beforeCalls = workflowCalls
+    const listedOff = await host.dispatch({ action: 'list' })
+    assert.equal(listedOff.enabled, false)
+    assert.equal(listedOff.gatewayError, undefined)
+    assert.equal(workflowCalls, beforeCalls, '总开关关闭时 list 不应连网关')
+    assert.equal((await host.dispatch({ action: 'diag' })).enabled, false)
+    assert.equal((await host.dispatch({ action: 'jobs' })).enabled, false)
+
+    host.dispose()
+    const restored = await createRunningHubHost(ctx, { dataDirectory, baseURL: BASE }, {
+      workflowSyncMs: 0,
+      clientFactory: () => ({ listWorkflows: async () => [] }),
+    })
+    try {
+      const restoredList = await restored.dispatch({ action: 'list' })
+      assert.equal(restored.enabled, false)
+      assert.equal(restoredList.enabled, false)
+      assert.equal(restoredList.autoInsert, true)
+      assert.equal(restoredList.videosPerTurn, 5)
+      assert.equal(restoredList.insertPosition, 'end')
+      assert.equal(restoredList.alwaysSendPrompt, false)
+    } finally {
+      restored.dispose()
+    }
+  })
+
+  test('apply() 下关闭总开关立即卸载工具与标记忽略提示；重新开启后按原模式恢复', async () => {
+    const dataDirectory = await mkdtemp(join(tmpRoot, 'rh-test-'))
+    const effects = []
+    const tools = []
+    const routes = []
+    const markerSections = []
+    const ctx = {
+      attachments: makeAttachments({ saveImage: [], saveFile: [], getTurnState: [], getTurn: [], credentialsSet: [] }),
+      credentials: { resolve: async () => undefined, set: async () => {}, describe: async () => undefined },
+      tavern: {
+        handle: () => {}, onTurnSettled: () => () => {}, attach: async () => {},
+        settlementSection: spec => markerSections.push(spec),
+        candidateSection: spec => markerSections.push(spec),
+        compactionSection: spec => markerSections.push(spec),
+      },
+      webServer: { register: spec => { routes.push(spec); return () => {} } },
+      effect: fn => { const d = fn(); effects.push(d); return d },
+      inject: (names, fn) => {
+        if (names[0] === 'tools') fn({ tools: { register: spec => {
+          tools.push(spec)
+          return () => { const index = tools.indexOf(spec); if (index >= 0) tools.splice(index, 1) }
+        } } })
+      },
+    }
+    try {
+      await apply(ctx, { dataDirectory, baseURL: BASE })
+      const route = routes.find(spec => spec.path === API)
+      const call = async body => {
+        const res = fakeRes()
+        await route.handler(fakeReq({ url: API, headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }), res)
+        assert.equal(res.statusCode, 200, Buffer.concat(res.chunks).toString('utf8'))
+        return resBody(res)
+      }
+      assert.equal(tools.length, 4)
+
+      await call({ action: 'preferences', enabled: false })
+      assert.deepEqual(tools.map(t => t.name), [], '关闭总开关时必须卸载全部 RunningHub 工具')
+
+      await call({ action: 'preferences', enabled: true })
+      assert.deepEqual(tools.map(t => t.name).sort(),
+        ['runninghub_describe', 'runninghub_generate', 'runninghub_send_pregenerated', 'runninghub_status'])
+
+      await call({ action: 'preferences', generationMode: 'marker' })
+      assert.match(markerSections[0].text(), /\[\[RH:SHOT\]\]/)
+      await call({ action: 'preferences', enabled: false })
+      assert.equal(markerSections[0].text(), '', '关闭总开关后不再注入 marker-ignore 提示')
+      assert.deepEqual(tools.map(t => t.name), [])
+      await call({ action: 'preferences', enabled: true })
+      assert.match(markerSections[0].text(), /\[\[RH:SHOT\]\]/, '重新开启后保留 marker 模式并恢复提示')
+      assert.deepEqual(tools.map(t => t.name), [], 'marker 模式下重新开启仍不注册工具')
+    } finally {
+      while (effects.length) {
+        const d = effects.pop()
+        if (typeof d === 'function') d()
+      }
+      await rm(dataDirectory, { recursive: true, force: true })
+    }
+  })
+
+  test('关闭总开关后拦截全部提交、重放、提示词注入、正文标记与预生成操作，且保留媒体读取与对账', async () => {
+    const gateway = makeGatewayFetch({
+      kind: 'video',
+      workflows: [{ alias: 'demo', customFields: [], referenceSlots: [], capabilities: {} }],
+      settings: { defaultModel: 'demo' },
+      portDirectiveText: '【模板正文】\n按规则写镜头提示词。',
+    })
+    const attached = []
+    const tavernImpl = {
+      getTurnState: async () => ({ settled: true, busy: false, turn: 5, textVersion: 'v1' }),
+      getTurn: async ({ gameId, turn }) => ({ gameId, turn, textVersion: 'v1', text: '正文。' }),
+      captureGeneration: async ({ gameId }) => ({ gameId, generationId: 'g'.repeat(64) }),
+      resolveGeneration: async () => ({ gameId: 'game-off', turn: 5, textVersion: 'v1' }),
+      onTurnSettled: () => () => {},
+      list: async () => attached,
+      update: async (id, changes) => { const item = attached.find(entry => entry.id === id); if (item) Object.assign(item, changes) },
+      attach: async spec => { attached.push({ ...spec, ...spec.item, id: 'm-' + (attached.length + 1) }) },
+      remove: async () => false,
+    }
+    const { host, regexLibraryFile } = await makeHost({ configured: true, gateway, tavernImpl, extraOptions: { reconcileMs: 0 } })
+    await writeFile(regexLibraryFile, JSON.stringify({ regex: [] }))
+    await host.dispatch({ action: 'list' })
+    await host.dispatch({ action: 'preferences', autoInsert: true, streamPreclaim: true })
+
+    // 开启时先提交并完成一个可重放任务，验证关闭后媒体读取与对账照常工作，但不能新提交或重放。
+    const firstJob = await host.dispatch({ action: 'submit', requestId: 'req-before-off', bindToTurn: false, input: { prompt: 'first shot' } })
+    await waitForJob(host, firstJob.id, job => job.status === 'ready')
+    assert.equal(gateway.generations(), 1)
+
+    // 在 marker 模式下即便正则库文件只读/损坏，也必须允许关闭总开关。
+    await host.dispatch({ action: 'preferences', generationMode: 'marker' })
+    await writeFile(regexLibraryFile, '{bad json')
+    const off = await host.dispatch({ action: 'preferences', enabled: false })
+    assert.equal(off.enabled, false)
+
+    assert.equal(host.promptText(), '')
+    assert.deepEqual(host.promptSections(), [])
+    assert.equal(host.turnReminder('玩家指令'), '')
+    const described = await host.dispatch({ action: 'describe' })
+    assert.equal(described.enabled, false)
+    assert.equal(described.promptTemplateSent, false)
+
+    // 拦截工具提交、面板提交、重新生成、流式预提交、正文标记结算。
+    const toolExec = { agent: { session: { id: 'game-off' } } }
+    await assert.rejects(
+      host.dispatch({ action: 'submit', requestId: 'req-tool-off', bindToTurn: false, input: { prompt: 'x' } }, toolExec),
+      /总开关已关闭/,
+    )
+    await assert.rejects(
+      host.dispatch({ action: 'submit', requestId: 'req-panel-off', bindToTurn: false, input: { prompt: 'x' } }),
+      /总开关已关闭/,
+    )
+    await assert.rejects(
+      host.dispatch({ action: 'regenerate', id: firstJob.id, requestId: 'req-regen-off' }),
+      /总开关已关闭/,
+    )
+    await assert.rejects(
+      host.dispatch({ action: 'pregen-refill', gameId: 'game-off' }),
+      /总开关已关闭/,
+    )
+    await assert.rejects(
+      host.dispatch({ action: 'pregen-send', gameId: 'game-off', id: 'pg-any' }),
+      /总开关已关闭/,
+    )
+    const preclaimRes = await host.dispatch({
+      action: 'preclaim', gameId: 'game-off', turn: 6,
+      shots: [{ prompt: 'stream shot', fingerprint: shotFingerprint({ prompt: 'stream shot' }) }],
+    })
+    assert.deepEqual(preclaimRes, { skipped: 'off' })
+
+    const markerRaw = '[[RH:SHOT]]\n@prompt\n关闭后不应提交的镜头\n[[/RH:SHOT]]\n这是正文。'
+    await host.handleTurn({ gameId: 'game-off', turn: 6, textVersion: 'v6', rawText: markerRaw, text: markerRaw })
+    assert.equal(gateway.generations(), 1, '关闭总开关期间不得再向网关提交新任务')
+
+    // 已完成任务的历史媒体仍可读，未对账的既有绑定仍可对账。
+    const mediaRes = fakeRes()
+    await host.route(fakeReq({ method: 'GET', url: `${MEDIA}?id=${firstJob.id}&index=0` }), mediaRes)
+    assert.equal(mediaRes.statusCode, 200)
+    const pendingBindId = '00000000-0000-4000-8000-000000000888'
+    await host.store.write({
+      id: pendingBindId, requestId: 'existing-reconcile-while-off', status: 'ready', model: 'demo',
+      createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+      binding: { gameId: 'game-off', generationId: 'g'.repeat(64) },
+      outputs: [], completedOutputs: [],
+      attachments: [{ kind: 'video', name: 'clip.mp4', mediaType: 'video/mp4', url: `${MEDIA}?id=${pendingBindId}&index=0` }],
+    })
+    await host.reconcile()
+    assert.equal(attached.length, 1, '关闭总开关不影响已提交任务的正文落位')
+
+    // 修复正则库后重新开启总开关，原有子设置全部恢复。
+    await writeFile(regexLibraryFile, JSON.stringify({ regex: [] }))
+    const back = await host.dispatch({ action: 'preferences', enabled: true })
+    assert.equal(back.enabled, true)
+    assert.equal(back.generationMode, 'marker')
+    assert.equal(back.autoInsert, true)
+    assert.equal(back.streamPreclaim, true)
+    assert.match(host.promptText(), /【模板正文】/)
+    assert.match(host.turnReminder('玩家指令'), /\[\[RH:SHOT\]\]/)
   })
 })

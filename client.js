@@ -17,7 +17,7 @@ window.__ModuleLoader__.load({
     let tavernUiApi = null
     const own = (object, key) => Object.prototype.hasOwnProperty.call(object || {}, key)
     // 与 index.mjs 的 PLUGIN_VERSION 对齐；对不上说明宿主侧还是旧代码（测试里有断言）。
-    const CLIENT_VERSION = '0.1.47'
+    const CLIENT_VERSION = '0.1.48'
     const message = error => typeof error === 'string' ? error : error?.message || '未知错误'
     // 探测结果的统一说法：保存和「检查连接」共用，不把原始错误当成成功。
     // 一键复制：手机上很多 WebView/非安全上下文没有 navigator.clipboard，退回 execCommand。
@@ -63,7 +63,7 @@ window.__ModuleLoader__.load({
 .rh-studio{--rh-bg:#f4f6f8;--rh-surface:#fff;--rh-soft:#f8fafb;--rh-ink:#18212f;--rh-muted:#667085;--rh-line:#dde3ea;--rh-brand:#175cd3;--rh-brand-soft:#eff5ff;--rh-success:#087a55;--rh-success-soft:#ecfdf3;--rh-danger:#b42318;--rh-warning:#a15c07;--rh-shadow:0 1px 2px #10182806,0 8px 24px #10182806;container-type:inline-size;position:relative;isolation:isolate;min-width:0;min-height:0;max-height:100%;height:100%;flex:1 1 auto;overflow-y:auto;overscroll-behavior:contain;background:var(--rh-bg);color:var(--rh-ink);font:13px/1.6 Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;overflow-wrap:anywhere;color-scheme:light}
 .rh-studio[data-theme="dark"]{--rh-bg:#141a23;--rh-surface:#1b2430;--rh-soft:#202c3a;--rh-ink:#e9eef5;--rh-muted:#a4b2c4;--rh-line:#344153;--rh-brand:#8db6ff;--rh-brand-soft:#233b60;--rh-success:#74ddb5;--rh-success-soft:#1d3b35;--rh-danger:#ffaaa2;--rh-warning:#f6d08b;color-scheme:dark}
 .rh-studio *{box-sizing:border-box}.rh-studio button,.rh-studio input,.rh-studio textarea,.rh-studio select{font:inherit}.rh-studio button{cursor:pointer}.rh-studio button:disabled{cursor:not-allowed;opacity:.48}.rh-studio button:focus-visible,.rh-studio input:focus-visible,.rh-studio select:focus-visible,.rh-studio textarea:focus-visible,.rh-studio summary:focus-visible{outline:3px solid color-mix(in srgb,var(--rh-brand) 35%,transparent);outline-offset:3px}.rh-studio h2,.rh-studio h3,.rh-studio p{margin:0}.rh-studio h2{font-size:22px;line-height:1.35;letter-spacing:-.04em}.rh-studio h3{font-size:14px;font-weight:700}.rh-studio svg{flex-shrink:0;display:block}
-.rh-topbar{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:18px 24px;background:var(--rh-surface);border-bottom:1px solid var(--rh-line)}.rh-brand{display:flex;align-items:center;gap:10px;min-width:0}.rh-mark{display:grid;place-items:center;width:36px;height:36px;border-radius:11px;background:#172b4d;color:#fff;font-size:15px;font-weight:800;letter-spacing:-1px}.rh-brand-name{display:flex;align-items:center;gap:6px;font-size:15px;font-weight:750;letter-spacing:-.3px}.rh-ui-badge{padding:1px 4px;border:1px solid color-mix(in srgb,var(--rh-brand) 28%,var(--rh-line));border-radius:4px;background:var(--rh-brand-soft);color:var(--rh-brand);font-size:8px;font-weight:700;letter-spacing:.3px;line-height:1.5}.rh-kicker{font-size:10px;letter-spacing:1.6px;color:var(--rh-muted);font-weight:600}.rh-top-actions,.rh-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.rh-pill{display:inline-flex;align-items:center;gap:7px;border:1px solid var(--rh-line);border-radius:30px;padding:5px 10px;font-size:11px;white-space:nowrap;color:var(--rh-muted)}.rh-dot{width:6px;height:6px;border-radius:50%;background:currentColor}.rh-pill[data-state="online"]{color:var(--rh-success);background:var(--rh-success-soft);border-color:transparent}
+.rh-topbar{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:18px 24px;background:var(--rh-surface);border-bottom:1px solid var(--rh-line)}.rh-brand{display:flex;align-items:center;gap:10px;min-width:0}.rh-mark{display:grid;place-items:center;width:36px;height:36px;border-radius:11px;background:#172b4d;color:#fff;font-size:15px;font-weight:800;letter-spacing:-1px}.rh-brand-name{display:flex;align-items:center;gap:6px;font-size:15px;font-weight:750;letter-spacing:-.3px}.rh-ui-badge{padding:1px 4px;border:1px solid color-mix(in srgb,var(--rh-brand) 28%,var(--rh-line));border-radius:4px;background:var(--rh-brand-soft);color:var(--rh-brand);font-size:8px;font-weight:700;letter-spacing:.3px;line-height:1.5}.rh-kicker{font-size:10px;letter-spacing:1.6px;color:var(--rh-muted);font-weight:600}.rh-top-actions,.rh-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.rh-pill{display:inline-flex;align-items:center;gap:7px;border:1px solid var(--rh-line);border-radius:30px;padding:5px 10px;font-size:11px;white-space:nowrap;color:var(--rh-muted)}.rh-dot{width:6px;height:6px;border-radius:50%;background:currentColor}.rh-pill[data-state="online"]{color:var(--rh-success);background:var(--rh-success-soft);border-color:transparent}.rh-pill[data-state="disabled"]{color:var(--rh-muted);background:var(--rh-soft);border-color:var(--rh-line)}.rh-master-toggle{display:inline-flex;align-items:center;gap:8px;padding:4px 8px 4px 10px;border:1px solid var(--rh-line);border-radius:999px;background:var(--rh-soft);font-size:11px;font-weight:600;color:var(--rh-ink);cursor:pointer;white-space:nowrap}.rh-master-toggle[data-enabled="true"]{border-color:color-mix(in srgb,var(--rh-brand) 35%,var(--rh-line));background:var(--rh-brand-soft)}.rh-master-toggle[data-enabled="false"]{color:var(--rh-muted);background:var(--rh-bg)}.rh-master-label{display:inline-flex;align-items:center;gap:4px}.rh-master-banner{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;padding:12px 16px;margin-bottom:16px;border:1px solid var(--rh-line);border-radius:11px;background:var(--rh-surface);box-shadow:var(--rh-shadow)}.rh-master-banner-copy{display:flex;flex-direction:column;gap:2px;min-width:0}.rh-master-banner-copy strong{font-size:12px;color:var(--rh-ink)}
 .rh-body{padding:22px 24px 24px;max-width:1440px;margin:auto}.rh-nav{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:20px}.rh-tabs{display:flex;align-items:center;padding:4px;background:var(--rh-surface);border:1px solid var(--rh-line);border-radius:10px;gap:4px}.rh-tab{display:flex;align-items:center;gap:7px;border:0;background:transparent;color:var(--rh-muted);padding:7px 13px;border-radius:7px;font-size:12px;font-weight:600}.rh-tab[aria-selected="true"]{background:var(--rh-brand-soft);color:var(--rh-brand)}.rh-count{font-size:10px;min-width:18px;text-align:center;background:var(--rh-bg);border-radius:5px;padding:0 4px}.rh-context{color:var(--rh-muted);font-size:11px;display:flex;align-items:center;gap:6px}
 .rh-card{background:var(--rh-surface);border:1px solid var(--rh-line);border-radius:14px;box-shadow:var(--rh-shadow);min-width:0}.rh-card-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:17px 20px;border-bottom:1px solid var(--rh-line)}.rh-card-body{padding:20px}.rh-note{color:var(--rh-muted);font-size:11px;line-height:1.7;margin:0}.rh-eyebrow{color:var(--rh-brand);font-size:10px;font-weight:700;letter-spacing:1.7px;margin-bottom:9px}.rh-lead{font-size:12px;color:var(--rh-muted);margin-top:9px!important}.rh-hero{padding:24px 24px 20px}.rh-workflow{display:flex;align-items:center;gap:12px;margin-top:20px;padding:12px 14px;border-radius:10px;background:var(--rh-soft);border:1px solid var(--rh-line)}.rh-workflow-label{color:var(--rh-muted);font-size:11px;flex-shrink:0}.rh-workflow select{flex:1;min-width:0;max-width:420px;background:var(--rh-surface)}.rh-workflow-hint{margin-left:auto;font-size:10px;color:var(--rh-muted);white-space:nowrap}
 .rh-composer{display:grid;grid-template-columns:minmax(0,1fr) 285px;gap:0;border-top:1px solid var(--rh-line)}.rh-prompt-pane{min-width:0;padding:22px 24px}.rh-section-label{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px;font-size:12px;font-weight:650}.rh-prompt{width:100%;resize:vertical;min-height:270px;padding:16px;border:1px solid var(--rh-line);border-radius:10px;background:var(--rh-surface);color:var(--rh-ink);line-height:1.9;outline:none}.rh-prompt:focus{border-color:var(--rh-brand);box-shadow:0 0 0 3px var(--rh-brand-soft)}.rh-prompt::placeholder{color:var(--rh-muted);opacity:.7}.rh-prompt-meta{display:flex;justify-content:space-between;gap:12px;margin-top:10px}.rh-side{padding:22px 20px;background:var(--rh-soft);border-left:1px solid var(--rh-line);min-width:0}.rh-stack{display:flex;flex-direction:column;gap:15px}.rh-field{display:flex;flex-direction:column;gap:7px;min-width:0}.rh-field-label{font-size:11px;font-weight:600;display:flex;align-items:center;gap:6px}.rh-input{box-sizing:border-box;width:100%;min-width:0;padding:9px 11px;color:var(--rh-ink);background:var(--rh-surface);border:1px solid var(--rh-line);border-radius:8px;transition:border-color .15s}.rh-input:focus{outline:none;border-color:var(--rh-brand)}.rh-input::placeholder{color:var(--rh-muted)}.rh-grid2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.rh-rule{height:1px;background:var(--rh-line);margin:2px 0}.rh-check{display:flex;align-items:center;gap:9px;font-size:11px;cursor:pointer}.rh-check input{width:15px;height:15px;accent-color:var(--rh-brand);margin:0;flex-shrink:0}.rh-fold{border-top:1px solid var(--rh-line);padding-top:14px}.rh-fold summary{cursor:pointer;color:var(--rh-ink);font-weight:600;font-size:12px;list-style:none;display:flex;align-items:center;justify-content:space-between;gap:8px}.rh-fold summary:after{content:'+';font-size:16px;color:var(--rh-muted)}.rh-fold[open] summary:after{content:'−'}.rh-fold-content{padding-top:14px;display:flex;flex-direction:column;gap:14px}.rh-meta-list{display:flex;flex-direction:column;gap:6px;color:var(--rh-muted);font-size:11px}
@@ -266,7 +266,7 @@ window.__ModuleLoader__.load({
   .rh-fail-details{grid-column:1/-1}
 }
 .rh-pregen{margin-top:24px}.rh-pregen-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:12px}.rh-pregen-entry{overflow:hidden;border:1px solid var(--rh-line);border-radius:11px;background:var(--rh-surface);display:flex;flex-direction:column;min-width:0}.rh-pregen-preview{background:var(--rh-soft);border-bottom:1px solid var(--rh-line);min-height:130px;display:flex;align-items:center;justify-content:center;position:relative}.rh-pregen-video{display:block;width:100%;max-height:240px;object-fit:contain;background:#000}.rh-pregen-info{padding:12px;display:flex;flex-direction:column;gap:8px;min-width:0}.rh-pregen-meta{display:flex;justify-content:space-between;gap:8px;color:var(--rh-muted);font-size:10px}.rh-pregen-desc{margin:0;font-size:12px;line-height:1.55;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}.rh-pregen-actions{display:flex;gap:6px;flex-wrap:wrap;margin-top:auto}.rh-pregen-settings{display:grid;grid-template-columns:repeat(3,minmax(120px,1fr)) auto auto;gap:10px;align-items:end;padding-bottom:14px;border-bottom:1px solid var(--rh-line)}.rh-pregen-empty{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;padding:26px 18px;margin-top:12px;border:1px dashed var(--rh-line);border-radius:10px;color:var(--rh-muted);text-align:center}.rh-pregen-empty strong{color:var(--rh-ink);font-size:12px}.rh-pregen-empty small{font-size:11px;max-width:340px}
-.rh-drawer-layer{position:absolute;inset:0;z-index:20;display:flex;justify-content:flex-end;min-height:0}.rh-backdrop{position:absolute;inset:0;border:0;background:#10182844;cursor:default!important}.rh-drawer{position:sticky;top:0;z-index:1;width:min(410px,100%);background:var(--rh-surface);border-left:1px solid var(--rh-line);box-shadow:-12px 0 40px #10182814;align-self:flex-start;min-width:0;height:100svh;max-height:100svh;overflow-y:auto}.rh-drawer-head{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:20px;border-bottom:1px solid var(--rh-line)}.rh-drawer-content{padding:22px;display:flex;flex-direction:column;gap:24px}.rh-setting-group{display:flex;flex-direction:column;gap:14px}.rh-setting-heading{font-size:12px;font-weight:700;display:flex;align-items:center;gap:8px}.rh-toggle-row{display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:12px;cursor:pointer}.rh-switch{position:relative;display:inline-flex;flex-shrink:0;width:34px;height:20px}.rh-switch input{position:absolute;inset:0;opacity:0;margin:0;width:100%;height:100%;z-index:1;cursor:pointer}.rh-switch-track{width:100%;height:100%;border-radius:20px;background:var(--rh-line);transition:background .15s}.rh-switch-track:after{content:'';position:absolute;width:14px;height:14px;border-radius:50%;top:3px;left:3px;background:#fff;box-shadow:0 1px 3px #0002;transition:transform .15s}.rh-switch input:checked+.rh-switch-track{background:var(--rh-brand)}.rh-switch input:checked+.rh-switch-track:after{transform:translateX(14px)}.rh-switch input:focus-visible+.rh-switch-track{outline:3px solid var(--rh-brand-soft);outline-offset:3px}.rh-switch input:disabled+.rh-switch-track{opacity:.5}.rh-settings-status{padding:10px 12px;border:1px solid var(--rh-line);border-radius:9px;background:var(--rh-soft);font-size:11px;line-height:1.65;color:var(--rh-muted)}.rh-settings-status[data-state="saved"]{color:var(--rh-success);border-color:color-mix(in srgb,var(--rh-success) 28%,var(--rh-line))}.rh-settings-status[data-state="dirty"]{color:var(--rh-warning);border-color:color-mix(in srgb,var(--rh-warning) 30%,var(--rh-line))}.rh-settings-status[data-state="saving"]{color:var(--rh-brand)}.rh-settings-status[data-state="error"],.rh-settings-status[data-state="conflict"]{color:var(--rh-danger);border-color:color-mix(in srgb,var(--rh-danger) 28%,var(--rh-line))}.rh-settings-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.rh-model-field{display:flex;flex-direction:column;gap:8px;padding:10px;border:1px solid var(--rh-line);border-radius:9px;background:var(--rh-soft);min-width:0}.rh-model-field-head{display:flex;align-items:center;justify-content:space-between;gap:8px;min-width:0}.rh-model-field-title{font-size:11px;font-weight:650;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.rh-skeleton{height:13px;border-radius:5px;background:var(--rh-line);opacity:.5;margin:12px 0}
+.rh-drawer-layer{position:absolute;inset:0;z-index:20;display:flex;justify-content:flex-end;min-height:0}.rh-backdrop{position:absolute;inset:0;border:0;background:#10182844;cursor:default!important}.rh-drawer{position:sticky;top:0;z-index:1;width:min(410px,100%);background:var(--rh-surface);border-left:1px solid var(--rh-line);box-shadow:-12px 0 40px #10182814;align-self:flex-start;min-width:0;height:100svh;max-height:100svh;overflow-y:auto}.rh-drawer-head{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:20px;border-bottom:1px solid var(--rh-line)}.rh-drawer-content{padding:22px;display:flex;flex-direction:column;gap:24px}.rh-master-card{padding:14px;border:1px solid var(--rh-line);border-radius:11px;background:var(--rh-soft);display:flex;flex-direction:column;gap:8px}.rh-master-row{display:flex;align-items:center;justify-content:space-between;gap:12px;cursor:pointer}.rh-master-row-copy{display:flex;flex-direction:column;gap:2px;min-width:0}.rh-master-row-copy strong{font-size:12px;color:var(--rh-ink)}.rh-setting-group{display:flex;flex-direction:column;gap:14px}.rh-setting-heading{font-size:12px;font-weight:700;display:flex;align-items:center;gap:8px}.rh-toggle-row{display:flex;align-items:center;justify-content:space-between;gap:12px;font-size:12px;cursor:pointer}.rh-switch{position:relative;display:inline-flex;flex-shrink:0;width:34px;height:20px}.rh-switch input{position:absolute;inset:0;opacity:0;margin:0;width:100%;height:100%;z-index:1;cursor:pointer}.rh-switch-track{width:100%;height:100%;border-radius:20px;background:var(--rh-line);transition:background .15s}.rh-switch-track:after{content:'';position:absolute;width:14px;height:14px;border-radius:50%;top:3px;left:3px;background:#fff;box-shadow:0 1px 3px #0002;transition:transform .15s}.rh-switch input:checked+.rh-switch-track{background:var(--rh-brand)}.rh-switch input:checked+.rh-switch-track:after{transform:translateX(14px)}.rh-switch input:focus-visible+.rh-switch-track{outline:3px solid var(--rh-brand-soft);outline-offset:3px}.rh-switch input:disabled+.rh-switch-track{opacity:.5}.rh-settings-status{padding:10px 12px;border:1px solid var(--rh-line);border-radius:9px;background:var(--rh-soft);font-size:11px;line-height:1.65;color:var(--rh-muted)}.rh-settings-status[data-state="saved"]{color:var(--rh-success);border-color:color-mix(in srgb,var(--rh-success) 28%,var(--rh-line))}.rh-settings-status[data-state="dirty"]{color:var(--rh-warning);border-color:color-mix(in srgb,var(--rh-warning) 30%,var(--rh-line))}.rh-settings-status[data-state="saving"]{color:var(--rh-brand)}.rh-settings-status[data-state="error"],.rh-settings-status[data-state="conflict"]{color:var(--rh-danger);border-color:color-mix(in srgb,var(--rh-danger) 28%,var(--rh-line))}.rh-settings-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.rh-model-field{display:flex;flex-direction:column;gap:8px;padding:10px;border:1px solid var(--rh-line);border-radius:9px;background:var(--rh-soft);min-width:0}.rh-model-field-head{display:flex;align-items:center;justify-content:space-between;gap:8px;min-width:0}.rh-model-field-title{font-size:11px;font-weight:650;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.rh-skeleton{height:13px;border-radius:5px;background:var(--rh-line);opacity:.5;margin:12px 0}
 .rh-slot-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:-2px}.rh-slot-actions .rh-btn{font-size:10px}
 .rh-library-dialog{position:fixed;inset:0;width:100%;max-width:none;height:100%;max-height:none;margin:0;padding:24px;border:0;background:transparent;display:grid;place-items:center;overflow:auto;box-sizing:border-box}
 .rh-library-dialog:not([open]){display:none}
@@ -306,7 +306,7 @@ window.__ModuleLoader__.load({
 .rh-library-skeleton{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
 .rh-library-skeleton .rh-skeleton{height:120px;margin:0}
 @media (max-width:560px){.rh-library-dialog{padding:10px}.rh-library{max-height:calc(100vh - 20px);border-radius:12px}.rh-library-head,.rh-library-toolbar,.rh-library-body{padding-left:14px;padding-right:14px}.rh-library-grid{grid-template-columns:repeat(auto-fill,minmax(96px,1fr))}}
-@container (max-width:780px){.rh-composer{grid-template-columns:1fr}.rh-side{border-left:0;border-top:1px solid var(--rh-line)}.rh-side>.rh-stack{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}.rh-side .rh-fold,.rh-side .rh-rule,.rh-side .rh-section-label{grid-column:1/-1}.rh-prompt{min-height:220px}.rh-workflow-hint{display:none}.rh-jobs{grid-template-columns:repeat(auto-fill,minmax(300px,1fr))}}@container (max-width:480px){.rh-topbar{padding:14px}.rh-body{padding:16px 12px}.rh-hero,.rh-prompt-pane{padding:18px 16px}.rh-references{padding:16px}.rh-side{padding:18px 16px}.rh-brand-name{font-size:13px}.rh-brand-sub,.rh-context,.rh-top-actions .rh-pill,.rh-prompt-meta .rh-note:last-child{display:none}.rh-nav{margin-bottom:15px}.rh-workflow{gap:8px;padding:10px;margin-top:16px}.rh-workflow select{padding:8px}.rh-studio h2{font-size:20px}.rh-side>.rh-stack{display:flex}.rh-slots{grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.rh-slot{padding:9px}.rh-upload{height:105px}.rh-slot .rh-note{font-size:10px}.rh-submitbar{padding:12px;gap:10px}.rh-submit-sub{display:none}.rh-btn-primary{padding:11px 17px}.rh-submit-summary{font-size:10px}.rh-jobs{grid-template-columns:1fr}.rh-results-head{gap:6px}.rh-drawer-content{padding:18px}.rh-top-actions{gap:4px}.rh-topbar .rh-btn{padding:7px 9px}}
+@container (max-width:780px){.rh-composer{grid-template-columns:1fr}.rh-side{border-left:0;border-top:1px solid var(--rh-line)}.rh-side>.rh-stack{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}.rh-side .rh-fold,.rh-side .rh-rule,.rh-side .rh-section-label{grid-column:1/-1}.rh-prompt{min-height:220px}.rh-workflow-hint{display:none}.rh-jobs{grid-template-columns:repeat(auto-fill,minmax(300px,1fr))}}@container (max-width:480px){.rh-topbar{padding:14px}.rh-body{padding:16px 12px}.rh-hero,.rh-prompt-pane{padding:18px 16px}.rh-references{padding:16px}.rh-side{padding:18px 16px}.rh-brand-name{font-size:13px}.rh-brand-sub,.rh-context,.rh-top-actions .rh-pill,.rh-prompt-meta .rh-note:last-child{display:none}.rh-nav{margin-bottom:15px}.rh-workflow{gap:8px;padding:10px;margin-top:16px}.rh-workflow select{padding:8px}.rh-studio h2{font-size:20px}.rh-side>.rh-stack{display:flex}.rh-slots{grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.rh-slot{padding:9px}.rh-upload{height:105px}.rh-slot .rh-note{font-size:10px}.rh-submitbar{padding:12px;gap:10px}.rh-submit-sub{display:none}.rh-btn-primary{padding:11px 17px}.rh-submit-summary{font-size:10px}.rh-jobs{grid-template-columns:1fr}.rh-results-head{gap:6px}.rh-drawer-content{padding:18px}.rh-top-actions{gap:6px}.rh-topbar .rh-btn{padding:7px 9px}.rh-master-prefix{display:none}}
 @media(prefers-reduced-motion:reduce){.rh-studio *{transition:none!important;animation:none!important}}
 @container (max-width:780px){.rh-pregen-settings{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @container (max-width:480px){.rh-pregen-grid{grid-template-columns:1fr}.rh-pregen-settings{grid-template-columns:1fr}}
@@ -1022,6 +1022,7 @@ img.rh-chat-image{display:block;width:100%!important;height:auto!important;max-w
       const rootRef = useRef(null)
       const hoverTimer = useRef(null)
       const activeRef = useRef(false)
+      const enabledRef = useRef(true)
       const seenActive = useRef(false)
       const flashTimer = useRef(null)
 
@@ -1043,13 +1044,14 @@ img.rh-chat-image{display:block;width:100%!important;height:auto!important;max-w
           inFlight = true
           controller = new AbortController()
           // 下一轮间隔跟着这次拿到的状态走：有任务在跑就 2.5 秒一问，闲下来就放慢。
-          let nextDelay = activeRef.current ? 2500 : 5000
+          let nextDelay = activeRef.current ? 2500 : (enabledRef.current ? 5000 : 10000)
           try {
             const data = await request({ action: 'jobs', gameId: sessionId }, controller.signal)
             if (!live) return
+            enabledRef.current = data?.enabled !== false
             const list = Array.isArray(data?.jobs) ? data.jobs : []
             setJobs(list)
-            nextDelay = list.some(job => job && DOCK_ACTIVE.has(job.status)) ? 2500 : 5000
+            nextDelay = list.some(job => job && DOCK_ACTIVE.has(job.status)) ? 2500 : (enabledRef.current ? 5000 : 10000)
           } catch (error) {
             // 读不到任务状态就保持上一次显示；停靠区不该把网络噪声塞进玩家界面。
           } finally {
@@ -1077,6 +1079,7 @@ img.rh-chat-image{display:block;width:100%!important;height:auto!important;max-w
         const registry = preclaimRegistry(sessionId)
         let blocked = false
         const stop = ui.watchReply(sessionId, state => {
+          if (!enabledRef.current) return
           if (!state || typeof state.text !== 'string') return
           if (state.streaming !== true) {
             // 这一轮写完了：下次生成重新开始判断。
@@ -1464,6 +1467,10 @@ img.rh-chat-image{display:block;width:100%!important;height:auto!important;max-w
       const diagRaw = useRef(null)
       const probeLock = useRef(false)
       const diagLock = useRef(false)
+      const pluginEnabled = summary ? summary.enabled !== false : true
+      const [enabledBusy, setEnabledBusy] = useState(false)
+      const [enabledError, setEnabledError] = useState('')
+      const enabledLock = useRef(false)
       const [autoInsertBusy, setAutoInsertBusy] = useState(false)
       const [autoInsertError, setAutoInsertError] = useState('')
       const autoInsertLock = useRef(false)
@@ -1608,12 +1615,12 @@ img.rh-chat-image{display:block;width:100%!important;height:auto!important;max-w
       // 抽屉打开、宿主却交回 0 个工作流时，顺手探一次网关：
       // 这样「网关没有工作流」和「宿主没把工作流交给网页」能当场分开。
       useEffect(() => {
-        if (!settingsOpen) return
+        if (!settingsOpen || !pluginEnabled) return
         if (!summary || summary.configured !== true) return
         if ((summary.workflows || []).length) return
         if (probeLock.current || probeResult) return
         void testConnection()
-      }, [settingsOpen, summary?.configured, (summary?.workflows || []).length, probeResult])
+      }, [settingsOpen, pluginEnabled, summary?.configured, (summary?.workflows || []).length, probeResult])
 
       // 打开设置抽屉时如果还没拿到宿主状态，主动补一次，别让抽屉一直停在“等待首次响应”。
       useEffect(() => {
@@ -1657,7 +1664,7 @@ img.rh-chat-image{display:block;width:100%!important;height:auto!important;max-w
             if (!data || !Array.isArray(data.jobs) || !Array.isArray(data.workflows)) {
               throw new Error('宿主状态格式无效：缺少 jobs 或 workflows')
             }
-            setSummary({ configured: data.configured, baseURL: data.baseURL,
+            setSummary({ enabled: data.enabled !== false, configured: data.configured, baseURL: data.baseURL,
               allowPrivateLan: data.allowPrivateLan === true,
               generationMode: data.generationMode === 'marker' ? 'marker' : 'tool',
               insertPosition: data.insertPosition === 'end' ? 'end' : 'inline',
@@ -1882,6 +1889,7 @@ img.rh-chat-image{display:block;width:100%!important;height:auto!important;max-w
           const data = await request({ action: 'preferences', ...patch }, current.signal)
           if (!alive.current) return data
           setSummary(previous => ({ ...(previous || {}),
+            ...(typeof data?.enabled === 'boolean' ? { enabled: data.enabled } : {}),
             ...(data?.generationMode === 'marker' || data?.generationMode === 'tool' ? { generationMode: data.generationMode } : {}),
             ...(data?.insertPosition === 'end' || data?.insertPosition === 'inline' ? { insertPosition: data.insertPosition } : {}),
             ...(typeof data?.autoInsert === 'boolean' ? { autoInsert: data.autoInsert } : {}),
@@ -2224,7 +2232,7 @@ img.rh-chat-image{display:block;width:100%!important;height:auto!important;max-w
         setSettingsNotice('')
       }, [syncContext])
       useEffect(() => {
-        if (!summary?.configured || !model || visible === false || selectionBusy.current) return
+        if (!summary?.configured || !pluginEnabled || !model || visible === false || selectionBusy.current) return
         let active = true
         const current = controller()
         // Background synchronization must not interrupt typing or disable uploads.
@@ -2246,15 +2254,15 @@ img.rh-chat-image{display:block;width:100%!important;height:auto!important;max-w
           if (active && alive.current) setWorkflowBusy(false)
         })
         return () => { active = false; current.abort(); controllers.current.delete(current) }
-      }, [model, summary?.workflows, summary?.configured, configVersion, visible, refreshVersion])
+      }, [model, summary?.workflows, summary?.configured, pluginEnabled, configVersion, visible, refreshVersion])
 
       useEffect(() => {
-        if (!settingsOpen || !workflow || !(workflow.modelFields || []).length) return
+        if (!settingsOpen || !pluginEnabled || !workflow || !(workflow.modelFields || []).length) return
         const context = workflow.alias + ':' + (workflow.revision || '')
         if (optionGroupsContext.current === context) return
         optionGroupsContext.current = context
         void loadOptionGroups()
-      }, [settingsOpen, workflow?.alias, workflow?.revision])
+      }, [settingsOpen, pluginEnabled, workflow?.alias, workflow?.revision])
 
       async function saveConfig() {
         if (configLock.current || submitLock.current || pendingRef.current) return
@@ -2316,6 +2324,7 @@ img.rh-chat-image{display:block;width:100%!important;height:auto!important;max-w
             version: CLIENT_VERSION,
             hostVersion: summary?.version || '',
             transport: lastTransport,
+            enabled: summary?.enabled ?? null,
             configured: summary?.configured ?? null,
             workflows: (summary?.workflows || []).length,
             model: summary?.model || '',
@@ -2364,6 +2373,27 @@ img.rh-chat-image{display:block;width:100%!important;height:auto!important;max-w
           diagLock.current = false
           controllers.current.delete(current)
           if (alive.current) setDiagBusy(false)
+        }
+      }
+
+      async function saveEnabled(value) {
+        if (enabledLock.current) return
+        enabledLock.current = true
+        setEnabledBusy(true)
+        setEnabledError('')
+        const current = controller()
+        try {
+          const data = await request({ action: 'preferences', enabled: value }, current.signal)
+          if (alive.current) {
+            setSummary(previous => ({ ...(previous || {}), enabled: data?.enabled !== false }))
+            setRefreshVersion(previous => previous + 1)
+          }
+        } catch (error) {
+          if (alive.current && error.name !== 'AbortError') setEnabledError(message(error))
+        } finally {
+          enabledLock.current = false
+          controllers.current.delete(current)
+          if (alive.current) setEnabledBusy(false)
         }
       }
 
@@ -2693,7 +2723,7 @@ img.rh-chat-image{display:block;width:100%!important;height:auto!important;max-w
       }
 
       const locked = configBusy || submitBusy || Boolean(pending)
-      const formDisabled = locked || workflowBusy || !workflow || workflow.syncContext !== syncContext || draftContext !== syncContext || Boolean(workflowError)
+      const formDisabled = !pluginEnabled || locked || workflowBusy || !workflow || workflow.syncContext !== syncContext || draftContext !== syncContext || Boolean(workflowError)
       const aliases = Array.from(new Set((summary?.workflows || []).filter(item => !item.broken).map(item => item.alias))).filter(Boolean)
       const resolutionFields = new Set(workflow?.capabilities?.resolutionFields || Object.keys(workflow?.capabilities?.resolutionSchema?.properties || {}))
       const dimensionsSupported = resolutionFields.has('width') && resolutionFields.has('height')
@@ -2864,6 +2894,7 @@ img.rh-chat-image{display:block;width:100%!important;height:auto!important;max-w
           alert(referenceErrors[slot.nodeId]))
       }
       function settingsStatusText() {
+        if (summary && !pluginEnabled) return '插件总开关已关闭；开启后自动恢复与客户端的同步。'
         if (settingsStatus === 'saving') return '正在自动同步到客户端…'
         if (settingsStatus === 'conflict') return settingsError || '客户端设置已在别处更新；点“重新载入”取回客户端那份。'
         if (settingsStatus === 'error') return settingsError || '自动同步失败，修改任意设置或点“重试同步”再试。'
@@ -2883,8 +2914,8 @@ img.rh-chat-image{display:block;width:100%!important;height:auto!important;max-w
           summary && Number(summary.phaseMs?.total) > 1500 ? note('宿主摘要偏慢：' + summary.phaseMs.total + 'ms（' +
             Object.entries(summary.phaseMs).filter(([name]) => name !== 'total').map(([name, ms]) => name + ' ' + ms + 'ms').join(' · ') + '）') : null,
           alert(refreshError ? '读取宿主状态失败：' + refreshError : ''),
-          alert(summary?.gatewayError || ''),
-          summary && !summary.configured ? alert('宿主里还没有网关 Key：先在下方的「网关连接」填地址和 Key 并保存。') : null,
+          pluginEnabled ? alert(summary?.gatewayError || '') : null,
+          pluginEnabled && summary && !summary.configured ? alert('宿主里还没有网关 Key：先在下方的「网关连接」填地址和 Key 并保存。') : null,
           !loaded ? h('div', { className: 'rh-settings-status', 'data-state': 'dirty', role: 'status' },
             '正在读取宿主状态…' + (refreshError ? '（' + refreshError + '）' : '')) : null,
           h('div', { className: 'rh-settings-actions' },
@@ -3115,7 +3146,7 @@ img.rh-chat-image{display:block;width:100%!important;height:auto!important;max-w
       function renderJobRowActions(job, video) {
         const play = video ? button('播放', () => openPlayer(job, video), false, 'play-' + job.id, 'primary', 'play') : null
         const regenerateButton = canRegenerateJob(job) ? button(regenerating[job.id] ? '重新提交中…' : '重新生成', () => regenerate(job),
-          Boolean(regenerating[job.id]), 'regen-' + job.id, '', 'refresh')
+          !pluginEnabled || Boolean(regenerating[job.id]), 'regen-' + job.id, '', 'refresh')
           : video ? h('button', { type: 'button', className: 'rh-btn', disabled: true,
             title: '此任务没有保存可重放的输入，无法重新生成',
             'aria-label': '重新生成不可用：此任务没有保存可重放的输入' }, icon('refresh'), '重新生成') : null
@@ -3136,7 +3167,7 @@ img.rh-chat-image{display:block;width:100%!important;height:auto!important;max-w
       }
       function renderMediaActions(job, video) {
         if (canRegenerateJob(job)) return button(regenerating[job.id] ? '重新提交中…' : '重新生成', () => regenerate(job),
-          Boolean(regenerating[job.id]), 'regen-' + job.id, 'quiet', 'refresh')
+          !pluginEnabled || Boolean(regenerating[job.id]), 'regen-' + job.id, 'quiet', 'refresh')
         if (video) return h('button', { type: 'button', className: 'rh-btn rh-btn-quiet', disabled: true,
           title: '此任务没有保存可重放的输入，无法重新生成',
           'aria-label': '重新生成不可用：此任务没有保存可重放的输入' }, icon('refresh'), '重新生成')
@@ -3183,7 +3214,7 @@ img.rh-chat-image{display:block;width:100%!important;height:auto!important;max-w
         const retryBtn = canRetryDownload ? button(retrying[job.id] ? '重试中…' : '重试下载', () => retryDownload(job.id),
           Boolean(retrying[job.id]), 'retry-' + job.id, 'primary', 'refresh') : null
         const regenBtn = canRegenerateJob(job) ? button(regenerating[job.id] ? '重新提交中…' : '重新生成', () => regenerate(job),
-          Boolean(regenerating[job.id]), 'regen-' + job.id, 'quiet', 'refresh') : null
+          !pluginEnabled || Boolean(regenerating[job.id]), 'regen-' + job.id, 'quiet', 'refresh') : null
         return h('article', { key: job.id, className: 'rh-job rh-fail-row' },
           h('div', { className: 'rh-fail-icon', 'aria-hidden': true }, icon('image', 14)),
           h('div', { className: 'rh-fail-copy' },
@@ -3246,7 +3277,7 @@ img.rh-chat-image{display:block;width:100%!important;height:auto!important;max-w
           h('footer', { className: 'rh-player-foot' },
             h('div', { className: 'rh-player-chips' }, chips.map((chip, index) => h('span', { key: index, className: 'rh-player-chip' }, chip))),
             h('div', { className: 'rh-player-actions' },
-              canRegenerateJob(job) ? h('button', { type: 'button', className: 'rh-player-btn', disabled: busy,
+              canRegenerateJob(job) ? h('button', { type: 'button', className: 'rh-player-btn', disabled: !pluginEnabled || busy,
                 onClick: () => { const target = job; closePlayer(); regenerate(target) } },
                 icon('refresh'), busy ? '重新提交中…' : '重新生成') : null,
               h('button', { type: 'button', className: 'rh-player-btn primary', onClick: closePlayer }, '关闭')))))
@@ -3282,7 +3313,7 @@ img.rh-chat-image{display:block;width:100%!important;height:auto!important;max-w
             entry.summary && entry.status !== 'ready' ? note(entry.summary) : null,
             alert(entry.error),
             h('div', { className: 'rh-pregen-actions' },
-              canSend ? button(busy === 'send' ? '发送中…' : '发送到本轮', () => pregenAction('send', entry.id), Boolean(busy), null, '', 'arrow') : null,
+              canSend ? button(busy === 'send' ? '发送中…' : '发送到本轮', () => pregenAction('send', entry.id), !pluginEnabled || Boolean(busy), null, '', 'arrow') : null,
               canDelete ? button(busy === 'delete' ? '删除中…' : '删除', () => pregenAction('delete', entry.id), Boolean(busy), null, 'quiet') : null)))
       }
       const pregenCard = gameId && pregen ? h('section', { className: 'rh-card rh-pregen', 'aria-label': '预生成视频池' },
@@ -3293,7 +3324,7 @@ img.rh-chat-image{display:block;width:100%!important;height:auto!important;max-w
             note(`就绪 ${pregen.ready || 0} · 生成中 ${pregen.generating || 0}${pregen.settings?.count ? ` · 目标 ${pregen.settings.count}` : ''}`)),
           h('div', { className: 'rh-row' },
             pregen.planning ? h('span', { className: 'rh-pill' }, '规划中…') : null,
-            button(pregenRefillBusy ? '补池中…' : '补池', () => pregenAction('refill'), pregenRefillBusy || !pregen.settings?.count, null, 'quiet', 'refresh'))),
+            button(pregenRefillBusy ? '补池中…' : '补池', () => pregenAction('refill'), !pluginEnabled || pregenRefillBusy || !pregen.settings?.count, null, 'quiet', 'refresh'))),
         h('div', { className: 'rh-card-body' },
           h('div', { className: 'rh-pregen-settings' },
             field('预生成目标数量', h('input', { className: 'rh-input', type: 'number', min: 0, max: 20, step: 1,
@@ -3333,12 +3364,30 @@ img.rh-chat-image{display:block;width:100%!important;height:auto!important;max-w
             h('div', null, h('div', { className: 'rh-brand-name' }, 'RunningHub', h('span', { className: 'rh-ui-badge', title: '视频缩略图界面 v5（PC 缩略图库）' }, 'v5')),
               h('div', { className: 'rh-kicker rh-brand-sub' }, 'LOCAL CREATIVE STUDIO'))),
           h('div', { className: 'rh-top-actions' },
-            h('span', { className: 'rh-pill', 'data-state': summary?.configured && !summary.gatewayError && !refreshError ? 'online' : 'offline' },
-              h('span', { className: 'rh-dot' }), summary == null ? '读取连接中' : summary.configured ? summary.gatewayError || refreshError ? '连接异常' : '网关已连接' : '待配置'),
+            h('label', { className: 'rh-master-toggle', 'data-enabled': pluginEnabled ? 'true' : 'false',
+              title: pluginEnabled ? '关闭后立即暂停所有对话联动、提示词注入、工具与生成' : '开启后恢复 RunningHub 全部功能' },
+              h('span', { className: 'rh-master-label' },
+                h('span', { className: 'rh-master-prefix' }, '总开关'),
+                h('span', null, enabledBusy ? '切换中…' : pluginEnabled ? '已开启' : '已关闭')),
+              h('span', { className: 'rh-switch' },
+                h('input', { type: 'checkbox', role: 'switch', 'aria-label': '插件总开关', checked: pluginEnabled,
+                  disabled: enabledBusy || !summary, onChange: event => saveEnabled(event.target.checked) }),
+                h('span', { className: 'rh-switch-track', 'aria-hidden': true }))),
+            h('span', { className: 'rh-pill', 'data-state': summary && !pluginEnabled ? 'disabled'
+              : summary?.configured && !summary.gatewayError && !refreshError ? 'online' : 'offline' },
+              h('span', { className: 'rh-dot' }), summary == null ? '读取连接中'
+                : !pluginEnabled ? '插件已关闭'
+                  : summary.configured ? summary.gatewayError || refreshError ? '连接异常' : '网关已连接' : '待配置'),
             h('button', { type: 'button', className: 'rh-btn', ref: settingsButtonRef, 'aria-haspopup': 'dialog',
               onClick: () => setSettingsOpen(true) }, icon('settings'), '设置'))),
         h('div', { className: 'rh-body', inert: settingsOpen ? '' : undefined,
           style: videoNotices.length ? { paddingBottom: view === 'create' ? 190 : 112 } : undefined },
+          summary && !pluginEnabled ? h('div', { className: 'rh-master-banner', role: 'status' },
+            h('div', { className: 'rh-master-banner-copy' },
+              h('strong', null, 'RunningHub 总开关已关闭'),
+              note('已暂停提示词模板注入、模型工具、正文标记提交、流式预提交、后台预生成与新任务提交；原有子设置、任务历史和正文已有视频均已保留。')),
+            button(enabledBusy ? '开启中…' : '立即开启', () => saveEnabled(true), enabledBusy, 'master-enable', 'primary')) : null,
+          alert(enabledError),
           h('nav', { className: 'rh-nav', 'aria-label': '工作台导航' },
             h('div', { className: 'rh-tabs', role: 'tablist', 'aria-label': '工作台页面' },
               h('button', { type: 'button', role: 'tab', id: 'rh-create-tab', 'aria-controls': 'rh-create-view',
@@ -3349,21 +3398,21 @@ img.rh-chat-image{display:block;width:100%!important;height:auto!important;max-w
               h('button', { type: 'button', role: 'tab', id: 'rh-history-tab', 'aria-controls': 'rh-history-view',
                 'aria-selected': view === 'history', className: 'rh-tab', onClick: () => setView('history') }, icon('grid', 14), '任务历史', h('span', { className: 'rh-count' }, jobs.length))),
             h('div', { className: 'rh-context' }, icon('link', 12), gameId ? '已关联当前对话' : '独立创作')),
-          alert(refreshError), alert(summary?.gatewayError), alert(summary?.settingsError ? '客户端默认模型读取失败：' + summary.settingsError : ''),
+          alert(refreshError), pluginEnabled ? alert(summary?.gatewayError) : null, alert(summary?.settingsError ? '客户端默认模型读取失败：' + summary.settingsError : ''),
           alert(summary?.engineError ? '任务引擎没启动：' + summary.engineError + '（工作流仍可读取，提交/重下会失败）' : ''),
           alert(summary?.storeWarning || ''),
           summary?.reconcilePending ? note('正文对账在后台进行，不占用面板轮询。') : null,
           alert(summary?.reconcileError ? '正文对账失败：' + summary.reconcileError : ''),
-          alert(summary?.autoInsert === true && summary?.alwaysSendPrompt === false
-            ? '自动插入已开启，但「总是发送提示词模板」关闭：模型不会收到生成说明，工具生成会被拒绝。' : ''),
-          alert(summary?.generationMode === 'marker' && summary?.alwaysSendPrompt === false
-            ? '正文标记模式已开启，但「总是发送提示词模板」关闭：模型看不到标记格式，不会输出镜头。' : ''),
-          alert(summary?.generationMode === 'marker' && summary?.autoInsert !== true
-            ? '正文标记模式已开启，但自动插入关闭：标记块会被保留，不会提交生成。' : ''),
+          pluginEnabled ? alert(summary?.autoInsert === true && summary?.alwaysSendPrompt === false
+            ? '自动插入已开启，但「总是发送提示词模板」关闭：模型不会收到生成说明，工具生成会被拒绝。' : '') : null,
+          pluginEnabled ? alert(summary?.generationMode === 'marker' && summary?.alwaysSendPrompt === false
+            ? '正文标记模式已开启，但「总是发送提示词模板」关闭：模型看不到标记格式，不会输出镜头。' : '') : null,
+          pluginEnabled ? alert(summary?.generationMode === 'marker' && summary?.autoInsert !== true
+            ? '正文标记模式已开启，但自动插入关闭：标记块会被保留，不会提交生成。' : '') : null,
           alert(summary?.markerError ? '正文标记处理失败：' + summary.markerError : ''),
           alert(summary?.markerWarning ? '正文标记：' + summary.markerWarning : ''),
           alert(summary?.markerRegexError ? '正文标记正则库同步失败：' + summary.markerRegexError : ''),
-          summary && !summary.configured ? h('div', { className: 'rh-notice' }, '连接本地网关后，即可读取工作流并开始创作。 ',
+          pluginEnabled && summary && !summary.configured ? h('div', { className: 'rh-notice' }, '连接本地网关后，即可读取工作流并开始创作。 ',
             button('配置连接', () => setSettingsOpen(true), false, null, 'link')) : null,
           h('div', { id: 'rh-create-view', role: 'tabpanel', 'aria-labelledby': 'rh-create-tab', hidden: view !== 'create' },
             h('section', { className: 'rh-card' },
@@ -3371,10 +3420,10 @@ img.rh-chat-image{display:block;width:100%!important;height:auto!important;max-w
                 h('h2', null, '把故事，变成镜头'),
                 h('p', { className: 'rh-lead' }, '选择工作流、写下画面。生成在后台继续，你可以留在故事里。'),
                 h('label', { className: 'rh-workflow' }, h('span', { className: 'rh-workflow-label' }, '工作流'),
-                  h('select', { className: 'rh-input', 'aria-label': '工作流', value: model, disabled: locked || settingsBusy || !aliases.length,
+                  h('select', { className: 'rh-input', 'aria-label': '工作流', value: model, disabled: !pluginEnabled || locked || settingsBusy || !aliases.length,
                     onChange: event => selectModel(event.target.value) }, !aliases.length ? h('option', { value: '' }, '等待客户端工作流') : null,
                     aliases.map(alias => h('option', { key: alias, value: alias }, alias))),
-                  h('span', { className: 'rh-workflow-hint' }, workflowBusy ? '读取参数中…' : workflow ? '已与客户端同步' : '等待连接')),
+                  h('span', { className: 'rh-workflow-hint' }, !pluginEnabled ? '插件已关闭' : workflowBusy ? '读取参数中…' : workflow ? '已与客户端同步' : '等待连接')),
                 h('div', { className: 'rh-row', style: { marginTop: 10 } },
                   button('同步客户端', () => setRefreshVersion(value => value + 1), locked || refreshBusy || workflowBusy, null, 'link', 'refresh'),
                   note(summary?.templateMode
@@ -3386,14 +3435,19 @@ img.rh-chat-image{display:block;width:100%!important;height:auto!important;max-w
               h('div', { className: 'rh-composer' },
                 h('div', { className: 'rh-prompt-pane' },
                   h('div', { className: 'rh-section-label' }, h('label', { htmlFor: 'rh-prompt' }, '提示词'),
-                    button('清空', () => setPrompt(''), locked || !prompt, null, 'quiet')),
-                  h('textarea', { id: 'rh-prompt', className: 'rh-prompt', rows: 9, value: prompt, disabled: locked,
+                    button('清空', () => setPrompt(''), !pluginEnabled || locked || !prompt, null, 'quiet')),
+                  h('textarea', { id: 'rh-prompt', className: 'rh-prompt', rows: 9, value: prompt, disabled: !pluginEnabled || locked,
                     placeholder: '描述你想看见的画面…\n\n主体、动作、场景、光线，以及镜头如何移动。\n提示词原样发送，不会自动改写。', onChange: event => setPrompt(event.target.value) }),
                   h('div', { className: 'rh-prompt-meta' }, note(prompt.length + ' 字'), note('原文直传 · 不自动改写')),
                   h('div', { className: 'rh-notice' }, h('div', { className: 'rh-row' }, icon('link', 14),
-                    h('span', null, summary?.autoInsert ? '正文视频自动插入已开启' : '创作与正文可以同步进行'),
+                    h('span', null, !pluginEnabled ? '插件总开关已关闭' : summary?.autoInsert ? '正文视频自动插入已开启' : '创作与正文可以同步进行'),
+                    !pluginEnabled ? button(enabledBusy ? '开启中…' : '立即开启', () => saveEnabled(true), enabledBusy, 'notice-enable', 'link') : null,
                     button('联动设置', () => setSettingsOpen(true), false, null, 'link')),
-                    note(summary?.autoInsert ? 'AI 生成的镜头会按设置（每回合 ' + (summary?.videosPerTurn || 3) + ' 段）绑定提交时的正文版本，完成后自动补入。' : '在设置里开启自动插入，AI 可先写正文，视频完成后再补入。'))),
+                    note(!pluginEnabled
+                      ? '开启总开关后立即按原有设置恢复（当前自动插入' + (summary?.autoInsert ? '开启' : '关闭') + '）。'
+                      : summary?.autoInsert
+                        ? 'AI 生成的镜头会按设置（每回合 ' + (summary?.videosPerTurn || 3) + ' 段）绑定提交时的正文版本，完成后自动补入。'
+                        : '在设置里开启自动插入，AI 可先写正文，视频完成后再补入。'))),
                 h('aside', { className: 'rh-side', 'aria-label': '生成参数' },
                   h('div', { className: 'rh-stack' },
                     h('div', { className: 'rh-section-label', style: { marginBottom: 0 } }, '生成参数',
@@ -3474,12 +3528,23 @@ img.rh-chat-image{display:block;width:100%!important;height:auto!important;max-w
               note('工作流、生成默认值与正文联动 · 与 6888 管理页互通'), note('网页 v' + CLIENT_VERSION + ' · 宿主 ' + (summary?.version || '未知版本'))),
               h('button', { type: 'button', className: 'rh-btn rh-btn-quiet', 'aria-label': '关闭设置', onClick: () => setSettingsOpen(false) }, icon('close'))),
             h('div', { className: 'rh-drawer-content' },
+              h('section', { className: 'rh-master-card', 'aria-label': '插件总开关' },
+                h('label', { className: 'rh-master-row' },
+                  h('span', { className: 'rh-master-row-copy' },
+                    h('strong', null, '启用 RunningHub 插件'),
+                    note(pluginEnabled ? '当前已开启：全部联动、提示词模板与生成功能正常工作。' : '当前已关闭：已暂停对话联动、工具与生成，原有设置均已保留。')),
+                  h('span', { className: 'rh-switch' },
+                    h('input', { type: 'checkbox', role: 'switch', 'aria-label': '设置里的插件总开关', checked: pluginEnabled,
+                      disabled: enabledBusy || !summary, onChange: event => saveEnabled(event.target.checked) }),
+                    h('span', { className: 'rh-switch-track', 'aria-hidden': true }))),
+                alert(enabledError)),
+              h('div', { className: 'rh-rule' }),
               renderSettingsStatus(),
               h('div', { className: 'rh-rule' }),
               h('section', { className: 'rh-setting-group' },
                 h('div', { className: 'rh-setting-heading' }, icon('grid'), '工作流'),
                 field('工作流', h('select', { className: 'rh-input', 'aria-label': '设置里的工作流', value: model,
-                  disabled: locked || settingsBusy || !aliases.length, onChange: event => selectModel(event.target.value) },
+                  disabled: !pluginEnabled || locked || settingsBusy || !aliases.length, onChange: event => selectModel(event.target.value) },
                 !aliases.length ? h('option', { value: '' }, '等待客户端工作流') : null,
                 aliases.map(alias => h('option', { key: alias, value: alias }, alias)))),
                 summary?.templateMode

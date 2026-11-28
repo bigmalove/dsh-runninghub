@@ -39,7 +39,7 @@ import {
 export const name = 'dsh-runninghub'
 export const inject = ['tavern', 'attachments', 'credentials', 'webServer']
 // 面板上要能一眼看出「手机上跑的是哪一版」：宿主与网页各自上报，对不上就是没更新全。
-export const PLUGIN_VERSION = '0.1.47'
+export const PLUGIN_VERSION = '0.1.48'
 export const LINKED_MEDIA_KIND = 'dsh-runninghub/media'
 export const API = '/api/dsh-runninghub'
 export const MEDIA = API + '/media'
@@ -192,6 +192,8 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
   try { selection = JSON.parse(await readFile(selectionFile, 'utf8')) }
   catch (error) { if (error.code !== 'ENOENT') selection = undefined }
   let baseURL = validateBaseURL(settings?.baseURL ?? config.baseURL ?? DEFAULT_BASE).href.replace(/\/$/, '')
+  // 插件总开关：关闭后暂停全部对话联动、工具注册、模板注入与新任务提交，保留所有子设置。
+  let enabled = settings?.enabled !== false
   // 手机 / termux 上网关可能只绑在局域网地址（回环反而拒绝）；勾选后允许明文局域网地址并带上 Key。
   let allowPrivateLan = settings?.allowPrivateLan === true
   let autoInsert = settings?.autoInsert === true
@@ -973,6 +975,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
    * 这里定期重读列表，revision 变了就重建模板；失败静默（面板另报连接异常）。
    */
   async function syncWorkflowConfig() {
+    if (!enabled || disposed) return
     const credential = await credentialDeadline(() => ctx.credentials.resolve(credentialName(baseURL)))
     if (!credential?.value) return
     const active = await connect()
@@ -1461,7 +1464,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
   }
 
   async function planPregen(gameId, reason = 'turn', current = {}) {
-    if (disposed) return null
+    if (disposed || !enabled) return null
     const state = await loadPregen(gameId)
     if (state.settings.count <= 0) return null
     if (pregenPlanners.has(gameId)) {
@@ -1549,6 +1552,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
   async function pregenRefill(input) {
     keys(input, ['action', 'gameId'])
     const gameId = pregenGameId(input.gameId)
+    if (!enabled) throw fail('RunningHub 插件总开关已关闭，请先开启总开关后再补池')
     const state = await reconcilePregen(gameId)
     if (state.settings.count <= 0) throw fail('先把预生成数量设为大于 0')
     const result = await planPregen(gameId, 'manual')
@@ -1801,7 +1805,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     if (!Number.isInteger(input.turn) || input.turn < 1) throw fail('turn 必须是轮次编号')
     if (!Array.isArray(input.shots)) throw fail('shots 必须是数组')
     if (input.shots.length > 20) throw fail('一次预提交最多 20 个镜头')
-    if (generationMode !== 'marker' || !autoInsert || !alwaysSendPrompt || !streamPreclaim) return { skipped: 'off' }
+    if (!enabled || generationMode !== 'marker' || !autoInsert || !alwaysSendPrompt || !streamPreclaim) return { skipped: 'off' }
     if (!input.shots.length) return { submitted: 0, reused: 0 }
     // 模板没准备好就先不发：模型这一轮拿到的格式可能和模板对不上，等结算按正常路径处理。
     if (promptDirective.model !== model || !directiveFor('marker')) return { skipped: 'no-template' }
@@ -1931,7 +1935,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
   }
 
   async function processMarkerTurn(value = {}) {
-    if (generationMode !== 'marker' || !autoInsert || !alwaysSendPrompt) return null
+    if (!enabled || generationMode !== 'marker' || !autoInsert || !alwaysSendPrompt) return null
     if (typeof ctx.tavern.attach !== 'function') return null
     if (!value) return null
     // 正文来源不只 rawText：宿主在「正文走工具调用（submit_story）」和「重新生成本轮」
@@ -2082,7 +2086,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
 
   async function handleTurn(value = {}) {
     if (disposed) return
-    if (generationMode === 'marker') {
+    if (enabled && generationMode === 'marker') {
       const markerTurn = await processMarkerTurn(value)
       // 标记模式不再编辑正文版本；保留版本透传，媒体仍按当前正文版本挂载。
       if (markerTurn?.textVersion) value = { ...value, textVersion: markerTurn.textVersion }
@@ -2101,7 +2105,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     }
     await flushPregenSends(gameId, state, value).catch(() => {})
     // 正文标记模式不把预生成池注入提示词，也就不再自动花积分补池；手动补池仍可用。
-    if (generationMode !== 'marker' && state.settings.count > 0) await planPregen(gameId, 'turn', { turn, text: value.text })
+    if (enabled && generationMode !== 'marker' && state.settings.count > 0) await planPregen(gameId, 'turn', { turn, text: value.text })
   }
 
   function pregenPromptText(gameId) {
@@ -2168,7 +2172,8 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     if (!configured) {
       model = ''; workflows = []; resetDirective()
     }
-    if (configured) {
+    if (!enabled) workflowError = ''
+    if (configured && enabled) {
       try {
         const active = await connect()
         clock.mark('connect')
@@ -2222,7 +2227,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     const jobs = clientJobs(await store.list())
     const badTasks = store.badTasks || []
     lastPhaseMs = clock.value
-    return { configured, baseURL, allowPrivateLan, generationMode, insertPosition, autoInsert, alwaysSendPrompt, videosPerTurn, streamPreclaim,
+    return { enabled, configured, baseURL, allowPrivateLan, generationMode, insertPosition, autoInsert, alwaysSendPrompt, videosPerTurn, streamPreclaim,
       markerPipeline: promptDirective.pipeline === true,
       applyDefaults: applyDefaultsPref, bindToTurn: bindToTurnPref,
       workflowSettings: true,
@@ -2254,7 +2259,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
       if (previous?.source === 'env' || info?.source === 'env' || info?.writable === false) throw fail('网关 Key 来自只读凭据，请修改凭据来源')
       await credentialDeadline(() => ctx.credentials.set(ref, supplied))
     }
-    await atomicJSON(settingsFile, { baseURL: nextBase, allowPrivateLan: nextAllowPrivateLan, autoInsert, alwaysSendPrompt, videosPerTurn, streamPreclaim, applyDefaults: applyDefaultsPref, bindToTurn: bindToTurnPref, generationMode, insertPosition })
+    await atomicJSON(settingsFile, { enabled, baseURL: nextBase, allowPrivateLan: nextAllowPrivateLan, autoInsert, alwaysSendPrompt, videosPerTurn, streamPreclaim, applyDefaults: applyDefaultsPref, bindToTurn: bindToTurnPref, generationMode, insertPosition })
     engine?.dispose(); engine = undefined; client = undefined; clientIdentity = undefined
     baseURL = nextBase; allowPrivateLan = nextAllowPrivateLan; workflows = []; workflowError = ''
     selectedModel = ''; model = ''; defaultModel = ''
@@ -2331,7 +2336,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     try { configuredKey = (await credentialDeadline(() => ctx.credentials.resolve(credentialName(baseURL))))?.value ? 'yes' : 'no' }
     catch { configuredKey = 'unknown' }
     return {
-      version: PLUGIN_VERSION, baseURL, allowPrivateLan, configuredKey, generationMode, insertPosition,
+      enabled, version: PLUGIN_VERSION, baseURL, allowPrivateLan, configuredKey, generationMode, insertPosition,
       node: process.version, platform: process.platform, arch: process.arch,
       engineError: engineError || '', badTasks: (store.badTasks || []).slice(0, 20),
       lastSummaryMs: lastPhaseMs, templatePending: Boolean(directiveJob), reconcilePending: Boolean(reconcileInflight),
@@ -2375,16 +2380,16 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
       keys(input, ['action', 'gameId'])
       if (input.gameId !== undefined && (typeof input.gameId !== 'string' || !input.gameId)) throw fail('gameId 必须是当前对话 ID')
       const all = await store.list()
-      return { jobs: clientJobs(input.gameId ? all.filter(job => job.binding?.gameId === input.gameId) : all) }
+      return { enabled, jobs: clientJobs(input.gameId ? all.filter(job => job.binding?.gameId === input.gameId) : all) }
     }
     return serial(async () => {
       if (input.action === 'preferences') {
-        keys(input, ['action', 'autoInsert', 'alwaysSendPrompt', 'videosPerTurn', 'streamPreclaim', 'applyDefaults', 'bindToTurn', 'generationMode', 'insertPosition'])
-        if (input.autoInsert === undefined && input.alwaysSendPrompt === undefined
+        keys(input, ['action', 'enabled', 'autoInsert', 'alwaysSendPrompt', 'videosPerTurn', 'streamPreclaim', 'applyDefaults', 'bindToTurn', 'generationMode', 'insertPosition'])
+        if (input.enabled === undefined && input.autoInsert === undefined && input.alwaysSendPrompt === undefined
           && input.videosPerTurn === undefined && input.streamPreclaim === undefined
           && input.generationMode === undefined && input.insertPosition === undefined
           && input.applyDefaults === undefined && input.bindToTurn === undefined) throw fail('没有要保存的偏好')
-        for (const key of ['autoInsert', 'alwaysSendPrompt', 'streamPreclaim', 'applyDefaults', 'bindToTurn']) {
+        for (const key of ['enabled', 'autoInsert', 'alwaysSendPrompt', 'streamPreclaim', 'applyDefaults', 'bindToTurn']) {
           if (input[key] !== undefined && typeof input[key] !== 'boolean') throw fail(key + ' 必须是布尔值')
         }
         if (input.videosPerTurn !== undefined
@@ -2397,8 +2402,9 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
         if (input.insertPosition !== undefined && input.insertPosition !== 'inline' && input.insertPosition !== 'end') {
           throw fail('视频插入位置只能是 inline 或 end')
         }
+        const nextEnabled = input.enabled === undefined ? enabled : input.enabled
         const nextMode = input.generationMode === undefined ? generationMode : input.generationMode
-        if (nextMode === 'marker') {
+        if ((nextEnabled || input.generationMode === 'marker') && nextMode === 'marker') {
           if (typeof ctx.tavern.attach !== 'function' || typeof ctx.tavern.onTurnSettled !== 'function') {
             throw fail('当前 Tavern 宿主不支持媒体插入/结算通知，无法使用正文标记模式')
           }
@@ -2407,6 +2413,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
           if (!regex.ok) throw fail('无法把正文标记正则写入 Tavern 正则库：' + (regex.reason || '未知原因'))
         }
         const next = {
+          enabled: nextEnabled,
           generationMode: nextMode,
           insertPosition: input.insertPosition === undefined ? insertPosition : input.insertPosition,
           autoInsert: input.autoInsert === undefined ? autoInsert : input.autoInsert,
@@ -2417,6 +2424,8 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
           bindToTurn: input.bindToTurn === undefined ? bindToTurnPref : input.bindToTurn,
         }
         await atomicJSON(settingsFile, { baseURL, allowPrivateLan, ...next })
+        const wasEnabled = enabled
+        enabled = next.enabled
         generationMode = next.generationMode
         insertPosition = next.insertPosition
         autoInsert = next.autoInsert
@@ -2425,11 +2434,27 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
         streamPreclaim = next.streamPreclaim
         applyDefaultsPref = next.applyDefaults
         bindToTurnPref = next.bindToTurn
-        // 正文标记模式不向模型开放生成工具；切回工具调用时再注册回来。
+        if (wasEnabled && !enabled) {
+          for (const [gid, handle] of [...pregenPlanners.entries()]) {
+            handle.controller.abort()
+            pregenDirty.delete(gid)
+            const state = pregenStates.get(gid)
+            if (state?.planning) {
+              delete state.planning
+              void persistPregen(gid).catch(() => {})
+            }
+          }
+          pregenDirty.clear()
+          workflowError = ''
+        }
+        // 正文标记模式或总开关关闭时不向模型开放生成工具；重新开启且在工具模式时恢复注册。
         lastMarkerError = ''
         lastMarkerWarning = ''
         lastMarkerSkip = ''
         try { toolSync() } catch { /* 工具注册失败不阻断设置保存 */ }
+        if (!wasEnabled && enabled && options.workflowSyncMs !== 0 && !disposed) {
+          void syncWorkflowConfig().catch(() => {})
+        }
         return next
       }
       // 输入框停靠区的轻量轮询：只读本地任务记录，不连网关、不列工作流。
@@ -2443,12 +2468,16 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
         exec?.signal?.throwIfAborted()
         const gameId = pregenGameId(input.gameId)
         if (typeof input.id !== 'string' || !input.id) throw fail('缺少预生成视频 id')
+        if (!enabled) {
+          throw fail(exec
+            ? 'RunningHub 插件总开关已关闭，模型不能发送预生成视频。'
+            : 'RunningHub 插件总开关已关闭，请先开启总开关后再发送预生成视频。')
+        }
         const result = await sendPregen({ gameId, id: input.id, anchor: input.anchor, caption: input.caption,
           allowStale: input.allowStale !== false })
         exec?.signal?.throwIfAborted()
         return result
       }
-      const active = await connect()
       if (input.action === 'regenerate') {
         keys(input, ['action', 'id', 'requestId', 'gameId', 'bindToTurn'])
         const id = validateJobId(input.id)
@@ -2456,6 +2485,8 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
         // 先按 requestId 去重：浏览器结果不明时重试不能变成第二个收费任务。
         const existing = (await store.list()).find(job => job.requestId === input.requestId)
         if (existing) return { ...existing, ...(replays.has(existing.id) ? { replayable: true } : {}) }
+        if (!enabled) throw fail('RunningHub 插件总开关已关闭，请先开启总开关后再重新生成')
+        const active = await connect()
         const original = await store.read(id)
         if (!original) throw fail('本地任务不存在', 'NOT_FOUND')
         if (!['ready', 'failed', 'download_failed'].includes(original.status)) {
@@ -2476,6 +2507,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
         try { await replays.save(job.id, clean); job.replayable = true } catch { /* 任务已提交，快照失败只影响下次重放 */ }
         return job
       }
+      const active = await connect()
       if (input.action === 'select-model') {
         keys(input, ['action', 'model'])
         if (typeof input.model !== 'string' || !input.model.trim()) throw fail('工作流别名不能为空')
@@ -2497,10 +2529,11 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
         const description = await active.client.describe(alias)
         const templateReady = promptDirective.model === alias && Boolean(directiveFor(generationMode))
         return { ...description,
+          enabled,
           generationMode,
           promptTemplateReady: templateReady,
           promptTemplateEnabled: alwaysSendPrompt,
-          promptTemplateSent: alwaysSendPrompt && templateReady,
+          promptTemplateSent: enabled && alwaysSendPrompt && templateReady,
           ...(promptDirective.mode ? { promptMode: promptDirective.mode } : {}) }
       }
       if (input.action === 'status') {
@@ -2644,6 +2677,11 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     const sameGame = job => (job.binding?.gameId ?? '') === gameHint
     const existing = (await store.list()).find(job => job.requestId === input.requestId && sameGame(job))
     if (existing) return { ...existing, ...(replays.has(existing.id) ? { replayable: true } : {}) }
+    if (!enabled) {
+      throw fail(exec || marker
+        ? 'RunningHub 插件总开关已关闭，模型不能提交生成任务；如需生成请在插件页面开启总开关。'
+        : 'RunningHub 插件总开关已关闭，请先在插件页面开启总开关后再提交生成。')
+    }
     // 正文标记模式下模型不该再走生成工具；即使旧请求还带着工具也由宿主拒绝。
     if (exec && generationMode === 'marker') {
       throw fail('当前是正文标记（非工具调用）模式，模型不能调用 runninghub_generate；请按正文标记格式把提示词写在正文里。')
@@ -3013,6 +3051,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     if (buffer.length) consume(null)
   }
   async function resume() {
+    if (!enabled || disposed) return
     // 预热不占全局 serial 串行锁：connect 自有 connectQueue、ensureModel 自有 workflowsLoading，
     // 否则手机 Termux 上网关未就绪或挂起时，插件启动预热会把面板轮询一并锁死数十秒。
     let configured = false
@@ -3028,7 +3067,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
   // 它的完整提示词模板」直接拼进正文提示词。开关关掉时整段都不发。
   // 预生成池与自动插入相互独立：自动插入关掉时，池子里的就绪视频仍然可以发。
   function promptText(gameId) {
-    if (!alwaysSendPrompt) return ''
+    if (!enabled || !alwaysSendPrompt) return ''
     const parts = []
     const channel = generationMode
     const directive = directiveFor(channel)
@@ -3091,7 +3130,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
   }
   // 每回合一条短提醒，放在本轮上下文里，避免长系统提示词里的自动插入要求被忽略。
   function turnReminder(input = '') {
-    if (!alwaysSendPrompt || !autoInsert || !model) return ''
+    if (!enabled || !alwaysSendPrompt || !autoInsert || !model) return ''
     if (promptDirective.model !== model || !directiveFor(generationMode)) return ''
     const lead = typeof input === 'string' && input.trim() ? `本轮玩家指引：${input.trim().slice(0, 500)}。` : ''
     const atEnd = insertPosition === 'end'
@@ -3137,6 +3176,7 @@ export async function createRunningHubHost(ctx, config = {}, options = {}) {
     removeGame: removePregenGame,
     syncMarkerRegex, disableMarkerRegex,
     setToolSync(fn) { toolSync = typeof fn === 'function' ? fn : () => {}; toolSync() },
+    get enabled() { return enabled },
     get generationMode() { return generationMode }, get insertPosition() { return insertPosition },
     get autoInsert() { return autoInsert },
     get alwaysSendPrompt() { return alwaysSendPrompt }, get videosPerTurn() { return videosPerTurn },
@@ -3172,7 +3212,7 @@ export async function apply(ctx, config = {}) {
   // 正文标记块在结算 / 候选 / 压缩读取正文时仍可能被看到：
   // 明确告诉后台这截是生成提示词，不是剧情，避免写进变量或摘要。
   const markerIgnore = '正文末尾 [[RH:SHOT]] 到 [[/RH:SHOT]] 之间是给视频生成用的提示词，不属于剧情；不要据此更新变量、人物状态、摘要或候选。'
-  const markerIgnoreText = () => host.generationMode === 'marker' ? markerIgnore : ''
+  const markerIgnoreText = () => host.enabled && host.generationMode === 'marker' ? markerIgnore : ''
   for (const name of ['settlementSection', 'candidateSection', 'compactionSection']) {
     if (typeof ctx.tavern[name] !== 'function') continue
     try { ctx.tavern[name]({ name: 'marker-ignore', text: markerIgnoreText }) }
@@ -3238,9 +3278,9 @@ export async function apply(ctx, config = {}) {
     toolDisposers.clear()
   }
   function syncRunningHubTools() {
-    // 正文标记模式是「非工具调用」：运行时的工具列表里一个 RunningHub 工具都不留，
+    // 总开关关闭或处于正文标记模式（非工具调用）时：运行时的工具列表里一个 RunningHub 工具都不留，
     // 不只是生成工具。只读的 describe/status 也不该在游玩请求里出现。
-    if (host.generationMode === 'marker') unregisterRunningHubTools()
+    if (!host.enabled || host.generationMode === 'marker') unregisterRunningHubTools()
     else registerRunningHubTools()
   }
   ctx.inject(['tools'], scoped => {

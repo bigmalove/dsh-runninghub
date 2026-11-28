@@ -122,6 +122,7 @@ test('RunningHub 重设计界面：jsdom + React DOM 隔离交互', {
   const saves = []
   const baseURL = 'http://127.0.0.1:6888'
   const state = {
+    enabled: true,
     configured: true,
     generationMode: 'tool',
     insertPosition: 'inline',
@@ -238,7 +239,7 @@ test('RunningHub 重设计界面：jsdom + React DOM 隔离交互', {
     }
     if (options.signal?.aborted) throw new window.DOMException('夹具请求已取消', 'AbortError')
     if (method === 'GET') {
-      return response({ configured: state.configured, generationMode: state.generationMode, insertPosition: state.insertPosition, autoInsert: state.autoInsert,
+      return response({ enabled: state.enabled !== false, configured: state.configured, generationMode: state.generationMode, insertPosition: state.insertPosition, autoInsert: state.autoInsert,
         alwaysSendPrompt: state.alwaysSendPrompt !== false, videosPerTurn: state.videosPerTurn,
         streamPreclaim: state.streamPreclaim === true,
         applyDefaults: state.applyDefaults !== false, bindToTurn: state.bindToTurn !== false, workflowSettings: true, baseURL: state.baseURL,
@@ -258,7 +259,7 @@ test('RunningHub 重设计界面：jsdom + React DOM 隔离交互', {
         return response(description(body.model))
       }
       case 'preferences': {
-        const keys = ['autoInsert', 'alwaysSendPrompt', 'streamPreclaim', 'applyDefaults', 'bindToTurn'].filter(key => body[key] !== undefined)
+        const keys = ['enabled', 'autoInsert', 'alwaysSendPrompt', 'streamPreclaim', 'applyDefaults', 'bindToTurn'].filter(key => body[key] !== undefined)
         const hasVideos = body.videosPerTurn !== undefined
         const hasMode = body.generationMode !== undefined
         const hasInsertPosition = body.insertPosition !== undefined
@@ -279,7 +280,7 @@ test('RunningHub 重设计界面：jsdom + React DOM 隔离交互', {
           assert.ok(['inline', 'end'].includes(body.insertPosition))
           state.insertPosition = body.insertPosition
         }
-        return response({ generationMode: state.generationMode, insertPosition: state.insertPosition, autoInsert: state.autoInsert, alwaysSendPrompt: state.alwaysSendPrompt,
+        return response({ enabled: state.enabled !== false, generationMode: state.generationMode, insertPosition: state.insertPosition, autoInsert: state.autoInsert, alwaysSendPrompt: state.alwaysSendPrompt,
           videosPerTurn: state.videosPerTurn, streamPreclaim: state.streamPreclaim === true,
           applyDefaults: state.applyDefaults, bindToTurn: state.bindToTurn })
       }
@@ -344,7 +345,7 @@ test('RunningHub 重设计界面：jsdom + React DOM 隔离交互', {
       }
       case 'jobs':
         assert.equal(body.gameId, 'fixture-game', '停靠区只读当前这局的任务')
-        return response({ jobs: state.jobs.filter(job => job.binding?.gameId === body.gameId) })
+        return response({ enabled: state.enabled !== false, jobs: state.jobs.filter(job => job.binding?.gameId === body.gameId) })
     }
     unexpectedRequests.push({ url, method, body })
     throw new Error('未声明的夹具请求：' + JSON.stringify(body))
@@ -833,6 +834,7 @@ test('RunningHub 重设计界面：jsdom + React DOM 隔离交互', {
     return [...container.querySelectorAll('.rh-field-label')].some(node => node.textContent === label)
   }
   async function mountVariant(overrides = {}) {
+    state.enabled = overrides.enabled ?? true
     state.model = overrides.model ?? 'h3参考'
     state.minimal = overrides.minimal ?? false
     state.dimensions = overrides.dimensions ?? false
@@ -1332,5 +1334,78 @@ test('RunningHub 重设计界面：jsdom + React DOM 隔离交互', {
     assert.equal(field('画面比例').value, '5:4', '自定义画幅仍可手填')
     // 等自动同步的防抖定时器跑完，别把请求留到卸载之后。
     await act(async () => { await delay(650) })
+  })
+
+  await t.test('插件总开关：顶栏与设置抽屉双向同步，关闭时禁用生成并保留原有设置', async () => {
+    state.autoInsert = true
+    state.jobs = [
+      { id: 'fixture-ready', model: 'h3参考', status: 'ready', createdAt: '2026-10-16T10:00:00Z', replayable: true,
+        attachments: [{ kind: 'image', name: '夹具生成图', url: '/api/dsh-runninghub/media?id=fixture-ready' }] },
+    ]
+    state.pregen = {
+      ...state.pregen,
+      entries: [
+        { id: 'pg-fixture-ready', status: 'ready', description: '窗边回头，阳光落在肩上', createdAt: '2026-10-16T09:58:00Z',
+          createdTurn: 3, summary: '就绪', workflow: 'h3参考',
+          attachments: [{ kind: 'video', name: 'fixture-pregen.mp4', mediaType: 'video/mp4',
+            url: '/api/dsh-runninghub/media?id=pregen-ready&index=0' }] },
+      ],
+      live: 1, ready: 1, generating: 0,
+    }
+    await mountVariant()
+    const topSwitch = query('input[aria-label="插件总开关"]')
+    assert.equal(topSwitch.checked, true, '顶栏总开关默认开启')
+    assert.match(query('.rh-master-toggle').textContent, /已开启/)
+    assert.match(query('.rh-pill').textContent, /网关已连接/)
+
+    await input(query('#rh-prompt'), '关闭开关时保留这段草稿')
+    const prefBefore = actionCalls('preferences').length
+    await click(topSwitch)
+    await until(() => state.enabled === false, '顶栏关闭总开关写回宿主')
+    assert.deepEqual(actionCalls('preferences').slice(prefBefore).at(-1).body, { action: 'preferences', enabled: false })
+    assert.equal(topSwitch.checked, false)
+    assert.match(query('.rh-master-toggle').textContent, /已关闭/)
+    assert.match(query('.rh-pill').textContent, /插件已关闭/)
+
+    const banner = query('.rh-master-banner')
+    assert.match(banner.textContent, /RunningHub 总开关已关闭/)
+    assert.equal(query('#rh-prompt').disabled, true, '关闭后提示词输入禁用')
+    assert.equal(query('select[aria-label="工作流"]').disabled, true, '关闭后工作流切换禁用')
+    assert.equal(button('开始生成').disabled, true, '关闭后开始生成禁用')
+    assert.equal(button('清空').disabled, true, '关闭后清空按钮禁用')
+
+    // 预生成页：补池和发送到本轮禁用，删除仍可用。
+    await click(query('#rh-pregen-tab'))
+    const pool = query('#rh-pregen-view section[aria-label="预生成视频池"]')
+    assert.equal(button('补池', pool).disabled, true, '关闭后补池禁用')
+    const readyEntry = [...pool.querySelectorAll('.rh-pregen-entry')].find(node => node.textContent.includes('窗边回头'))
+    assert.equal(button('发送到本轮', readyEntry).disabled, true, '关闭后发送到本轮禁用')
+    assert.equal(button('删除', readyEntry).disabled, false, '关闭后仍可清理旧条目')
+
+    // 历史页：重新生成禁用，不影响查看历史任务。
+    await click(query('#rh-history-tab'))
+    const readyCard = [...container.querySelectorAll('.rh-job')].find(node => node.textContent.includes('fixture-ready'))
+    assert.equal(button('重新生成', readyCard).disabled, true, '关闭后历史任务重新生成禁用')
+
+    // 设置抽屉同步展示总开关与关闭态，且子设置完整保留。
+    await click(button('设置'))
+    const drawer = query('.rh-drawer')
+    const drawerSwitch = query('input[aria-label="设置里的插件总开关"]', drawer)
+    assert.equal(drawerSwitch.checked, false, '抽屉内总开关必须与顶栏同步为关闭')
+    assert.match(query('.rh-settings-status', drawer).textContent, /插件总开关已关闭/)
+    assert.equal(query('.rh-toggle-row input', drawer).checked, true, '关闭总开关不得丢失原有自动插入等子设置')
+
+    // 在抽屉里重新开启总开关：顶栏与整个界面恢复可用。
+    await click(drawerSwitch)
+    await until(() => state.enabled === true && !button('补池', pool).disabled, '抽屉开启总开关恢复全部功能')
+    assert.deepEqual(actionCalls('preferences').at(-1).body, { action: 'preferences', enabled: true })
+    assert.equal(query('input[aria-label="插件总开关"]').checked, true)
+    assert.equal(drawerSwitch.checked, true)
+    assert.equal(container.querySelector('.rh-master-banner'), null, '重新开启后关闭提示横幅消失')
+    await click(query('.rh-drawer-head button[aria-label="关闭设置"]'))
+    await click(query('#rh-create-tab'))
+    assert.equal(query('#rh-prompt').disabled, false)
+    assert.equal(button('开始生成').disabled, false)
+    assert.equal(query('#rh-prompt').value, '关闭开关时保留这段草稿')
   })
 })

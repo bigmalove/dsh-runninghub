@@ -350,3 +350,27 @@ test('预生成：模型输出被解析为多条，重复提示词不会重复�
   await until(async () => (await summary(f.host)).pregen.entries.filter(entry => entry.status === 'ready').length >= 2, '两条就绪')
   assert.equal(f.gateway.submitted.length, 2, '同一批里相似提示词只提交一次')
 })
+
+test('预生成：关闭总开关后暂停每轮自动规划，手动补池与发送均被拒绝；重新开启后恢复', async t => {
+  const f = await setup(t)
+  await f.host.dispatch({ action: 'pregen-settings', gameId: 'game-1', count: 1 })
+  const ready = await until(async () => {
+    const entries = (await summary(f.host)).pregen.entries.filter(entry => entry.status === 'ready')
+    return entries[0] ?? null
+  }, '一条预生成视频就绪')
+  const llmBeforeOff = f.llmCalls.length
+  const submittedBeforeOff = f.gateway.submitted.length
+
+  await f.host.dispatch({ action: 'preferences', enabled: false })
+  await f.host.dispatch({ action: 'pregen-settings', gameId: 'game-1', count: 2 })
+  await f.host.handleTurn({ gameId: 'game-1', turn: 6, text: '关闭总开关后的下一轮正文。' })
+  await wait(80)
+  assert.equal(f.llmCalls.length, llmBeforeOff, '关闭总开关后不得自动调用后台规划模型')
+  assert.equal(f.gateway.submitted.length, submittedBeforeOff, '关闭总开关后不得自动提交预生成')
+  await assert.rejects(f.host.dispatch({ action: 'pregen-refill', gameId: 'game-1' }), /总开关已关闭/)
+  await assert.rejects(f.host.dispatch({ action: 'pregen-send', gameId: 'game-1', id: ready.id }), /总开关已关闭/)
+
+  await f.host.dispatch({ action: 'preferences', enabled: true })
+  await f.host.handleTurn({ gameId: 'game-1', turn: 7, text: '重新开启总开关后的正文。' })
+  await until(() => f.llmCalls.length > llmBeforeOff && f.gateway.submitted.length > submittedBeforeOff, '重新开启后恢复自动规划')
+})
